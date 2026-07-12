@@ -535,8 +535,10 @@ class TestInlineImages(unittest.TestCase):
         self.assertIn("보존 기간(14일)", self._html("img"))
         self.assertIsNone(self._html("txt"))         # 서식 HTML 회수
         self.assertIn("data:image/", self._html("new"))  # 최근은 유지
-        # 하루 1회 가드 — 같은 날 재호출 None
+        # 하루 1회 가드 — 같은 날 '같은 설정' 재호출은 None
         self.assertIsNone(self.store.maybe_prune_html(14))
+        # 같은 날이라도 보존 기간을 바꾸면 즉시 재실행 (설정 변경 반영)
+        self.assertIsNotNone(self.store.maybe_prune_html(10))
         # 마커는 다음날 프룬에서도 보존 (재프룬 금지)
         self.store.set_state("last_image_prune", "2000-01-01")
         self.assertEqual(self.store.maybe_prune_html(14), (0, 0))

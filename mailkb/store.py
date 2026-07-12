@@ -713,14 +713,17 @@ class Store:
 
         retain_days <= 0 이면 기능 끔(임베드도 프룬도 안 함 — 현행 유지).
         건너뛴 날은 다음 실행이 경과일 기준으로 한 번에 처리(누락 없음).
+        가드는 '같은 날 + 같은 설정값'일 때만 — 보존 기간을 바꾸면 그날이라도
+        다음 sync 에서 즉시 반영된다 (PC 스모크 피드백, 2026-07-13).
         """
         if retain_days <= 0:
             return None
         today = datetime.now().date().isoformat()
-        if self.get_state("last_image_prune") == today:
+        stamp = f"{today}:{retain_days}"
+        if self.get_state("last_image_prune") == stamp:
             return None
         n_mark, n_del = self._prune_html(retain_days)
-        self.set_state("last_image_prune", today)
+        self.set_state("last_image_prune", stamp)
         if n_mark or n_del:
             # 조각 회수 — 풀 VACUUM(배타 수십 초) 금지, auto_vacuum=INCREMENTAL 전제
             self.db.execute("PRAGMA incremental_vacuum")
