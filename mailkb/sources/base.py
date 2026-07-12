@@ -40,6 +40,10 @@ class Source(Protocol):
 
     name: str
 
-    def fetch(self, since_iso: str | None) -> Iterator[MailRecord]:
-        """since_iso 이후의 메일을 시간순으로 yield. None 이면 전체."""
+    def fetch(self, since_iso: str | None,
+              image_cutoff: str | None = None) -> Iterator[MailRecord]:
+        """since_iso 이후의 메일을 시간순으로 yield. None 이면 전체.
+
+        image_cutoff: 이 날짜(YYYY-MM-DD) 이전 메일은 인라인 이미지 추출 생략
+        (선택 — 어댑터가 지원하지 않으면 무시하고 store 게이트가 걸러준다)."""
         ...

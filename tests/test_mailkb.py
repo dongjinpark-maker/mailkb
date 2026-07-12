@@ -560,6 +560,79 @@ class TestInlineImages(unittest.TestCase):
         self.assertNotIn("md-toggle", out)             # 마커는 html 취급 안 함
 
 
+class TestComInlineCollect(unittest.TestCase):
+    """outlook_com._collect_inline_images — 모의 COM 객체로 순수 로직 검증
+    (PC 스모크 전에 매칭·MIME·실패 경로를 WSL 에서 보장)."""
+
+    class _PA:
+        def __init__(self, cid, raise_=False):
+            self._cid, self._raise = cid, raise_
+
+        def GetProperty(self, prop):
+            if self._raise:
+                raise RuntimeError("no property")
+            return self._cid
+
+    class _Att:
+        def __init__(self, cid, fname, data=b"IMGDATA", pa_raise=False,
+                     save_raise=False):
+            self.FileName = fname
+            self.PropertyAccessor = TestComInlineCollect._PA(cid, pa_raise)
+            self._data, self._save_raise = data, save_raise
+
+        def SaveAsFile(self, path):
+            if self._save_raise:
+                raise OSError("save failed")
+            with open(path, "wb") as f:
+                f.write(self._data)
+
+    def test_collect_matching_and_failures(self):
+        from mailkb.sources.outlook_com import _collect_inline_images
+        html = ('<img src="cid:Wave1@X"><img src="cid:doc1@x">'
+                '<img src="cid:broken@x"><img src="cid:gone@x">')
+        atts = [
+            self._Att("<wave1@x>", "wave.PNG"),            # 매칭(꺾쇠·대소문자)
+            self._Att("doc1@x", "report.docx"),            # 이미지 아님 → 실패 집계
+            self._Att("broken@x", "b.png", save_raise=True),  # 저장 실패 → 집계
+            self._Att("", "noise.png", pa_raise=True),     # ContentID 없음 → 무시
+            self._Att("unref@x", "unref.png"),             # HTML 미참조 → 무시
+        ]
+        out, failed = _collect_inline_images(atts, html)
+        self.assertEqual(list(out), ["wave1@x"])
+        self.assertEqual(out["wave1@x"], ("image/png", b"IMGDATA"))
+        self.assertEqual(failed, 2)                        # docx + 저장 실패
+
+    def test_collect_no_cid_short_circuit(self):
+        from mailkb.sources.outlook_com import _collect_inline_images
+        called = []
+
+        class _Boom:
+            @property
+            def PropertyAccessor(self):
+                called.append(1)
+                raise AssertionError("cid 없으면 첨부를 건드리지 않아야")
+        out, failed = _collect_inline_images([_Boom()], "<p>이미지 없음</p>")
+        self.assertEqual((out, failed, called), ({}, 0, []))
+
+    def test_collect_end_to_end_with_store(self):
+        # 모의 첨부 → MailRecord.inline_images → store 주입까지 전체 경로
+        from mailkb.sources.outlook_com import _collect_inline_images
+        html = '<p>도면</p><img src="cid:fp1@x">'
+        out, _ = _collect_inline_images([self._Att("<FP1@x>", "f.png")], html)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = Store(Path(tmp.name) / "t.sqlite", [ME])
+        self.addCleanup(store.close)
+        stats = store.ingest([MailRecord(
+            message_id="<c1@t>", subject="도면", sender_name="kim",
+            sender_addr="kim@corp.example", to=[ME],
+            sent_on="2026-07-10T09:00:00", body_text="도면 공유",
+            body_html=html, inline_images=out)])
+        self.assertEqual(stats.img_embedded, 1)
+        r = store.db.execute("SELECT html FROM message_html").fetchone()
+        self.assertIn("data:image/png;base64,", r["html"])
+
+
 class TestRollingSummarySkip(unittest.TestCase):
     """review.update_rolling_summaries 의 스킵 로직 (AI 호출은 스텁으로 대체)."""
 

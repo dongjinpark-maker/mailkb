@@ -13,8 +13,12 @@ from __future__ import annotations
 
 import email.parser
 import email.utils
+import os
+import re
+import tempfile
 from datetime import datetime, timedelta, timezone
 from typing import Iterator
+from urllib.parse import unquote
 
 from ..clean import html_to_markdown
 from .base import MailRecord
@@ -22,9 +26,70 @@ from .base import MailRecord
 # MAPI 속성 (PropertyAccessor 용)
 PR_TRANSPORT_HEADERS = "http://schemas.microsoft.com/mapi/proptag/0x007D001F"
 PR_INTERNET_MESSAGE_ID = "http://schemas.microsoft.com/mapi/proptag/0x1035001F"
+PR_ATTACH_CONTENT_ID = "http://schemas.microsoft.com/mapi/proptag/0x3712001F"
 
 FOLDER_INBOX = 6
 FOLDER_SENT = 5
+
+# 인라인(cid) 이미지 수집 — docs/PROPOSAL-images.md 3-A.
+# HTML 이 참조하는 cid 에 대응하는 '이미지' 첨부만 바이트로 동봉하고,
+# 치환은 store 가 정제(인용 절단) 후에 한다.
+_CID_SRC_RX = re.compile(r"src=[\"']cid:([^\"']+)", re.IGNORECASE)
+_IMG_MIME = {
+    "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+    "gif": "image/gif", "bmp": "image/bmp", "webp": "image/webp",
+}
+
+
+def _norm_cid(cid: str) -> str:
+    return unquote(cid or "").strip().strip("<>").lower()
+
+
+def _collect_inline_images(attachments, html: str) -> tuple[dict, int]:
+    """HTMLBody 의 cid: 참조에 대응하는 이미지 첨부 바이트 수집.
+
+    attachments: COM Attachment 유사 객체 iterable (FileName,
+    PropertyAccessor.GetProperty, SaveAsFile) — 순수 로직이라 WSL 에서
+    모의 객체로 테스트 가능. 반환 ({cid: (mime, bytes)}, 실패 수).
+    항목 단위 실패는 삼키고 계속 — 매칭 실패한 cid 는 store 정제 후
+    차단 마크로 남아 웹에서 '추출 실패' 안내가 뜬다(graceful).
+    """
+    wanted = {_norm_cid(c) for c in _CID_SRC_RX.findall(html or "")}
+    if not wanted:
+        return {}, 0
+    out: dict = {}
+    failed = 0
+    for a in attachments:
+        try:
+            cid_raw = a.PropertyAccessor.GetProperty(PR_ATTACH_CONTENT_ID) or ""
+        except Exception:
+            cid_raw = ""
+        cid = _norm_cid(cid_raw)
+        if not cid or cid not in wanted or cid in out:
+            continue
+        ext = (a.FileName or "").rpartition(".")[2].lower()
+        mime = _IMG_MIME.get(ext)
+        if not mime:
+            failed += 1                     # cid 참조인데 이미지 확장자가 아님
+            continue
+        fd, tmp = tempfile.mkstemp(prefix="mailkb_cid_")
+        os.close(fd)
+        try:
+            a.SaveAsFile(tmp)
+            with open(tmp, "rb") as f:
+                data = f.read()
+            if data:
+                out[cid] = (mime, data)
+            else:
+                failed += 1
+        except Exception:
+            failed += 1                     # SaveAsFile 실패 등 — 항목만 포기
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    return out, failed
 
 
 def _dasl_utc(since_iso: str, overlap_minutes: int = 30) -> str:
@@ -67,7 +132,10 @@ class OutlookComSource:
 
     # ------------------------------------------------------------- fetch
 
-    def fetch(self, since_iso: str | None) -> Iterator[MailRecord]:
+    def fetch(self, since_iso: str | None,
+              image_cutoff: str | None = None) -> Iterator[MailRecord]:
+        """image_cutoff(YYYY-MM-DD): 이 날짜 이전 메일은 인라인 이미지 추출을
+        건너뛴다 — 대량 백필에서 곧 프룬될 이미지에 COM 왕복을 쓰지 않는다."""
         for folder_const, folder_name in ((FOLDER_INBOX, "inbox"), (FOLDER_SENT, "sent")):
             folder = self._ns.GetDefaultFolder(folder_const)
             items = folder.Items
@@ -80,12 +148,13 @@ class OutlookComSource:
                 )
             item = items.GetFirst()
             while item is not None:
-                rec = self._to_record(item, folder_name)
+                rec = self._to_record(item, folder_name, image_cutoff)
                 if rec is not None:
                     yield rec
                 item = items.GetNext()
 
-    def _to_record(self, item, folder_name: str) -> MailRecord | None:
+    def _to_record(self, item, folder_name: str,
+                   image_cutoff: str | None = None) -> MailRecord | None:
         if getattr(item, "Class", None) != 43:  # olMail 만 (회의요청 등 제외)
             return None
 
@@ -103,7 +172,14 @@ class OutlookComSource:
             body = item.Body or ""
 
         when = item.ReceivedTime if folder_name == "inbox" else item.SentOn
+        when_iso = when.strftime("%Y-%m-%dT%H:%M:%S") if when else ""
         to, cc = self._recipients(item)
+
+        # 인라인 이미지 수집 — cid 참조가 있고 컷오프 안쪽 메일만 (COM 왕복 절약)
+        inline: dict = {}
+        if html and "cid:" in html.lower() and not (
+                image_cutoff and when_iso and when_iso[:10] < image_cutoff):
+            inline, _ = _collect_inline_images(item.Attachments, html)
 
         return MailRecord(
             message_id=message_id,
@@ -112,9 +188,10 @@ class OutlookComSource:
             sender_addr=self._sender_smtp(item),
             to=to,
             cc=cc,
-            sent_on=when.strftime("%Y-%m-%dT%H:%M:%S") if when else "",
+            sent_on=when_iso,
             body_text=body,
             body_html=html,
+            inline_images=inline,
             entry_id=item.EntryID,
             in_reply_to=(headers.get("In-Reply-To") or "").strip(),
             references=refs_raw.split(),

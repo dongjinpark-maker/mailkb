@@ -164,8 +164,9 @@ def cmd_sync(args) -> None:
     t0 = time.monotonic()
     prog = _SyncProgress()
     retain = int(cfg.opt("web", "image_retain_days", default=60) or 0)
-    stats = store.ingest(source.fetch(since), progress=prog.update,
-                         image_cutoff=store_mod.image_cutoff_for(retain))
+    cutoff = store_mod.image_cutoff_for(retain)
+    stats = store.ingest(source.fetch(since, image_cutoff=cutoff),
+                         progress=prog.update, image_cutoff=cutoff)
     pruned = store.maybe_prune_html(retain)
     prog.done()
     dt = time.monotonic() - t0

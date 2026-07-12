@@ -857,7 +857,10 @@ def _scenario() -> list[_Mail]:
 class FakeSource:
     name = "fake"
 
-    def fetch(self, since_iso: str | None) -> Iterator[MailRecord]:
+    def fetch(self, since_iso: str | None,
+              image_cutoff: str | None = None) -> Iterator[MailRecord]:
+        # image_cutoff 는 무시 — store 의 ingest 게이트가 동일 판정을 한다
+        #  (데모에선 '경과 메일의 cid 흔적 → 마커' 경로 시연에 오히려 필요)
         mails = sorted(_scenario(), key=lambda m: m.when)
         for i, m in enumerate(mails):
             sent_on = m.when.strftime("%Y-%m-%dT%H:%M:%S")

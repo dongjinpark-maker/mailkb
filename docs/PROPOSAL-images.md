@@ -4,7 +4,9 @@
 > auto_vacuum=INCREMENTAL)·주입(정제 후 cid 임베드·중복 생략)·컷오프 게이트·
 > 프룬(하루 1회·마커·incremental_vacuum)·렌더(마커+텍스트·빈 본문 가드)·
 > 설정 노브·fake 픽스처, WSL 검증(테스트 248건·demo 시각 확인).
-> **2단계(outlook_com cid 추출 — PC 스모크 필요) 대기.**
+> **2단계 코드 완료 (2026-07-13)** — outlook_com cid 추출
+> (_collect_inline_images: PR_ATTACH_CONTENT_ID 매칭·이미지 MIME 게이트·
+> 항목 단위 graceful, 모의 COM 객체 단위 테스트 3건). **PC 스모크만 남음.**
 > 목표: 인라인 이미지를 최근 N일(기본 60) 동안 Minerva 에서 바로 보고,
 > 그 이후는 본문을 텍스트 수준으로 압축해 **저장 용량을 늘리지 않으면서**
 > 장기 검색·AI QnA·Outlook 원문 연결은 그대로 유지한다.
@@ -130,5 +132,11 @@ Attachments 에서 찾아 base64 임베드      ├─ 이미지 있었음 → "
 ## 5. 구현 순서 (착수 시)
 
 1. ~~fake 픽스처 + strip/마커/렌더~~ ✅ 완료 (2026-07-13)
-2. outlook_com cid 추출 (PC 검증 필요 — PropertyAccessor 스모크) ← 다음
+2. ~~outlook_com cid 추출~~ ✅ 코드 완료 (2026-07-13) — **PC 스모크 체크리스트**:
+   - [ ] db.sqlite 삭제(clean start) 후 `sync --full` — 출력의
+         `인라인 이미지 임베드 n · 실패 m` 확인 (m 이 크면 Content-ID 변형 조사)
+   - [ ] 이미지 포함 최근 메일을 웹에서 열어 표시 확인 (서명 로고·스크린샷)
+   - [ ] 60일 경과 이미지 메일 → 마커 표시 확인 (첫 sync 후)
+   - [ ] winmail.dat(TNEF) 메일이 있으면 차단 마크+안내 배너로 graceful 한지
+   - [ ] --full 소요 시간 (이미지 추출 가산분 체감)
 3. demo 재생성 + 스크린샷 갱신(README 이미지에 인라인 이미지 보이면 홍보 효과)

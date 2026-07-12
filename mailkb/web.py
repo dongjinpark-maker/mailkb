@@ -2285,8 +2285,9 @@ def perform_action(store, cfg, path: str, form: dict) -> str:
         from .sources import get_source
         src = get_source(cfg.source)                 # outlook 이면 Windows COM
         retain = int(cfg.opt("web", "image_retain_days", default=60) or 0)
-        stats = store.ingest(src.fetch(store.last_sync()),
-                             image_cutoff=image_cutoff_for(retain))
+        cutoff = image_cutoff_for(retain)
+        stats = store.ingest(src.fetch(store.last_sync(), image_cutoff=cutoff),
+                             image_cutoff=cutoff)
         store.maybe_prune_html(retain)               # 하루 1회 본문 압축
         return "/?msg=" + _q(f"동기화({src.name}): 신규 {stats.inserted} · 중복 {stats.skipped}")
 
@@ -2589,8 +2590,10 @@ class _Handler(BaseHTTPRequestHandler):
                 src = get_source(self.cfg.source)
                 retain = int(self.cfg.opt("web", "image_retain_days",
                                           default=60) or 0)
-                n = store.ingest(src.fetch(store.last_sync()),
-                                 image_cutoff=image_cutoff_for(retain)).inserted
+                cutoff = image_cutoff_for(retain)
+                n = store.ingest(src.fetch(store.last_sync(),
+                                           image_cutoff=cutoff),
+                                 image_cutoff=cutoff).inserted
                 store.maybe_prune_html(retain)       # 하루 1회 본문 압축
             except Exception:             # 자동 동기화 실패는 조용히(다음 주기 재시도)
                 n = 0
