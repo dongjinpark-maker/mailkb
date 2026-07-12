@@ -1916,7 +1916,7 @@ def render_settings(store, cfg) -> str:
         out.append("<p class='empty'>차단된 발신인 없음</p>")
 
     # ── 판정 기준 (런타임 편집 → overrides.json 영구 저장) ──
-    smd = cfg.opt("ai", "summary_max_days", default=3)
+    smd = cfg.opt("ai", "summary_max_days", default=1)
     def _num(name, val, note):
         return (f"<tr><th>{esc(note[0])}</th>"
                 f"<td><input type='number' name='{name}' value='{esc(str(val))}' "
@@ -1966,7 +1966,7 @@ def render_settings(store, cfg) -> str:
         "<td class='dim'>이 주기마다 백그라운드로 메일 수집 (기본 30 · 0=끔 · 새 메일 오면 알림)</td></tr>"
         "<tr><th>이미지 보존(일)</th>"
         f"<td><input type='number' name='image_retain_days' value='{esc(str(img_days))}' "
-        "min='0' step='10' style='width:80px'></td>"
+        "min='0' step='1' style='width:80px'></td>"
         "<td class='dim'>인라인 이미지·서식 HTML 보존 기간 (기본 60 · 0=임베드 끔). "
         "경과분은 텍스트로 압축 — 늘려도 지난 것은 sync --full 로만 복구</td></tr>"
         "</table><button>저장</button></form>")

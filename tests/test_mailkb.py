@@ -647,8 +647,8 @@ class TestRollingSummarySkip(unittest.TestCase):
             ignore_senders=["noreply"],
             internal_domains=["corp.example"],
             ai_backends={"internal": {"cmd": ["dummy"]}},
-            # 이 클래스는 1통 스레드로 스킵 '사유'를 검증하므로 문턱 해제
-            raw={"ai": {"summary_min_msgs": 1}},
+            # 이 클래스는 1통 스레드로 스킵 '사유'를, 3일 창으로 소급을 검증
+            raw={"ai": {"summary_min_msgs": 1, "summary_max_days": 3}},
         )
 
     def tearDown(self):
@@ -762,13 +762,13 @@ class TestRollingSummarySkip(unittest.TestCase):
     # --- 요약 대상 날짜 창 (마지막 실행 이후) ---
 
     def test_summary_window_first_run_is_max_days(self):
-        # 마커 없음(첫 실행)도 구분 없이 최근 3일 (기본 summary_max_days=3)
+        # 마커 없음(첫 실행) — 이 클래스 설정(summary_max_days=3)으로 3일 창
         self.assertEqual(review._summary_window(self.store, self.cfg, "2026-07-20"),
                          ("2026-07-18", "2026-07-20"))
 
     def test_summary_window_max_days_config(self):
-        # summary_max_days=1 → 오늘만
-        self.cfg.raw = {"ai": {"summary_max_days": 1}}
+        # 기본값(미설정) = 1 → 오늘만 (2026-07-13 기본 3→1)
+        self.cfg.raw = {}
         self.assertEqual(review._summary_window(self.store, self.cfg, "2026-07-20"),
                          ("2026-07-20", "2026-07-20"))
 
@@ -1098,7 +1098,8 @@ class TestDecisionLedger(unittest.TestCase):
         self.cfg = Config(home=self.home, my_addresses=[ME],
                           internal_domains=["corp.example"],
                           ai_default="internal",
-                          ai_backends={"internal": {"cmd": ["echo"]}})
+                          ai_backends={"internal": {"cmd": ["echo"]}},
+                          raw={"ai": {"summary_max_days": 3}})
         self.store.ingest([
             _rec("d1", "kim@corp.example", [ME], "ECN 결정",
                  "2026-07-20T09:00:00",
@@ -1823,7 +1824,7 @@ class TestAILayer(unittest.TestCase):
             home=self.home, my_addresses=[ME],
             internal_domains=["corp.example"],
             ai_default="internal", ai_backends={"internal": {"cmd": ["echo"]}},
-            raw={"ai": {"summary_min_msgs": 1}},   # 1통 스레드로 단계를 검증
+            raw={"ai": {"summary_min_msgs": 1, "summary_max_days": 3}},
         )
 
     def tearDown(self):

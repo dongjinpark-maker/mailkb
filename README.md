@@ -98,10 +98,13 @@ python -m mailkb serve --app      # Edge 앱 모드 (주소창 없는 독립 창
 
 1. **Windows 네이티브 Python 3.11+** 설치 (WSL 불가 — COM 접근 필요)
 2. `pip install pywin32` (프록시 필요 시 `--proxy` 옵션)
-3. 이 디렉토리 복사 후:
+3. GitHub 에서 받기 (이후 갱신도 `git pull` 한 번):
    ```
+   git clone https://github.com/dongjinpark-maker/mailkb
+   cd mailkb
    python -m mailkb init          # 데이터는 코드 폴더 옆 <mailkb>\data\ 에 생성 (~/ 안 씀)
    ```
+   `data/` 는 gitignore 라 pull 이 실데이터·설정을 건드리지 않는다.
 4. `<mailkb>\data\config.toml` — **사내망 적용 설정** (리포·코드의 값은 전부 가상
    예시라, 실환경 값은 여기에만 넣는다. 다른 위치는 `--home`/`MAILKB_HOME`):
    - `my_addresses` → 실제 회사 주소. **메일 별칭(alias)으로도 발신한다면 별칭

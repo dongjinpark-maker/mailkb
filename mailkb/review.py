@@ -795,11 +795,12 @@ def _summary_window(store: Store, cfg: Config, review_date: str) -> tuple[str, s
 
     start = max(마지막 실행일, 리뷰날짜 − (summary_max_days−1)), 단 리뷰날짜 초과 금지.
     - 매일 돌리면 마지막 실행일 ≈ 리뷰날짜라 사실상 '마지막 실행 이후'와 동일.
-    - 오래 비워도(또는 첫 실행) 최대 summary_max_days(기본 3)일만 소급 → 비용 상한.
+    - 오래 비워도(또는 첫 실행) 최대 summary_max_days(기본 1 — 오늘만)일 소급.
+      건너뛴 날 소급이 필요하면 config 에서 2~3 으로 (비용 상한 트레이드오프).
       → 3일 넘게 비운 구간의 가장 오래된 날은 요약에서 빠질 수 있음(의도된 트레이드오프).
     이미 요약된 스레드는 증분 가드로 재호출 없이 스킵되므로 소급은 값싸다.
     """
-    n = max(1, int(cfg.opt("ai", "summary_max_days", default=3)))
+    n = max(1, int(cfg.opt("ai", "summary_max_days", default=1)))
     floor = (date.fromisoformat(review_date) - timedelta(days=n - 1)).isoformat()
     last = store.get_state("last_summary")
     base = max(last, floor) if last else floor

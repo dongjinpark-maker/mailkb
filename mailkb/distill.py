@@ -227,10 +227,11 @@ def _harvest_window(store: Store, cfg: Config, date_iso: str) -> tuple[str, str]
 
     - 마커 `last_harvest`(프롬프트에 실은 가장 최신 메시지의 타임스탬프) 이후의
       메시지만 재료 → 같은 날 재실행은 새 메일이 없으면 AI 콜 없이 끝난다.
-    - 소급 상한 = ai.summary_max_days(기본 3일) — 오래 비운 구간의 비용 상한(요약과 동일).
+    - 소급 상한 = ai.summary_max_days(기본 1일 — 오늘만, 요약과 공유). 건너뛴 날
+      소급이 필요하면 config 에서 늘린다.
     - 과거 --date 백필(마커보다 과거 날짜)은 그 날짜 하루만 보고 마커는 안 움직인다.
     """
-    n = max(1, int(cfg.opt("ai", "summary_max_days", default=3)))
+    n = max(1, int(cfg.opt("ai", "summary_max_days", default=1)))
     try:
         floor = (date.fromisoformat(date_iso) - timedelta(days=n - 1)).isoformat()
     except ValueError:
