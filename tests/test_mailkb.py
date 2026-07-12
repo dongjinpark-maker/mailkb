@@ -1,6 +1,7 @@
 """핵심 로직 단위 테스트: 인용 제거, 스레딩, 미답변 판정."""
 
 import json
+from datetime import date, timedelta
 import os
 import sys
 import tempfile
@@ -410,18 +411,6 @@ class TestStore(unittest.TestCase):
         self.assertEqual(self.store.thread(tid)["hidden"], 1)
         self.assertEqual(self.store.unanswered(days=3650), [])
 
-    def test_migrate_dismissed_to_hidden(self):
-        # 구 추적제외(dismissed) 데이터는 _migrate 가 숨김으로 이관
-        self.store.ingest([_rec("m1", "kim@c", [ME], "이관 건", "2026-07-01T09:00:00")])
-        tid = self.store.message("1")["thread_id"]
-        self.store.db.execute(
-            "UPDATE threads SET status='dismissed' WHERE id=?", (tid,))
-        self.store.db.commit()
-        s2 = Store(self.store.db_path, [ME])       # 재오픈 → _migrate 실행
-        row = s2.thread(tid)
-        self.assertEqual((row["hidden"], row["status"]), (1, "open"))
-        s2.close()
-
     def test_unanswered_detection(self):
         self.store.ingest([
             # 스레드 1: 내가 마지막 답장 → 미답변 아님
@@ -471,6 +460,104 @@ class TestStore(unittest.TestCase):
         self.assertEqual(rows[0]["to_count"], 1)       # 내가 kim 에게 1회
         addrs = [r["addr"] for r in rows]
         self.assertNotIn(ME, addrs)                    # 내 주소는 people 에 없음
+
+
+class TestInlineImages(unittest.TestCase):
+    """인라인 이미지 수명주기 — 주입(정제 후)·컷오프 게이트·프룬 마커·렌더."""
+
+    PNG = ("image/png", b"\x89PNG-fake-bytes-0123456789")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "t.sqlite", [ME])
+        self.cfg = Config(home=Path(self.tmp.name), my_addresses=[ME],
+                          internal_domains=["corp.example"])
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _img_rec(self, mid, when, cids=("a@x",), dup=False):
+        imgs = "".join(f'<img src="cid:{c}">' for c in cids)
+        if dup:
+            imgs += f'<img src="cid:{cids[0]}">'
+        return MailRecord(
+            message_id=f"<{mid}@t>", subject=f"이미지건 {mid}",
+            sender_name="kim", sender_addr="kim@corp.example", to=[ME],
+            sent_on=when, body_text="파형 공유드립니다.",
+            body_html=f"<p>파형 공유</p>{imgs}",
+            inline_images={c: self.PNG for c in cids})
+
+    def _html(self, mid):
+        r = self.store.db.execute(
+            "SELECT h.html FROM message_html h JOIN messages m ON m.id=h.message_id "
+            "WHERE m.message_id=?", (f"<{mid}@t>",)).fetchone()
+        return r["html"] if r else None
+
+    def test_inject_after_sanitize_with_dedup_and_fail(self):
+        from mailkb.clean import inject_inline_images, sanitize_html
+        html = sanitize_html(
+            '<p>공유</p><img src="cid:W1@X"><img src="cid:W1@X"><img src="cid:none@x">')
+        out, n, fail = inject_inline_images(html, {"<w1@x>": self.PNG})
+        self.assertEqual((n, fail), (1, 1))         # 정규화 매칭 · 실패 집계
+        self.assertEqual(out.count("data:image/png;base64,"), 1)
+        self.assertIn("중복 이미지 생략", out)       # 메일 내 중복 1회만
+        self.assertIn('data-blocked-src="cid:none@x"', out)  # 실패 → 차단 마크 유지
+
+    def test_ingest_embeds_and_counts(self):
+        stats = self.store.ingest([self._img_rec("n1", "2026-07-10T09:00:00",
+                                                 cids=("a@x", "b@x"), dup=True)])
+        self.assertEqual((stats.img_embedded, stats.img_failed), (2, 0))
+        html = self._html("n1")
+        self.assertEqual(html.count("data:image/"), 2)
+        self.assertIn("중복 이미지 생략", html)
+
+    def test_ingest_cutoff_gate_skips_old(self):
+        stats = self.store.ingest(
+            [self._img_rec("o1", "2026-05-01T09:00:00")],
+            image_cutoff="2026-06-01")
+        self.assertEqual(stats.img_embedded, 0)      # 컷오프 이전 — 임베드 스킵
+        self.assertIn('data-blocked-src="cid:', self._html("o1"))
+
+    def test_prune_marker_delete_and_marker_survives(self):
+        old_day = (date.today() - timedelta(days=20)).isoformat()
+        self.store.ingest([
+            self._img_rec("img", f"{old_day}T09:00:00"),          # 이미지 → 마커
+            MailRecord(message_id="<txt@t>", subject="서식만",
+                       sender_name="kim", sender_addr="kim@corp.example",
+                       to=[ME], sent_on=f"{old_day}T10:00:00",
+                       body_text="표 있는 본문", body_html="<p><b>표</b> 본문</p>"),
+            self._img_rec("new", "%sT09:00:00" % date.today().isoformat()),
+        ])
+        res = self.store.maybe_prune_html(14)
+        self.assertEqual(res, (1, 1))                # 마커 1 · 삭제 1
+        self.assertIn("이미지 1장", self._html("img"))
+        self.assertIn("보존 기간(14일)", self._html("img"))
+        self.assertIsNone(self._html("txt"))         # 서식 HTML 회수
+        self.assertIn("data:image/", self._html("new"))  # 최근은 유지
+        # 하루 1회 가드 — 같은 날 재호출 None
+        self.assertIsNone(self.store.maybe_prune_html(14))
+        # 마커는 다음날 프룬에서도 보존 (재프룬 금지)
+        self.store.set_state("last_image_prune", "2000-01-01")
+        self.assertEqual(self.store.maybe_prune_html(14), (0, 0))
+        self.assertIn("이미지 1장", self._html("img"))
+
+    def test_prune_disabled_when_zero(self):
+        self.assertIsNone(self.store.maybe_prune_html(0))
+        # 컷오프 sentinel: retain 0 → 전부 게이트
+        from mailkb.store import image_cutoff_for
+        self.assertEqual(image_cutoff_for(0), "9999-12-31")
+
+    def test_render_marker_banner_with_text(self):
+        from mailkb import web
+        old_day = (date.today() - timedelta(days=20)).isoformat()
+        self.store.ingest([self._img_rec("img", f"{old_day}T09:00:00")])
+        self.store.maybe_prune_html(14)
+        tid = self.store.message("1")["thread_id"]
+        out = web.render_thread(self.store, tid)
+        self.assertIn("class='imgstrip'", out)        # 마커 배너
+        self.assertIn("파형 공유드립니다", out)        # 텍스트 본문 함께
+        self.assertNotIn("md-toggle", out)             # 마커는 html 취급 안 함
 
 
 class TestRollingSummarySkip(unittest.TestCase):
@@ -1908,7 +1995,7 @@ class TestWeb(unittest.TestCase):
         out = self.web.render_thread(self.store, tid)
         self.assertIn("<b>부탁</b>", out)             # 서식 렌더
         self.assertIn("data-blocked-src", out)         # 원격 이미지 차단
-        self.assertIn("원격 이미지 차단", out)          # 안내 배너
+        self.assertIn("일부 이미지를 표시할 수 없습니다", out)   # 안내 배너
 
     def test_thread_markdown_toggle_for_text_mail(self):
         # text-only 메일이 마크다운으로 보이면 토글 버튼 + 원문(md-raw) + 서식(md-rich)
@@ -2221,6 +2308,19 @@ class TestWeb(unittest.TestCase):
         self.assertIn("spam@vendor.example", out)          # 차단 목록
         self.assertIn("/settings/unblock", out)            # 해제 폼
         self.assertIn("broadcast_to", out)                 # 현재 기준
+
+    def test_settings_image_retain_knob(self):
+        page = self.web.render_settings(self.store, self.cfg)
+        self.assertIn("이미지 보존(일)", page)
+        self.assertIn("name='image_retain_days'", page)
+        self.assertIn("value='60'", page)              # 기본값
+        # 저장 경로: _SETTINGS_INTS 에 등재 → overrides.json 영구
+        loc = self.web._save_settings(self.cfg.home,
+                                      {"image_retain_days": ["30"]})
+        self.assertIn("/settings", loc)
+        import mailkb.config as cfgmod2
+        self.assertEqual(
+            cfgmod2.read_overrides(self.cfg.home)["web"]["image_retain_days"], 30)
 
     def test_settings_about_section(self):
         # 설정 하단 정보(About): 버전·GitHub 링크·저작권

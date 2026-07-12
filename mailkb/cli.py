@@ -14,6 +14,7 @@ from datetime import date
 
 from . import config as config_mod
 from . import notes, review
+from . import store as store_mod
 from .store import Store
 
 
@@ -162,7 +163,10 @@ def cmd_sync(args) -> None:
           + (f" (since {since[:16]})" if since else ""), file=sys.stderr, flush=True)
     t0 = time.monotonic()
     prog = _SyncProgress()
-    stats = store.ingest(source.fetch(since), progress=prog.update)
+    retain = int(cfg.opt("web", "image_retain_days", default=60) or 0)
+    stats = store.ingest(source.fetch(since), progress=prog.update,
+                         image_cutoff=store_mod.image_cutoff_for(retain))
+    pruned = store.maybe_prune_html(retain)
     prog.done()
     dt = time.monotonic() - t0
 
@@ -175,6 +179,11 @@ def cmd_sync(args) -> None:
         print(f"  인용 제거 {stats.raw_chars:,}자 → {stats.kept_chars:,}자 (절감 {saved}%)")
     elif stats.skipped and not stats.fetched - stats.skipped:
         print("  변경 없음 (겹쳐 읽은 경계 메일만 — 정상)")
+    if stats.img_embedded or stats.img_failed:
+        print(f"  인라인 이미지 임베드 {stats.img_embedded}"
+              + (f"   실패 {stats.img_failed} (Outlook에서 확인)" if stats.img_failed else ""))
+    if pruned:
+        print(f"  본문 압축(보존 {retain}일 경과): 이미지 마커 {pruned[0]} · HTML 회수 {pruned[1]}")
 
 
 def cmd_ls(args) -> None:

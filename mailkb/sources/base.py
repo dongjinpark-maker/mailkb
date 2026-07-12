@@ -23,6 +23,10 @@ class MailRecord:
     sent_on: str = ""          # ISO8601 "YYYY-MM-DDTHH:MM:SS"
     body_text: str = ""        # 평문/마크다운 본문 (검색·AI·신호용 — 인용 제거 대상)
     body_html: str = ""        # 원본 HTML (표시용 — store 가 정제해 저장; 없으면 "")
+    inline_images: dict = field(default_factory=dict)
+    # {cid: (mime, bytes)} — HTML 의 cid: 참조에 대응하는 인라인 이미지 바이트.
+    # 소스가 바이트만 동봉하고 치환은 store 가 정제(인용 절단) '후'에 한다
+    # (docs/PROPOSAL-images.md — 재인용 체인 중복 임베드 방지)
     entry_id: str = ""         # Outlook EntryID (불안정 — 폴더 이동 시 변경)
     in_reply_to: str = ""
     references: list[str] = field(default_factory=list)

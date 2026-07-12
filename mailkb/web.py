@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from . import __version__, config as cfgmod, report, review
-from .store import Store
+from .store import Store, image_cutoff_for
 
 # 데일리 생성 백그라운드 잡(단일) — 웹은 단일 스레드라 리뷰(수 초~수십 초)는 별 스레드로
 # step: 진행 단계(1~total, 0=미상/비-AI) — 대기 화면 프로그레스 바 재료
@@ -358,6 +358,12 @@ input, select, textarea { background: var(--surface); color: var(--ink); }
   0%, 100% { transform: rotate(-7deg) translateY(0); }
   50%      { transform: rotate(7deg) translateY(-3px); }
 }
+/* 이미지 보존 기간 경과 마커(프룬 산출) · 메일 내 중복 이미지 생략 표시 */
+.imgstrip { background: var(--surface-3); border: 1px dashed var(--border-strong);
+    border-radius: 6px; padding: 5px 10px; font-size: 12.5px; color: var(--ink-3);
+    margin-bottom: 8px; }
+.imgnote-inline { display: inline-block; font-size: 12px; color: var(--muted);
+    border: 1px dashed var(--border); border-radius: 4px; padding: 1px 6px; }
 .rvbar { max-width: 420px; height: 8px; background: var(--surface-3);
     border-radius: 999px; overflow: hidden; margin: 8px 0 6px; }
 .rvfill { height: 100%; background: var(--accent); border-radius: 999px;
@@ -1823,7 +1829,12 @@ def render_thread(store, tid: int) -> str:
         out.append(f"<div{cls}>{esc(a)}</div>")
     out.append("</div>")
     # text-only 메일 중 마크다운으로 보이는 게 하나라도 있으면 스레드당 토글 버튼 1개.
-    raws = ["" if blk["html"] else "\n".join(blk["body"]) for blk in d["timeline"]]
+    # 프룬 마커(이미지 보존 기간 경과)는 HTML 로 취급하지 않음 — 텍스트와 함께 표시
+    def _is_strip_marker(h):
+        return (h or "").startswith("<div class='imgstrip'>")
+
+    raws = ["" if (blk["html"] and not _is_strip_marker(blk["html"]))
+            else "\n".join(blk["body"]) for blk in d["timeline"]]
     any_md = any(r and _looks_like_markdown(r) for r in raws)
     out.append("<div class='mthread'>")
     if any_md:
@@ -1844,18 +1855,28 @@ def render_thread(store, tid: int) -> str:
             f"<span class='mh-who'>{arrow} {who}{att}</span>"
             f"<span class='mh-when'>{esc(blk['sent_on'])}</span></div>")
         out.append("<div class='mbody'>")
-        if blk["html"]:
+        if blk["html"] and _is_strip_marker(blk["html"]):
+            # 보존 기간 경과 — 마커 배너 + 텍스트 본문 (docs/PROPOSAL-images.md)
+            out.append(blk["html"])          # 마커는 프룬이 만든 고정 형식
+            if raw.strip():
+                out.append("<pre style='white-space:pre-wrap'>" + esc(raw) + "</pre>")
+            else:
+                out.append("<p class='dim'>본문 없음 — Outlook에서 확인</p>")
+        elif blk["html"]:
             if "data-blocked-src" in blk["html"]:
-                out.append("<div class='imgnote'>🚫 원격 이미지 차단됨 — "
-                           "원문은 Outlook에서 확인</div>")
+                out.append("<div class='imgnote'>🚫 일부 이미지를 표시할 수 없습니다"
+                           "(원격 차단 또는 추출 실패) — 원문은 Outlook에서</div>")
             out.append(blk["html"])          # 이미 정제됨(store)
         elif raw and _looks_like_markdown(raw):
             # 원문(기본)과 서식(숨김) 둘 다 실어 토글은 순수 show/hide 로 처리.
             out.append("<pre class='md-raw' style='white-space:pre-wrap'>"
                        + esc(raw) + "</pre>")
             out.append("<div class='md-rich'>" + _mail_md_to_html(raw) + "</div>")
-        else:
+        elif raw.strip():
             out.append("<pre style='white-space:pre-wrap'>" + esc(raw) + "</pre>")
+        else:
+            # 이미지-전용 메일 등 텍스트가 비면(빈 본문 가드) 안내만
+            out.append("<p class='dim'>본문 없음 — Outlook에서 확인</p>")
         out.append("</div></div>")
     out.append("</div>")   # .mthread
     return "\n".join(out)
@@ -1930,6 +1951,7 @@ def render_settings(store, cfg) -> str:
     # ── 표시 설정 ──
     rw = cfg.opt("web", "reading_width", default=1200)
     sync_min = cfg.opt("web", "sync_interval_min", default=30)
+    img_days = cfg.opt("web", "image_retain_days", default=60)
     out.append("<h2>표시 · 동기화</h2>")
     out.append(
         "<form method='post' action='/settings/save'>"
@@ -1942,6 +1964,11 @@ def render_settings(store, cfg) -> str:
         f"<td><input type='number' name='sync_interval_min' value='{esc(str(sync_min))}' "
         "min='0' step='5' style='width:80px'></td>"
         "<td class='dim'>이 주기마다 백그라운드로 메일 수집 (기본 30 · 0=끔 · 새 메일 오면 알림)</td></tr>"
+        "<tr><th>이미지 보존(일)</th>"
+        f"<td><input type='number' name='image_retain_days' value='{esc(str(img_days))}' "
+        "min='0' step='10' style='width:80px'></td>"
+        "<td class='dim'>인라인 이미지·서식 HTML 보존 기간 (기본 60 · 0=임베드 끔). "
+        "경과분은 텍스트로 압축 — 늘려도 지난 것은 sync --full 로만 복구</td></tr>"
         "</table><button>저장</button></form>")
 
     # ── 노이즈 규칙 (발신자·제목) ──
@@ -1989,6 +2016,7 @@ _SETTINGS_INTS = [   # (폼 필드, 오버라이드 섹션, 키, 최소값)
     ("summary_max_days", "ai", "summary_max_days", 1),
     ("reading_width", "web", "reading_width", 600),
     ("sync_interval_min", "web", "sync_interval_min", 0),   # 0=자동 동기화 끔
+    ("image_retain_days", "web", "image_retain_days", 0),   # 0=이미지 임베드 끔
 ]
 _NOISE_LISTS = {"ignore_senders", "subject_noise_strong", "subject_noise_weak"}
 
@@ -2256,7 +2284,10 @@ def perform_action(store, cfg, path: str, form: dict) -> str:
     if path == "/sync":
         from .sources import get_source
         src = get_source(cfg.source)                 # outlook 이면 Windows COM
-        stats = store.ingest(src.fetch(store.last_sync()))
+        retain = int(cfg.opt("web", "image_retain_days", default=60) or 0)
+        stats = store.ingest(src.fetch(store.last_sync()),
+                             image_cutoff=image_cutoff_for(retain))
+        store.maybe_prune_html(retain)               # 하루 1회 본문 압축
         return "/?msg=" + _q(f"동기화({src.name}): 신규 {stats.inserted} · 중복 {stats.skipped}")
 
     if path == "/settings/unblock":
@@ -2556,7 +2587,11 @@ class _Handler(BaseHTTPRequestHandler):
             try:
                 from .sources import get_source
                 src = get_source(self.cfg.source)
-                n = store.ingest(src.fetch(store.last_sync())).inserted
+                retain = int(self.cfg.opt("web", "image_retain_days",
+                                          default=60) or 0)
+                n = store.ingest(src.fetch(store.last_sync()),
+                                 image_cutoff=image_cutoff_for(retain)).inserted
+                store.maybe_prune_html(retain)       # 하루 1회 본문 압축
             except Exception:             # 자동 동기화 실패는 조용히(다음 주기 재시도)
                 n = 0
             finally:

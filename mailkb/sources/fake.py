@@ -59,10 +59,48 @@ _RICH_HTML = {
         "<div> ---------</div>"
         "<p>From: 김도현</p><p>이전 인용 내용입니다. 지난 셔틀 일정은…</p>"
     ),
+    # 인라인(cid) 이미지 — 최근(표시)과 보존 기간 경과(마커) 두 상태 데모.
+    # 같은 이미지를 두 번 참조해 '중복 생략' 표시도 함께 시연.
+    "imgnew": (
+        "<p>브링업 보드 부팅 파형 공유드립니다.</p>"
+        '<p>정상 케이스:<br><img src="cid:wave1@nurisoft" alt="정상 파형"></p>'
+        '<p>행 재현 케이스:<br><img src="cid:wave2@nurisoft" alt="행 파형"></p>'
+        '<p>(참고 — 정상 파형 재게시)<br><img src="cid:wave1@nurisoft"></p>'
+        "<p>행 케이스는 PLL 락 직후 리셋이 관측됩니다. 분석 의견 부탁드립니다.</p>"
+    ),
+    "imgold": (
+        "<p>지난달 레이아웃 스냅샷 공유합니다.</p>"
+        '<img src="cid:floor1@nurisoft" alt="레이아웃">'
+        "<p>다음 리비전에서 매크로 배치가 바뀔 예정입니다.</p>"
+    ),
 }
 
 # body_html 을 비워 텍스트 메일로 보내는 키 — 웹 마크다운 토글(#21) 데모
 _NO_HTML = {"mdmail"}
+
+
+def _png(rgb: tuple, size: int = 24) -> bytes:
+    """합성 단색 PNG (stdlib) — 인라인 이미지 데모용 (수백 바이트)."""
+    import struct
+    import zlib
+
+    def chunk(t: bytes, d: bytes) -> bytes:
+        return (struct.pack(">I", len(d)) + t + d
+                + struct.pack(">I", zlib.crc32(t + d)))
+
+    ihdr = struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)
+    raw = b"".join(b"\x00" + bytes(rgb) * size for _ in range(size))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+# 인라인(cid) 이미지 메일 — sanitize 가 cid 를 차단 마크로 바꾸고 store 가
+# inline_images 바이트를 주입한다 (docs/PROPOSAL-images.md 경로 그대로 재현)
+_INLINE_IMAGES = {
+    "imgnew": {"wave1@nurisoft": ("image/png", _png((70, 130, 220))),
+               "wave2@nurisoft": ("image/png", _png((220, 120, 70)))},
+    "imgold": {"floor1@nurisoft": ("image/png", _png((120, 190, 120)))},
+}
 
 _PEOPLE = {
     # 사내 인물 (NPX-200 엣지 NPU SoC 개발 조직)
@@ -447,6 +485,14 @@ def _scenario() -> list[_Mail]:
          "위 (c), (d)는 리소스 배정이 필요해 다음 주간회의 안건으로 올리겠습니다.\n"
          "상세 데이터는 첨부 참고 바랍니다.",
          _day(2, 18), attachments=["llm_demo_회고.pptx"])
+
+    # 인라인 이미지 메일 — 최근(이미지 표시) / 보존 기간(demo 14일) 경과(마커)
+    send("imgnew", "lee", ["me"], [], "브링업 부팅 파형 공유",
+         "브링업 보드 부팅 파형 공유드립니다. 행 케이스는 PLL 락 직후 리셋이\n"
+         "관측됩니다. 분석 의견 부탁드립니다.", _day(1, 15, 20))
+    send("imgold", "jung", ["me"], [], "레이아웃 스냅샷 공유(구건)",
+         "지난달 레이아웃 스냅샷 공유합니다. 다음 리비전에서 매크로 배치가\n"
+         "바뀔 예정입니다.", _day(20, 11, 10))
 
     # 야간 발신 단발 (§4 야간·주말 데모 보강)
     send("night1", "me", ["lee"], [], "RE: nightly 회귀 크래시 분석",
@@ -834,5 +880,6 @@ class FakeSource:
                 references=[parent_id] if parent_id else [],
                 conversation_key="",
                 attachments=m.attachments,
+                inline_images=_INLINE_IMAGES.get(m.key, {}),
                 folder="sent" if m.sender_addr in (ME, ME_ALIAS) else "inbox",
             )

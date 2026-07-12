@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
-from .clean import extract_new_content, normalize_subject, sanitize_html
+from .clean import (extract_new_content, inject_inline_images,
+                    normalize_subject, sanitize_html)
 from .sources.base import MailRecord
 
 _SCHEMA = """
@@ -29,10 +30,16 @@ CREATE TABLE IF NOT EXISTS messages (
     is_sent      INTEGER DEFAULT 0,    -- 내가 보낸 메일
     attach_names TEXT DEFAULT '',      -- 파일명만; 내용은 Outlook 에서 O(1) 조회
     new_content  TEXT DEFAULT '',      -- 인용 제거된 신규 텍스트
-    body_html    TEXT DEFAULT '',      -- 정제된 표시용 HTML (웹 UI; 없으면 '')
     read_at      TEXT DEFAULT '',      -- 웹에서 스레드 열람 시각 (빈값=미읽음)
     raw_chars    INTEGER DEFAULT 0,    -- 절감 측정용 원본 길이
     folder       TEXT DEFAULT ''
+);
+-- 표시용 HTML(이미지 임베드 포함)은 별도 테이블 — 큰 blob 이 messages 행에
+-- 끼면 목록·카운트 전수 스캔이 오버플로 페이지를 건너 읽어 느려진다
+-- (docs/PROPOSAL-images.md 3-B-2). 스레드 열람 때만 조인.
+CREATE TABLE IF NOT EXISTS message_html (
+    message_id INTEGER PRIMARY KEY,   -- messages.id
+    html       TEXT DEFAULT ''        -- 정제·이미지 임베드된 HTML (프룬 대상)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id);
 CREATE INDEX IF NOT EXISTS idx_messages_sent_on ON messages(sent_on);
@@ -137,6 +144,18 @@ class SyncStats:
     new_threads: int = 0
     raw_chars: int = 0
     kept_chars: int = 0
+    img_embedded: int = 0   # 인라인 이미지 임베드 수
+    img_failed: int = 0     # cid 매칭 실패(차단 마크 잔존) — PC 관찰용
+
+
+def image_cutoff_for(retain_days: int) -> str:
+    """ingest 이미지 게이트용 컷오프(YYYY-MM-DD).
+
+    retain_days <= 0 은 기능 끔 — 모든 메일이 컷오프 이전이 되는 sentinel 반환.
+    """
+    if retain_days <= 0:
+        return "9999-12-31"
+    return (datetime.now() - timedelta(days=retain_days)).date().isoformat()
 
 
 class Store:
@@ -145,34 +164,21 @@ class Store:
         self.my_addresses = {a.lower() for a in my_addresses}
         self.db = sqlite3.connect(db_path)
         self.db.row_factory = sqlite3.Row
+        # incremental vacuum: 이미지 프룬이 지운 공간을 조각 단위로 회수 —
+        # 풀 VACUUM(수십 초 배타 잠금)은 단일 스레드 웹 서버를 세우므로 금지.
+        # 이 PRAGMA 는 새 DB(테이블 생성 전)에서만 효력 — clean start 전제.
+        self.db.execute("PRAGMA auto_vacuum=INCREMENTAL")
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=5000")  # 웹 백그라운드 쓰기 경합 대비
         self.db.executescript(_SCHEMA)
-        self._migrate()
+        # (구 _migrate 는 2026-07-12 제거 — 스키마 개편은 clean start 로,
+        #  기존 DB 는 삭제 후 sync --full 재수집)
         try:
             self.db.execute(_FTS_TRIGRAM)
             self.fts_tokenizer = "trigram"
         except sqlite3.OperationalError:
             self.db.execute(_FTS_FALLBACK)
             self.fts_tokenizer = "unicode61"
-        self.db.commit()
-
-    def _migrate(self) -> None:
-        """기존 DB 스키마 진화 — 없는 컬럼만 안전하게 추가(기존 데이터 무손상)."""
-        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(messages)")}
-        if "body_html" not in cols:
-            self.db.execute("ALTER TABLE messages ADD COLUMN body_html TEXT DEFAULT ''")
-        if "read_at" not in cols:
-            self.db.execute("ALTER TABLE messages ADD COLUMN read_at TEXT DEFAULT ''")
-        tcols = {r["name"] for r in self.db.execute("PRAGMA table_info(threads)")}
-        if "flagged" not in tcols:
-            self.db.execute("ALTER TABLE threads ADD COLUMN flagged INTEGER DEFAULT 0")
-        if "hidden" not in tcols:
-            self.db.execute("ALTER TABLE threads ADD COLUMN hidden INTEGER DEFAULT 0")
-        # 추적제외(dismissed) 폐지(2026-07-12) — 기존 데이터는 숨김으로 이관.
-        # 숨김이 자동 해제(새 수신 시)까지 흡수했으므로 의미 손실 없음.
-        self.db.execute(
-            "UPDATE threads SET hidden=1, status='open' WHERE status='dismissed'")
         self.db.commit()
 
     def close(self) -> None:
@@ -186,16 +192,19 @@ class Store:
         ).fetchone()
         return row["value"] if row else None
 
-    def ingest(self, records, progress=None) -> SyncStats:
+    def ingest(self, records, progress=None,
+               image_cutoff: str | None = None) -> SyncStats:
         """MailRecord 스트림을 인덱싱. 시간순 입력을 가정.
 
         progress(stats) 가 주어지면 레코드마다 호출된다(CLI 라이브 카운터용).
+        image_cutoff(YYYY-MM-DD): 이 날짜 이전 메일은 인라인 이미지를 임베드하지
+        않는다(대량 백필에서 곧 프룬될 이미지 낭비 방지). None 이면 게이트 없음.
         """
         stats = SyncStats()
         max_seen = self.last_sync() or ""
         for rec in records:
             stats.fetched += 1
-            if self._insert(rec, stats):
+            if self._insert(rec, stats, image_cutoff):
                 stats.inserted += 1
             else:
                 stats.skipped += 1
@@ -212,7 +221,8 @@ class Store:
         self.db.commit()
         return stats
 
-    def _insert(self, rec: MailRecord, stats: SyncStats) -> bool:
+    def _insert(self, rec: MailRecord, stats: SyncStats,
+                image_cutoff: str | None = None) -> bool:
         exists = self.db.execute(
             "SELECT 1 FROM messages WHERE message_id=?", (rec.message_id,)
         ).fetchone()
@@ -221,6 +231,14 @@ class Store:
 
         new_content = extract_new_content(rec.body_text)
         body_html = sanitize_html(rec.body_html) if rec.body_html else ""
+        # 인라인 이미지 주입 — 정제(인용 절단) '후' 살아남은 cid 에만 (중복 1회).
+        # 컷오프 이전 메일은 스킵 (어차피 프룬 대상 — 대량 백필 낭비 방지).
+        if body_html and rec.inline_images and not (
+                image_cutoff and (rec.sent_on or "")[:10] < image_cutoff):
+            body_html, n_emb, n_fail = inject_inline_images(
+                body_html, rec.inline_images)
+            stats.img_embedded += n_emb
+            stats.img_failed += n_fail
         stats.raw_chars += len(rec.body_text)
         stats.kept_chars += len(new_content)
         is_sent = int(rec.sender_addr.lower() in self.my_addresses)
@@ -230,17 +248,21 @@ class Store:
             """INSERT INTO messages
                (message_id, entry_id, thread_id, subject, sender_name, sender_addr,
                 to_addrs, cc_addrs, sent_on, is_sent, attach_names, new_content,
-                body_html, raw_chars, folder)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                raw_chars, folder)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 rec.message_id, rec.entry_id, thread_id, rec.subject,
                 rec.sender_name, rec.sender_addr.lower(),
                 ";".join(a.lower() for a in rec.to),
                 ";".join(a.lower() for a in rec.cc),
                 rec.sent_on, is_sent, ";".join(rec.attachments),
-                new_content, body_html, len(rec.body_text), rec.folder,
+                new_content, len(rec.body_text), rec.folder,
             ),
         )
+        if body_html:
+            self.db.execute(
+                "INSERT INTO message_html(message_id, html) VALUES (?, ?)",
+                (cur.lastrowid, body_html))
         self.db.execute(_FTS_SYNC, (cur.lastrowid, rec.subject, new_content))
         self._touch_thread(thread_id, rec.sent_on)
         # 새 수신 메일이 숨긴 스레드에 오면 자동 숨김 해제 — "지금은 조용히,
@@ -430,8 +452,11 @@ class Store:
         ).fetchall()
 
     def thread_messages(self, thread_id: int) -> list[sqlite3.Row]:
+        """스레드 메시지 (표시용 HTML 은 message_html 조인 — 키명 body_html 유지)."""
         return self.db.execute(
-            "SELECT * FROM messages WHERE thread_id=? ORDER BY sent_on",
+            "SELECT m.*, COALESCE(h.html, '') AS body_html "
+            "FROM messages m LEFT JOIN message_html h ON h.message_id = m.id "
+            "WHERE m.thread_id=? ORDER BY m.sent_on",
             (thread_id,),
         ).fetchall()
 
@@ -675,6 +700,63 @@ class Store:
                VALUES (?,?,?,?,?,?,datetime('now'))""",
             (date_iso, kind, who or "", thread_id, signal or "", quote or ""))
         self.db.commit()
+
+    # ------------------------------------------ 본문 HTML 수명주기 (이미지 프룬)
+    # docs/PROPOSAL-images.md: retain_days 경과 시 표시용 HTML 을 텍스트 수준으로
+    # 압축 — 이미지 있던 메일은 초경량 마커 한 줄, 없던 메일은 행 삭제.
+    # 검색(FTS)·AI 재료는 new_content 라 무손실.
+
+    _STRIP_MARK = "<div class='imgstrip'>"
+
+    def maybe_prune_html(self, retain_days: int) -> tuple[int, int] | None:
+        """sync 종료 훅 — 하루 1회만 실제 프룬. (마커 n, 삭제 n) 또는 None(스킵).
+
+        retain_days <= 0 이면 기능 끔(임베드도 프룬도 안 함 — 현행 유지).
+        건너뛴 날은 다음 실행이 경과일 기준으로 한 번에 처리(누락 없음).
+        """
+        if retain_days <= 0:
+            return None
+        today = datetime.now().date().isoformat()
+        if self.get_state("last_image_prune") == today:
+            return None
+        n_mark, n_del = self._prune_html(retain_days)
+        self.set_state("last_image_prune", today)
+        if n_mark or n_del:
+            # 조각 회수 — 풀 VACUUM(배타 수십 초) 금지, auto_vacuum=INCREMENTAL 전제
+            self.db.execute("PRAGMA incremental_vacuum")
+            self.db.commit()
+        return n_mark, n_del
+
+    def _prune_html(self, retain_days: int) -> tuple[int, int]:
+        """retain_days 경과 메일의 message_html 압축 — (마커 전환 n, 삭제 n)."""
+        cutoff = (datetime.now() - timedelta(days=retain_days)).date().isoformat()
+        n_mark = n_del = 0
+        rows = self.db.execute(
+            "SELECT h.message_id AS mid, h.html FROM message_html h "
+            "JOIN messages m ON m.id = h.message_id "
+            "WHERE substr(m.sent_on, 1, 10) < ?", (cutoff,)).fetchall()
+        for r in rows:
+            html = r["html"] or ""
+            if html.startswith(self._STRIP_MARK):
+                continue                      # 이미 마커 — 재프룬 금지
+            # 임베드분 + 미임베드 cid 흔적(컷오프 게이트로 건너뛴 백필 메일)
+            # 둘 다 '이미지 있었음' — 마커로 흔적을 남긴다
+            n_img = (html.count("data:image/")
+                     + html.count('data-blocked-src="cid:'))
+            if n_img:
+                marker = (f"{self._STRIP_MARK}🖼 이미지 {n_img}장 — "
+                          f"보존 기간({retain_days}일) 경과, 원본은 Outlook에서"
+                          "</div>")
+                self.db.execute(
+                    "UPDATE message_html SET html=? WHERE message_id=?",
+                    (marker, r["mid"]))
+                n_mark += 1
+            else:
+                self.db.execute(
+                    "DELETE FROM message_html WHERE message_id=?", (r["mid"],))
+                n_del += 1
+        self.db.commit()
+        return n_mark, n_del
 
     def save_summary(self, thread_id: int, summary: str, msg_count: int) -> None:
         self.db.execute(

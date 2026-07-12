@@ -612,3 +612,57 @@ def normalize_subject(subject: str) -> str:
     """RE:/FW:/회신:/전달: 접두어를 제거한 스레드 매칭용 제목."""
     s = _SUBJECT_PREFIX.sub("", subject or "")
     return re.sub(r"\s+", " ", s).strip().lower()
+
+
+# ------------------------------------------------ 인라인 이미지 주입 (cid → data:)
+# sanitize_html 은 cid: 를 원격 이미지처럼 data-blocked-src 로 무력화해 둔다.
+# 여기서 정제(인용 절단) '후'에 살아남은 cid 참조에만 바이트를 base64 로 주입
+# — 잘려나간 재인용 체인 속 이미지는 임베드되지 않는다 (docs/PROPOSAL-images.md).
+
+_CID_IMG_RX = re.compile(
+    r"<img\b[^>]*\bdata-blocked-src=\"cid:([^\"]+)\"[^>]*>", re.IGNORECASE)
+
+
+def _norm_cid(cid: str) -> str:
+    """Content-ID 정규화 — 꺾쇠(<>)·공백·URL 이스케이프·대소문자 차이 흡수."""
+    from urllib.parse import unquote
+    return unquote(cid or "").strip().strip("<>").lower()
+
+
+def inject_inline_images(html: str, images: dict) -> tuple[str, int, int]:
+    """정제된 HTML 의 cid 차단 마크에 인라인 이미지를 주입.
+
+    images: {cid: (mime, bytes)}. 반환 (html, 임베드 수, 실패 수).
+    - 같은 cid 의 재등장(메일 내 중복)은 1회만 임베드, 이후는 생략 표시
+      — 무제한 정책에서 중복이 용량을 배수로 키우는 것 방지.
+    - 매칭 실패(cid 는 있는데 바이트 없음)는 차단 마크 유지 → 웹 안내 배너.
+    """
+    if not html or not images:
+        # 실패 수 = 남아 있는 cid 차단 마크 수 (images 비어도 집계)
+        return html, 0, len(_CID_IMG_RX.findall(html or ""))
+    import base64 as _b64
+    norm = {_norm_cid(k): v for k, v in images.items()}
+    b64_cache: dict[str, str] = {}
+    embedded: set[str] = set()
+    failed = 0
+
+    def _repl(m):
+        nonlocal failed
+        raw_cid = m.group(1)
+        cid = _norm_cid(raw_cid)
+        item = norm.get(cid)
+        if not item:
+            failed += 1
+            return m.group(0)                    # 추출 실패 — 차단 마크 유지
+        if cid in embedded:                      # 메일 내 중복 — 생략 표시
+            return "<span class='imgnote-inline'>🖼 (중복 이미지 생략)</span>"
+        embedded.add(cid)
+        mime, data = item
+        if cid not in b64_cache:
+            b64_cache[cid] = _b64.b64encode(data).decode("ascii")
+        return m.group(0).replace(
+            f'data-blocked-src="cid:{raw_cid}"',
+            f'src="data:{mime};base64,{b64_cache[cid]}"', 1)
+
+    out = _CID_IMG_RX.sub(_repl, html)
+    return out, len(embedded), failed
