@@ -1,0 +1,21 @@
+# Python 캐시 (재생성됨 — 삭제된 모듈 ai/model/tui 의 낡은 .pyc 포함)
+__pycache__/
+*.py[cod]
+
+# 데모 런타임 산출물 (config.toml 만 있으면 sync/review 로 재생성 — 코드가 아님)
+#   python3 -m mailkb --home ./demo sync --source fake --full
+demo/db.sqlite
+demo/blocked_senders.txt
+demo/overrides.json
+demo/vault/daily/
+demo/vault/notes/
+demo/logs/
+
+# 실제 운영 홈(--home/MAILKB_HOME 미지정 시 기본값) — 실제 메일이라 커밋 금지
+/data/
+
+# 에디터·OS 부산물
+.DS_Store
+*.swp
+*.swo
+*~

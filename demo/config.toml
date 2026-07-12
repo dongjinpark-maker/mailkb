@@ -1,0 +1,76 @@
+# mailkb 설정
+# 내 주소 (발신 메일 판별 기준 — 복수 가능)
+my_addresses = ["dohyun.kim@nurisoft.co.kr", "dhkim@nurisoft.co.kr"]
+
+# 본문에서 '나를 명시적으로 언급'했는지 판정할 이름/호칭(개입 큐 과탐 축소).
+# 내 이름이 들어간 메일은 대규모 그룹메일이라도 '확인 대상'으로 유지한다.
+# (내가 보낸 메일에 대한 답장도 '나를 언급한 것'과 동일하게 취급 — 내 참여 스레드)
+my_names = ["김도현"]
+
+# 기본 소스: outlook(회사 PC, 클래식 Outlook COM) | fake(데모)
+source = "outlook"
+
+[filters]
+# 이 문자열이 발신 주소에 포함되면 노이즈(공지/자동발송)로 분류
+ignore_senders = ["noreply", "no-reply", "notification@", "jira@", "build@"]
+# 사내 도메인 — 설정하면 외부 도메인 발신(스팸 등)은 미답변/기한/요약에서 제외.
+# 외부 파트너 메일도 추적하려면 빈 리스트로.
+internal_domains = ["nurisoft.co.kr"]
+# 추가 차단 발신자는 <home>/blocked_senders.txt 에 누적된다 (mailkb block <주소>).
+# 실제 수신 차단은 Outlook 규칙으로 병행 — 이 파일은 mailkb 신호에서만 제외.
+# 제목 기반 노이즈 2단계 (소문자 부분 매치, 키를 지우면 아래 기본값 적용):
+#  - strong: 내 참여 여부와 무관하게 무조건 제외 (시스템 알림/설문 등)
+#  - weak:   내가 답장하지 않았고 수신 3인 이상 대량일 때만 제외 (주간보고 등 —
+#            내가 논의에 참여한 스레드는 유지)
+subject_noise_strong = ["invitation", "notification", "자동회신", "자동 회신",
+                        "[nflow]", "[nwork]", "승계통보", "설문요청", "설문 요청"]
+subject_noise_weak = ["weekly report", "주간보고", "주간 보고", "[회의록]"]
+
+[ai]
+# 폴백 백엔드. summary/classify 로 라우팅 안 되는 호출용.
+default = "internal"
+# 작업별 라우팅: 요약/회고 = sonnet(품질), 개입 분류 = haiku(비용).
+# sonnet/haiku/internal 은 [ai.backends.*] 없어도 내장 기본값으로 동작(config 우선).
+summary = "sonnet"
+classify = "haiku"
+# 요약 창: max(마지막 실행일, 오늘−(N−1))~오늘. 매일=마지막 실행 이후, 오래 비우면 최근 N일.
+# summary_max_days = 3
+
+[ai.backends.internal]
+# opencode headless — 프롬프트는 stdin 으로 전달됨
+cmd = ["opencode", "run"]
+
+[ai.backends.sonnet]
+# claude headless — 요약/회고용(sonnet). --backend sonnet 로도 지정 가능.
+cmd = ["claude", "-p", "--model", "sonnet"]
+
+[ai.backends.haiku]
+# claude headless — 개입 분류용(default haiku).
+cmd = ["claude", "-p", "--model", "haiku"]
+
+[review]
+# "개입 필요" 큐의 정체 판정 기준 (영업일 — 주말·아래 holidays 제외)
+stall_workdays = 2   # 내가 보낸 메일에 응답 없음 = 정체
+stale_workdays = 3   # 열린 스레드 무활동 = 정체
+# 대량발송 제외선: 수신인 이 수 이상이면 전사/그룹 공지로 보고 개인 액션 큐에서 제외.
+# 조직 규모에 맞춰 조정 — 실무 그룹 메일은 포함되고 팀/전사 공지만 배제되게.
+broadcast_to = 50
+# 수신인이 이 수 이하이면 '나에게 직접 온 메일'로 보고 개입 큐에 유지.
+# 그 이상(그룹메일)은 요청/질문 신호·내 이름 언급·내 참여 스레드일 때만 유지 →
+# 요청 없는 그룹 FYI 과탐(false alarm) 제거.
+direct_to = 4
+# 공휴일 (YYYY-MM-DD) — 영업일 계산에서 제외. 비워두면 주말만 제외.
+# 대한민국 공휴일 2026 (대체공휴일 포함). 음력 공휴일이 매년 바뀌므로 연 1회 갱신.
+holidays = [
+  "2026-01-01",                                # 신정
+  "2026-02-16", "2026-02-17", "2026-02-18",    # 설날 연휴
+  "2026-03-01", "2026-03-02",                  # 삼일절 (+대체)
+  "2026-05-05",                                # 어린이날
+  "2026-05-24", "2026-05-25",                  # 부처님오신날 (+대체)
+  "2026-06-06",                                # 현충일
+  "2026-08-15", "2026-08-17",                  # 광복절 (+대체)
+  "2026-09-24", "2026-09-25", "2026-09-26", "2026-09-28",  # 추석 연휴 (+대체)
+  "2026-10-03", "2026-10-05",                  # 개천절 (+대체)
+  "2026-10-09",                                # 한글날
+  "2026-12-25",                                # 성탄절
+]
