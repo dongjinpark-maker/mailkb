@@ -2286,9 +2286,12 @@ def perform_action(store, cfg, path: str, form: dict) -> str:
         src = get_source(cfg.source)                 # outlook 이면 Windows COM
         retain = int(cfg.opt("web", "image_retain_days", default=60) or 0)
         cutoff = image_cutoff_for(retain)
-        stats = store.ingest(src.fetch(store.last_sync(), image_cutoff=cutoff),
-                             image_cutoff=cutoff)
-        store.maybe_prune_html(retain)               # 하루 1회 본문 압축
+        try:
+            stats = store.ingest(src.fetch(store.last_sync(), image_cutoff=cutoff),
+                                 image_cutoff=cutoff)
+        finally:
+            # 프룬은 COM 불필요 — 수집이 실패(Outlook 꺼짐 등)해도 실행
+            store.maybe_prune_html(retain)
         return "/?msg=" + _q(f"동기화({src.name}): 신규 {stats.inserted} · 중복 {stats.skipped}")
 
     if path == "/settings/unblock":
@@ -2585,18 +2588,21 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/autosync":           # app.js 백그라운드 주기 동기화 → 신규 통수만 반환
             n = 0
             store = Store(self.cfg.db_path, self.cfg.my_addresses)
+            retain = int(self.cfg.opt("web", "image_retain_days",
+                                      default=60) or 0)
             try:
                 from .sources import get_source
                 src = get_source(self.cfg.source)
-                retain = int(self.cfg.opt("web", "image_retain_days",
-                                          default=60) or 0)
                 cutoff = image_cutoff_for(retain)
                 n = store.ingest(src.fetch(store.last_sync(),
                                            image_cutoff=cutoff),
                                  image_cutoff=cutoff).inserted
-                store.maybe_prune_html(retain)       # 하루 1회 본문 압축
             except Exception:             # 자동 동기화 실패는 조용히(다음 주기 재시도)
                 n = 0
+            try:
+                store.maybe_prune_html(retain)   # 프룬은 COM 불필요 — 항상 시도
+            except Exception:
+                pass
             finally:
                 store.close()
             body = str(n).encode("ascii")

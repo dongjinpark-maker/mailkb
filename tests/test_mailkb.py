@@ -544,6 +544,21 @@ class TestInlineImages(unittest.TestCase):
         self.assertEqual(self.store.maybe_prune_html(14), (0, 0))
         self.assertIn("이미지 1장", self._html("img"))
 
+    def test_web_sync_failure_still_prunes(self):
+        # Outlook 꺼짐 등 수집 실패에도 프룬(COM 불필요)은 실행된다
+        from mailkb import web
+        old_day = (date.today() - timedelta(days=20)).isoformat()
+        self.store.ingest([self._img_rec("img", f"{old_day}T09:00:00")])
+        self.cfg.raw = {"web": {"image_retain_days": 14}}
+        self.cfg.source = "fake"
+        with mock.patch("mailkb.sources.fake.FakeSource.fetch",
+                        side_effect=RuntimeError("COM down")):
+            try:
+                web.perform_action(self.store, self.cfg, "/sync", {})
+            except RuntimeError:
+                pass                                  # 수집 실패는 상위에서 안내
+        self.assertIn("이미지 1장", self._html("img"))  # 프룬은 됐음
+
     def test_prune_disabled_when_zero(self):
         self.assertIsNone(self.store.maybe_prune_html(0))
         # 컷오프 sentinel: retain 0 → 전부 게이트

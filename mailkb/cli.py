@@ -165,9 +165,12 @@ def cmd_sync(args) -> None:
     prog = _SyncProgress()
     retain = int(cfg.opt("web", "image_retain_days", default=60) or 0)
     cutoff = store_mod.image_cutoff_for(retain)
-    stats = store.ingest(source.fetch(since, image_cutoff=cutoff),
-                         progress=prog.update, image_cutoff=cutoff)
-    pruned = store.maybe_prune_html(retain)
+    try:
+        stats = store.ingest(source.fetch(since, image_cutoff=cutoff),
+                             progress=prog.update, image_cutoff=cutoff)
+    finally:
+        # 프룬은 COM 불필요 — 수집 실패(Outlook 꺼짐 등)에도 실행
+        pruned = store.maybe_prune_html(retain)
     prog.done()
     dt = time.monotonic() - t0
 
