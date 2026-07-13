@@ -389,6 +389,12 @@ def intervention_queue(
             "personal": personal,
         })
 
+    # 오래 방치된 항목은 큐에서 내림(기본 21일 초과 — 더는 '지금 할 일'이 아님).
+    # 스레드 자체는 목록·↩ 필터에 그대로 남고, 웹 항목의 ✕(숨기기)로 명시 제거도 가능.
+    # review.queue_max_days 로 조정 (0 = 상한 없음).
+    max_days = int(cfg.opt("review", "queue_max_days", default=21) or 0)
+    if max_days > 0:
+        items = [it for it in items if it["days"] <= max_days]
     order = {k: i for i, (k, _) in enumerate(CATEGORIES)}
     # 카테고리 우선순위 → 나를 지목한 것(personal) 먼저 → 오래된 것 먼저
     items.sort(key=lambda it: (order.get(it["category"], 99),

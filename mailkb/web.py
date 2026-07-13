@@ -208,6 +208,11 @@ h1 { font-size: 20px; } h2 { font-size: 17px; margin-top: 22px; }
 .item.hot { border-left-color: var(--danger); }
 .item.personal { border-left-color: var(--accent2); }
 .item .who { color: var(--ink-2); } .item .day { color: var(--ink-3); font-size: 13px; }
+.item form.qhide { float: right; margin: -2px -4px 0 8px; }
+.item form.qhide button { font-size: 11px; padding: 1px 7px; color: var(--muted);
+    border-color: var(--border); background: none; }
+.item form.qhide button:hover { color: var(--ink-2); border-color: var(--border-strong);
+    background: var(--surface-2); }
 .item .snip { color: var(--ink-2); font-size: 13px; display: block; margin-top: 2px; }
 .star { color: var(--accent2); font-weight: 700; }
 .dim { color: var(--ink-3); }
@@ -246,6 +251,7 @@ details.catfold { margin: 8px 0 4px; background: var(--fold); border: 1px solid 
     color: var(--accent); background: var(--surface); border: 1px solid var(--border-strong); border-radius: 12px; }
 .md-toggle:hover { background: var(--hover-bg); border-color: var(--accent); }
 .md-rich { display: none; }
+.md-rich.md-show { display: block; }   /* 프룬 메일 — 서식이 기본 */
 .mthread.md-on .md-raw { display: none; }
 .mthread.md-on .md-rich { display: block; }
 .md-rich > :first-child { margin-top: 0; }
@@ -1455,6 +1461,10 @@ def _item_html(it: dict) -> str:
         cls += " hot"
     elif it.get("personal"):
         cls += " personal"
+    hide = (f"<form class='qhide' method='post' "
+            f"action='/thread/{it['thread_id']}/hide'>"
+            "<button title='목록·추적에서 숨김 — 새 메일 오면 자동 해제'>✕</button>"
+            "</form>")
     star = "<span class='star'>★ </span>" if it.get("personal") else ""
     tag = f" {esc(it['tag'])}" if it.get("tag") else ""
     snip = (f"<span class='snip'>「{esc(it['snippet'])}」</span>"
@@ -1464,7 +1474,7 @@ def _item_html(it: dict) -> str:
         act = f" · 제안: {esc(it['ai_action'])}" if it.get("ai_action") else ""
         reason = f"<span class='snip'>↳ {esc(it['ai_reason'])}{act}</span>"
     return (
-        f"<div class='{cls}'>{star}"
+        f"<div class='{cls}'>{hide}{star}"
         f"<a href='/thread/{it['thread_id']}'>{esc(it['subject'])}</a> "
         f"<span class='who'>· {esc(it['who'])}</span> "
         f"<span class='day'>— {esc(review.day_label(it))}{tag}</span>"
@@ -1835,7 +1845,10 @@ def render_thread(store, tid: int) -> str:
 
     raws = ["" if (blk["html"] and not _is_strip_marker(blk["html"]))
             else "\n".join(blk["body"]) for blk in d["timeline"]]
-    any_md = any(r and _looks_like_markdown(r) for r in raws)
+    # 토글 버튼은 '진짜 텍스트 메일'에만 — 프룬 마커 메일은 아래에서 서식을
+    # 기본 렌더하므로 토글 대상이 아니다
+    any_md = any(r and _looks_like_markdown(r) and not blk["html"]
+                 for blk, r in zip(d["timeline"], raws))
     out.append("<div class='mthread'>")
     if any_md:
         out.append("<button type='button' class='md-toggle'>서식 보기</button>")
@@ -1856,9 +1869,13 @@ def render_thread(store, tid: int) -> str:
             f"<span class='mh-when'>{esc(blk['sent_on'])}</span></div>")
         out.append("<div class='mbody'>")
         if blk["html"] and _is_strip_marker(blk["html"]):
-            # 보존 기간 경과 — 마커 배너 + 텍스트 본문 (docs/PROPOSAL-images.md)
+            # 보존 기간 경과 — 마커 배너 + 텍스트 본문. 원 서식은 이미 회수됐으므로
+            # 마크다운(표·목록 — html_to_markdown 산출)을 서식으로 직접 렌더한다.
             out.append(blk["html"])          # 마커는 프룬이 만든 고정 형식
-            if raw.strip():
+            if raw and _looks_like_markdown(raw):
+                out.append("<div class='md-rich md-show'>"
+                           + _mail_md_to_html(raw) + "</div>")
+            elif raw.strip():
                 out.append("<pre style='white-space:pre-wrap'>" + esc(raw) + "</pre>")
             else:
                 out.append("<p class='dim'>본문 없음 — Outlook에서 확인</p>")

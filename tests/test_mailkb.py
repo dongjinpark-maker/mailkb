@@ -559,6 +559,26 @@ class TestInlineImages(unittest.TestCase):
                 pass                                  # 수집 실패는 상위에서 안내
         self.assertIn("이미지 1장", self._html("img"))  # 프룬은 됐음
 
+    def test_pruned_markdown_table_renders_formatted(self):
+        # 프룬된 메일의 텍스트(마크다운 표)는 서식으로 직접 렌더 — 토글 불요
+        from mailkb import web
+        old_day = (date.today() - timedelta(days=20)).isoformat()
+        self.store.ingest([MailRecord(
+            message_id="<tbl@t>", subject="일정표", sender_name="kim",
+            sender_addr="kim@corp.example", to=[ME],
+            sent_on=f"{old_day}T09:00:00",
+            body_text="일정 공유\n\n| 단계 | 기한 |\n|---|---|\n| GDS | 8/20 |",
+            body_html='<p>일정 공유</p><img src="cid:x@y"><table><tr><td>GDS</td></tr></table>',
+            inline_images={"x@y": self.PNG})])
+        self.store.maybe_prune_html(14)
+        tid = self.store.message("1")["thread_id"]
+        out = web.render_thread(self.store, tid)
+        self.assertIn("class='imgstrip'", out)            # 마커
+        self.assertIn("md-rich md-show", out)             # 서식 기본 표시
+        self.assertIn("<table class='md-table'>", out)    # 표 렌더
+        self.assertIn("<td>GDS</td>", out)
+        self.assertNotIn("md-toggle", out)                # 프룬 메일만으론 토글 없음
+
     def test_prune_disabled_when_zero(self):
         self.assertIsNone(self.store.maybe_prune_html(0))
         # 컷오프 sentinel: retain 0 → 전부 게이트
@@ -1695,6 +1715,21 @@ class TestIntervention(unittest.TestCase):
         self.assertTrue(cfg.is_noise_subject_weak("[회의록] 7/9 품질회의"))
         self.assertFalse(cfg.is_noise_subject_strong("설계 검토 요청"))
         self.assertFalse(cfg.is_noise_subject_weak("설계 검토 요청"))
+
+    def test_queue_max_days_cap(self):
+        # 21일(기본) 초과 방치 항목은 큐에서 내림 — 0 이면 상한 해제
+        old = (date.today() - timedelta(days=30)).isoformat()
+        self.store.ingest([self._r(
+            "cap", "kim@corp.example", [ME], "오래된 승인 요청",
+            f"{old}T09:00:00", "가부 회신 부탁드립니다.")])
+        q = review.intervention_queue(self.store, self.cfg, date.today().isoformat(),
+                                      unanswered=[])
+        self.assertNotIn("오래된 승인 요청", [it["subject"] for it in q])
+        self.cfg.raw = {"review": {"queue_max_days": 0}}
+        q2 = review.intervention_queue(self.store, self.cfg, date.today().isoformat(),
+                                       unanswered=[])
+        self.assertIn("오래된 승인 요청", [it["subject"] for it in q2])
+        self.cfg.raw = {}
 
     def test_queue_drops_strong_noise_even_with_decision(self):
         self.store.ingest([self._r(
@@ -3082,6 +3117,12 @@ class TestWeb(unittest.TestCase):
             self.store, self.cfg, f"/thread/{tid}/record-decision",
             {"title": [" "]})
         self.assertEqual(len(self.store.decisions()), 1)
+
+    def test_home_queue_items_have_hide_button(self):
+        out = self.web.render_home(self.store, self.cfg, "2026-07-04")
+        tid = self.store.message("1")["thread_id"]
+        self.assertIn(f"class='qhide' method='post' action='/thread/{tid}/hide'",
+                      out)                                # 큐 항목 ✕(숨기기)
 
     def test_home_ledger_lens_counts(self):
         out = self.web.render_home(self.store, self.cfg, "2026-07-04")
