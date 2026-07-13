@@ -208,6 +208,11 @@ class _MarkdownConverter(HTMLParser):
             self._row = None
         elif tag == "table":
             if self._rows:
+                # GFM 유효성: 첫 행 뒤 구분행이 없으면(th 없는 Outlook 표 —
+                # 붙여넣기 표의 전형) 삽입해 다운스트림 표 렌더가 인식하게 한다
+                if (len(self._rows) < 2
+                        or not all(c == "---" for c in self._rows[1])):
+                    self._rows.insert(1, ["---"] * len(self._rows[0]))
                 self._out.append("\n\n")
                 for r in self._rows:
                     self._out.append("| " + " | ".join(r) + " |\n")

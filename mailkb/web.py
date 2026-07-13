@@ -468,10 +468,13 @@ _MAIL_STRONG_RX = re.compile(r"\*\*(\S(?:.*?\S)?)\*\*")
 _MAIL_EM_RX = re.compile(r"(?<![*\w])\*(\S(?:.*?\S)?)\*(?![*\w])")
 # GFM 표 구분행: `|---|:--:|--:|` (2열 이상). `---` 단독 수평선과 안 겹치게 파이프 필수.
 _MAIL_TDELIM_RX = re.compile(r"^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)+\|?\s*$")
+# 파이프 행: `| a | b |` — 구분행 없는 표(구버전 html_to_markdown 저장분) 인식용
+_MAIL_PIPE_ROW_RX = re.compile(r"^\s*\|.*\|\s*$")
 _MAIL_MD_SIGNAL_RX = re.compile(
     r"(?m)^\s*(?:#{1,6}\s+\S|[-*+]\s+\S|\d+[.)]\s+\S|>\s+\S|```)"
     r"|\*\*\S|`[^`]+`|\[[^\]]+\]\([^)\s]+\)"
     r"|^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)+\|?\s*$"      # 표 구분행
+    r"|^\s*\|[^\n]*\|\s*\n\s*\|[^\n]*\|"                   # 구분행 없는 파이프 표 2행+
 )
 
 
@@ -622,6 +625,21 @@ def _mail_md_to_html(text: str) -> str:
                 rows.append(_split_table_row(lines[i]))
                 i += 1
             out.append(_render_table(heads, aligns, rows))
+            continue
+        if (_MAIL_PIPE_ROW_RX.match(line) and i + 1 < n
+                and _MAIL_PIPE_ROW_RX.match(lines[i + 1])
+                and not _MAIL_TDELIM_RX.match(lines[i + 1])):
+            # 구분행 없는 파이프 표 (th 없는 Outlook 표의 구버전 변환 저장분) —
+            # 첫 행을 헤더로 렌더
+            _flush()
+            heads = _split_table_row(line)
+            i += 1
+            rows = []
+            while i < n and _MAIL_PIPE_ROW_RX.match(lines[i]):
+                if not _MAIL_TDELIM_RX.match(lines[i]):
+                    rows.append(_split_table_row(lines[i]))
+                i += 1
+            out.append(_render_table(heads, [], rows))
             continue
         if not stripped:                                   # 빈 줄 → 문단 종료
             _flush()
@@ -1150,7 +1168,7 @@ _APP_JS = r"""
         if (msg) toast(msg);
         /* 스레드 상태 변경(플래그·숨김·추적)은 왼쪽 목록에도 즉시 반영 */
         if (leftCur &&
-            /\/thread\/\d+\/(flag|unflag|hide|unhide)$/.test(action)) {
+            /\/thread\/\d+\/(flag|unflag|hide|unhide|qmute|qunmute)$/.test(action)) {
           var sc = left.scrollTop;
           load(leftCur, "left", false)
             .then(function () { left.scrollTop = sc; })   /* 스크롤 유지 */
@@ -1462,9 +1480,9 @@ def _item_html(it: dict) -> str:
     elif it.get("personal"):
         cls += " personal"
     hide = (f"<form class='qhide' method='post' "
-            f"action='/thread/{it['thread_id']}/hide'>"
-            "<button title='목록·추적에서 숨김 — 새 메일 오면 자동 해제'>✕</button>"
-            "</form>")
+            f"action='/thread/{it['thread_id']}/qmute'>"
+            "<button title='지금 할 일에서 제외 — 목록·검색엔 그대로, "
+            "새 메일 오면 자동 복귀'>✕</button></form>")
     star = "<span class='star'>★ </span>" if it.get("personal") else ""
     tag = f" {esc(it['tag'])}" if it.get("tag") else ""
     snip = (f"<span class='snip'>「{esc(it['snippet'])}」</span>"
@@ -1779,7 +1797,8 @@ def render_threads(store, cfg, offset: int = 0, flt: str = "") -> str:
             + f"<div class='mlist'>{body}{more}</div>")
 
 
-def _actions_bar(tid: int, t, has_attach: bool, decider: str = "") -> str:
+def _actions_bar(tid: int, t, has_attach: bool, decider: str = "",
+                 qmuted: bool = False) -> str:
     flagged = bool(t["flagged"]) if t else False
     hidden = bool(t["hidden"]) if t else False
     forms: list[str] = []
@@ -1801,6 +1820,9 @@ def _actions_bar(tid: int, t, has_attach: bool, decider: str = "") -> str:
         _btn("unhide", "🙈 숨김 해제")
     else:
         _btn("hide", "숨기기")
+    # '지금 할 일' 전용 제외 상태 — 복원만 노출(제외는 홈 큐의 ✕)
+    if qmuted:
+        _btn("qunmute", "지금 할 일에 복원")
     # 노트/열기/첨부 (발신자 차단은 주소별 보기 페이지로 이동 — 이름 클릭)
     _btn("note", "노트 생성")
     _btn("open", "Outlook 열기")
@@ -1829,7 +1851,8 @@ def render_thread(store, tid: int) -> str:
         # 결정자 기본값 = 최신 수신 메일 발신인 (타임라인은 최신 먼저)
         decider = next((blk["sender"] for blk in d["timeline"]
                         if not blk["is_sent"]), "")
-        out.append(_actions_bar(tid, t, has_attach, decider=decider))
+        out.append(_actions_bar(tid, t, has_attach, decider=decider,
+                                qmuted=store.is_queue_muted(tid)))
     out.append("<div class='analysis'>")
     for a in d["analysis"]:
         if not a:
@@ -2376,6 +2399,13 @@ def perform_action(store, cfg, path: str, form: dict) -> str:
         if action == "unflag":
             store.set_flag(tid, False)
             return back + "?msg=" + _q("플래그 해제")
+        if action == "qmute":
+            # '지금 할 일' 전용 제외 — 숨기기와 구분(목록·검색·통계 무영향)
+            store.set_queue_mute(tid, True)
+            return "/?msg=" + _q("지금 할 일에서 제외 — 새 메일 오면 자동 복귀")
+        if action == "qunmute":
+            store.set_queue_mute(tid, False)
+            return back + "?msg=" + _q("지금 할 일에 복원")
         if action == "hide":
             # 숨김: 목록·추적에서 제외, 새 수신 메일이 오면 자동 해제
             store.hide_thread(tid, True)
