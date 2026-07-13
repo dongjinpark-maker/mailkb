@@ -2440,6 +2440,15 @@ class TestWeb(unittest.TestCase):
         out = self.web.render_thread(self.store, tid)
         self.assertNotIn("md-toggle", out)
 
+    def test_html_mail_wrapped_for_dark_flatten(self):
+        # 메일 원본 HTML 은 .mailhtml 로 감싸 다크 평탄화 대상이 된다
+        tid = self.store.message("1")["thread_id"]
+        out = self.web.render_thread(self.store, tid)
+        self.assertIn("<div class='mailhtml'>", out)
+        # 다크 평탄화 규칙이 CSS 에 존재 (색·배경·링크)
+        self.assertIn(":root[data-theme='dark'] .mailhtml", self.web._CSS)
+        self.assertIn(".mailhtml a { color: var(--accent) !important", self.web._CSS)
+
     def test_thread_no_md_toggle_for_plain_text(self):
         # 마크다운 신호 없는 평문 → 토글·md-rich 없음(기존 <pre> 그대로)
         self.store.ingest([
@@ -3263,12 +3272,17 @@ class TestWeb(unittest.TestCase):
         self.assertIn("화면 테마", page)
         self.assertIn("data-set-theme='light'", page)
         self.assertIn("data-set-theme='dark'", page)
-        # 기본은 라이트가 active
-        self.assertIn("class='themebtn active' data-set-theme='light'", page)
+        # 세그먼트 토글 — 해/달 SVG 아이콘 + radiogroup 접근성
+        self.assertIn("role='radiogroup'", page)
+        self.assertEqual(page.count("<svg"), 2)          # 라이트·다크 아이콘
+        # 기본은 라이트가 active (aria-checked 동기화)
+        self.assertIn("class='themebtn active' role='radio' aria-checked='true' "
+                      "data-set-theme='light'", page)
         # 다크 저장 시 다크가 active
         self.cfg.raw = {"web": {"theme": "dark"}}
         page2 = self.web.render_settings(self.store, self.cfg)
-        self.assertIn("class='themebtn active' data-set-theme='dark'", page2)
+        self.assertIn("class='themebtn active' role='radio' aria-checked='true' "
+                      "data-set-theme='dark'", page2)
 
     def test_appjs_theme_toggle_markers(self):
         js = self.web._APP_JS

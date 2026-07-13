@@ -145,9 +145,19 @@ table.settbl input, table.settbl select { font-size: 13px; padding: 2px 4px; }
 .setadd { display: flex; gap: 6px; margin-top: 4px; }
 .setadd input[type=text] { flex: 1; font-size: 13px; padding: 4px 6px; }
 .settings h3 { font-size: 14px; margin: 14px 0 4px; color: var(--ink-2); }
-.themepick { display: flex; gap: 8px; margin: 6px 0 18px; }
-.themebtn.active { border-color: var(--accent); background: var(--sel-bg);
-    color: var(--accent-strong); font-weight: 700; }
+/* 화면 테마 — Android 스타일 세그먼트 토글 (해/달 아이콘) */
+.themepick { display: inline-flex; gap: 4px; margin: 8px 0 20px; padding: 4px;
+    background: var(--surface-2); border: 1px solid var(--border); border-radius: 999px; }
+.themebtn { display: inline-flex; align-items: center; gap: 7px; cursor: pointer;
+    padding: 7px 16px; border: 0; border-radius: 999px; background: transparent;
+    color: var(--ink-2); font-size: 13.5px; font-weight: 600; line-height: 1;
+    transition: background .16s, color .16s, box-shadow .16s; }
+.themebtn svg { width: 16px; height: 16px; flex: none; }
+.themebtn:hover { color: var(--ink); }
+.themebtn.active { background: var(--surface); color: var(--accent-strong);
+    box-shadow: 0 1px 3px rgba(0,0,0,.16); }
+.themebtn.active svg { color: var(--accent); }
+.themebtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 /* Outlook 유사 좌/우 분할 — 패널별 독립 스크롤 (#14) */
 #layout { flex: 1; display: flex; min-height: 0; }
 #left { width: var(--left-w); min-width: 240px; max-width: 70vw; flex: none;
@@ -242,6 +252,24 @@ details.catfold { margin: 8px 0 4px; background: var(--fold); border: 1px solid 
     color: var(--ink-2); }
 .imgnote { background: var(--warn-bg); border: 1px solid var(--warn-border); border-radius: 6px;
     padding: 4px 10px; font-size: 12px; color: var(--warn); margin-bottom: 8px; }
+/* 다크 모드 메일 가독성 (2026-07-14): 메일 원본 HTML(.mailhtml)은 흰 배경 전제의
+   인라인 색(검은 글씨·흰 블록·파란 링크)을 담고 있어 다크에서 안 보인다. 다크에서만
+   그 색을 테마 색으로 평탄화 — 라이트는 원본 그대로 둔다. 의미 색상(빨간 배지 등)도
+   무채색이 되지만 '안 보이는 것보다 읽히는 게 낫다'는 선택. 우리 콘텐츠(.md-rich·
+   배너·데일리)는 .mailhtml 밖이라 무영향. */
+:root[data-theme='dark'] .mailhtml,
+:root[data-theme='dark'] .mailhtml * {
+    color: var(--ink) !important;
+    background-color: transparent !important;
+    border-color: var(--border-strong) !important;
+}
+:root[data-theme='dark'] .mailhtml a { color: var(--accent) !important;
+    text-decoration: underline; }
+/* 이미지·인용 표식은 평탄화에서 제외(원래 테마 색 유지) */
+:root[data-theme='dark'] .mailhtml img { background: transparent; }
+:root[data-theme='dark'] .mailhtml blockquote { border-left-color: var(--border-2) !important;
+    color: var(--ink-2) !important; }
+:root[data-theme='dark'] .mailhtml details.qfold > summary { color: var(--ink-3) !important; }
 /* HTML 없는 본문(#21, 2026-07-13 반전): 기본 서식(md-rich), 버튼 누르면 저장
    텍스트(md-raw). 실사용(COM)에서 HTML 없는 본문 = 프룬/변환 산출물이라 raw 는
    원문이 아니다 — 서식이 원 의도에 가깝고, 텍스트는 검증용 토글로.
@@ -1282,9 +1310,11 @@ _APP_JS = r"""
     var val = b.getAttribute("data-set-theme") === "dark" ? "dark" : "light";
     document.documentElement.setAttribute("data-theme", val);
     var picks = document.getElementsByClassName("themebtn");
-    for (var i = 0; i < picks.length; i++)
-      picks[i].classList.toggle("active",
-        picks[i].getAttribute("data-set-theme") === val);
+    for (var i = 0; i < picks.length; i++) {
+      var sel = picks[i].getAttribute("data-set-theme") === val;
+      picks[i].classList.toggle("active", sel);
+      picks[i].setAttribute("aria-checked", sel ? "true" : "false");
+    }
     fetch("/settings/theme", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded",
@@ -1916,7 +1946,10 @@ def render_thread(store, tid: int) -> str:
             if "data-blocked-src" in blk["html"]:
                 out.append("<div class='imgnote'>🚫 일부 이미지를 표시할 수 없습니다"
                            "(원격 차단 또는 추출 실패) — 원문은 Outlook에서</div>")
-            out.append(blk["html"])          # 이미 정제됨(store) — 폴드도 저장분에 포함
+            # 메일 원본 HTML — 흰 배경 전제의 인라인 색을 담고 있어 다크에서
+            # 검은 글씨·흰 블록·파란 링크로 깨진다. .mailhtml 로 감싸 다크 모드
+            # CSS 가 그 색만 테마 색으로 평탄화한다(우리 콘텐츠엔 영향 없음).
+            out.append("<div class='mailhtml'>" + blk["html"] + "</div>")
         elif raw and _looks_like_markdown(raw):
             # HTML 없는 본문(프룬 마커·행 삭제·텍스트 메일 공통) — 서식 기본.
             # 저장 텍스트는 변환 산출물이라 raw 가 원문이 아니다; 텍스트는
@@ -1944,16 +1977,26 @@ def render_settings(store, cfg) -> str:
     바뀐 값은 overrides.json 에 저장돼 config.toml 위에 병합된다(영구·재시작 유지)."""
     out = ["<div class='settings'>", "<h1>설정</h1>"]
 
-    # ── 화면 테마 (라이트/다크) ──
+    # ── 화면 테마 (라이트/다크) — 세그먼트 토글 ──
     cur_theme = cfg.opt("web", "theme", default="light")
-    def _tbtn(val, label):
+    _SUN = ("<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' "
+            "stroke-width='2' stroke-linecap='round' aria-hidden='true'>"
+            "<circle cx='12' cy='12' r='4.2'/><path d='M12 2.5v2.4M12 19.1v2.4"
+            "M4.2 4.2l1.7 1.7M18.1 18.1l1.7 1.7M2.5 12h2.4M19.1 12h2.4"
+            "M4.2 19.8l1.7-1.7M18.1 5.9l1.7-1.7'/></svg>")
+    _MOON = ("<svg viewBox='0 0 24 24' fill='currentColor' aria-hidden='true'>"
+             "<path d='M20.5 14.5A8.5 8.5 0 0 1 9.5 3.5a7 7 0 1 0 11 11z'/></svg>")
+    def _tbtn(val, label, icon):
         on = " active" if cur_theme == val else ""
-        return (f"<button type='button' class='themebtn{on}' "
-                f"data-set-theme='{esc(val)}'>{esc(label)}</button>")
+        pressed = "true" if cur_theme == val else "false"
+        return (f"<button type='button' class='themebtn{on}' role='radio' "
+                f"aria-checked='{pressed}' data-set-theme='{esc(val)}'>"
+                f"{icon}{esc(label)}</button>")
     out.append("<h2>화면 테마</h2>")
     out.append("<p class='dim'>즉시 적용되고 설정에 저장됩니다.</p>")
-    out.append("<div class='themepick'>"
-               + _tbtn("light", "라이트") + _tbtn("dark", "다크") + "</div>")
+    out.append("<div class='themepick' role='radiogroup' aria-label='화면 테마'>"
+               + _tbtn("light", "라이트", _SUN)
+               + _tbtn("dark", "다크", _MOON) + "</div>")
 
     # ── 차단된 발신인 (편집 가능) ──
     out.append("<h2>차단된 발신인</h2>")
