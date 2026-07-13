@@ -274,9 +274,18 @@ class _MarkdownConverter(HTMLParser):
                 inner = "".join(sink[idx + len(marks):])
                 if marks and inner.strip() == "":
                     del sink[idx:idx + len(marks)]      # 빈 강조 제거
-                else:
-                    for mk in reversed(marks):
-                        self._emit(mk)
+                elif marks:
+                    # 가장자리 공백을 마커 밖으로 — "<b>aaa </b>" 를 그대로
+                    # 옮긴 "**aaa **" 는 유효한 마크다운이 아니라(CommonMark)
+                    # 렌더러가 못 살린다. "**aaa** " 로 재배치.
+                    lead = inner[:len(inner) - len(inner.lstrip())]
+                    trail = inner[len(inner.rstrip()):]
+                    del sink[idx:]
+                    sink.append(lead)
+                    sink.extend(marks)
+                    sink.append(inner.strip())
+                    sink.extend(reversed(marks))
+                    sink.append(trail)
             return
         if tag == "pre":
             raw = "".join(self._pre_parts).strip("\n")

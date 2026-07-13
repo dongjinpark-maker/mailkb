@@ -469,17 +469,21 @@ _MAIL_ORD_RX = re.compile(r"^\s*\d+[.)]\s+")
 _MAIL_HEAD_RX = re.compile(r"^(#{1,6})\s+(.*)$")
 _MAIL_HR_RX = re.compile(r"^\s*([-*_])(?:\s*\1){2,}\s*$")
 _MAIL_CODE_RX = re.compile(r"`([^`]+)`")
-_MAIL_LINK_RX = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
-_MAIL_STRONG_RX = re.compile(r"\*\*(\S(?:.*?\S)?)\*\*")
+# 링크 라벨은 한 겹의 대괄호 허용 — "[공지] 제목" 링크가 "[[공지] 제목](url)" 로
+# 변환되는 게 정상(CommonMark 균형 괄호)이라 렌더러가 받아줘야 한다
+_MAIL_LINK_RX = re.compile(r"\[((?:[^\[\]\n]|\[[^\[\]\n]*\])+)\]\(([^)\s]+)\)")
+# 굵게/취소선은 안쪽 가장자리 공백 허용("**aaa **" — 구버전 변환 저장분) —
+# 공백은 태그 밖으로 재배치해 살린다. 기울임(*)은 수식·글롭 오탐 위험이 커서 엄격 유지.
+_MAIL_STRONG_RX = re.compile(r"\*\*(\s*)([^*\n]*[^*\s\n])(\s*)\*\*")
 _MAIL_EM_RX = re.compile(r"(?<![*\w])\*(\S(?:.*?\S)?)\*(?![*\w])")
-_MAIL_DEL_RX = re.compile(r"~~(\S(?:[^~\n]*\S)?)~~")   # 취소선 (diff 삭제분 등)
+_MAIL_DEL_RX = re.compile(r"~~(\s*)([^~\n]*[^~\s\n])(\s*)~~")   # 취소선 (diff 삭제분 등)
 # GFM 표 구분행: `|---|:--:|--:|` (2열 이상). `---` 단독 수평선과 안 겹치게 파이프 필수.
 _MAIL_TDELIM_RX = re.compile(r"^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)+\|?\s*$")
 # 파이프 행: `| a | b |` — 구분행 없는 표(구버전 html_to_markdown 저장분) 인식용
 _MAIL_PIPE_ROW_RX = re.compile(r"^\s*\|.*\|\s*$")
 _MAIL_MD_SIGNAL_RX = re.compile(
     r"(?m)^\s*(?:#{1,6}\s+\S|[-*+]\s+\S|\d+[.)]\s+\S|>\s+\S|```)"
-    r"|\*\*\S|`[^`]+`|\[[^\]]+\]\([^)\s]+\)"
+    r"|\*\*\S|`[^`]+`|\[(?:[^\[\]\n]|\[[^\[\]\n]*\])+\]\([^)\s]+\)"
     r"|^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)+\|?\s*$"      # 표 구분행
     r"|^\s*\|[^\n]*\|\s*\n\s*\|[^\n]*\|"                   # 구분행 없는 파이프 표 2행+
 )
@@ -508,9 +512,11 @@ def _mail_md_inline(s: str) -> str:
         return m.group(0)                     # 미지원 스킴은 원문 유지
 
     s = _MAIL_LINK_RX.sub(_link, s)
-    s = _MAIL_STRONG_RX.sub(lambda m: "<strong>%s</strong>" % m.group(1), s)
+    s = _MAIL_STRONG_RX.sub(
+        lambda m: "%s<strong>%s</strong>%s" % (m.group(1), m.group(2), m.group(3)), s)
     s = _MAIL_EM_RX.sub(lambda m: "<em>%s</em>" % m.group(1), s)
-    s = _MAIL_DEL_RX.sub(lambda m: "<del>%s</del>" % m.group(1), s)
+    s = _MAIL_DEL_RX.sub(
+        lambda m: "%s<del>%s</del>%s" % (m.group(1), m.group(2), m.group(3)), s)
     s = re.sub(r"\x00(\d+)\x00",
                lambda m: "<code>%s</code>" % codes[int(m.group(1))], s)
     return s

@@ -89,6 +89,15 @@ class TestClean(unittest.TestCase):
         body = "네, 알겠습니다."
         self.assertEqual(extract_new_content(body), "네, 알겠습니다.")
 
+    def test_inline_mark_edge_space_moved_out(self):
+        # "<b>aaa </b>" → "**aaa** " — 마커 안 가장자리 공백은 무효 마크다운이라
+        # 밖으로 재배치 (렌더러·외부 md 도구가 살릴 수 있게)
+        self.assertEqual(html_to_markdown("<p><b>aaa </b>다음</p>"), "**aaa** 다음")
+        self.assertEqual(html_to_markdown("<p>앞<b> aaa</b></p>"), "앞 **aaa**")
+        out = html_to_markdown(
+            "<p><span style='text-decoration: line-through;'>취소 </span>유지</p>")
+        self.assertEqual(out, "~~취소~~ 유지")
+
     def test_html_to_text(self):
         html = "<html><style>p{color:red}</style><body><p>안녕하세요&nbsp;팀</p><br><div>둘째 줄</div></body></html>"
         out = html_to_text(html)
@@ -2454,6 +2463,27 @@ class TestWeb(unittest.TestCase):
         self.assertIn("&lt;script&gt;", html)
         self.assertIn("<strong>굵게</strong>", html)
         self.assertNotIn('href="javascript', html)      # 링크 미생성(텍스트만)
+
+    def test_mail_md_link_label_with_brackets(self):
+        # "[공지] 제목" 링크의 변환형 "[[공지] 제목](url)" — 라벨 속 한 겹
+        # 대괄호를 렌더러가 받아준다. 링크 아닌 일반 대괄호는 오탐 없음.
+        out = self.web._mail_md_to_html("[[공지] 제목](https://x.y) 본문")
+        self.assertIn(">[공지] 제목</a>", out)
+        out = self.web._mail_md_to_html("[메모] 참고 (자료) 그리고 [문서](https://x.y)")
+        self.assertNotIn("메모] 참고</a>", out)          # 앞 대괄호는 링크 아님
+        self.assertIn(">문서</a>", out)
+        self.assertTrue(self.web._looks_like_markdown("[[a] b](https://x.y)"))
+
+    def test_mail_md_strong_del_legacy_inner_space(self):
+        # 구버전 변환 저장분 "**aaa **" — 공백을 태그 밖으로 빼고 살린다.
+        # 평문 별표 수식("2 ** 3")은 오탐 없음.
+        out = self.web._mail_md_to_html("**aaa ** 다음")
+        self.assertIn("<strong>aaa</strong>", out)
+        self.assertNotIn("<em>", out)                    # em 오작동 회귀 가드
+        self.assertIn("<del>취소</del>",
+                      self.web._mail_md_to_html("~~취소 ~~ 유지"))
+        self.assertNotIn("<strong>",
+                         self.web._mail_md_to_html("점수 계산은 2 ** 3 방식"))
 
     def test_mail_md_to_html_table(self):
         # GFM 표: 헤더/본문, 정렬 콜론, 셀 내 인라인, 이스케이프 파이프
