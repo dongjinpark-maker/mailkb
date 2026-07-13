@@ -15,11 +15,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from mailkb import distill, notes, review, web
 from mailkb.clean import (
+    PRESERVED_MARK,
     extract_new_content,
     html_to_markdown,
     html_to_text,
     normalize_subject,
     sanitize_html,
+    strip_preserved,
 )
 from mailkb.config import Config
 from mailkb.sources.base import MailRecord
@@ -460,6 +462,159 @@ class TestStore(unittest.TestCase):
         self.assertEqual(rows[0]["to_count"], 1)       # 내가 kim 에게 1회
         addrs = [r["addr"] for r in rows]
         self.assertNotIn(ME, addrs)                    # 내 주소는 people 에 없음
+
+
+class TestMidJoinPreserve(unittest.TestCase):
+    """mid-join 인용 보존 — 스레드 첫 보유 메일의 인용 체인은 유일본이라
+    절단하지 않는다 (텍스트=PRESERVED_MARK, HTML=qfold 접힘). 기존 스레드
+    합류분은 종전대로 절단. docs/PROPOSAL-midjoin.md."""
+
+    _KQ = ("________________________________\n"
+           "보낸 사람: 강미래 <kang@corp.example>\n"
+           "제목: 원 건\n받는 사람: 오태양\n\n"
+           "원 논의 내용입니다.\n> 더 이전 인용\n--\n강미래 선임")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "t.sqlite", [ME])
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    # ---------------------------------------------------------- clean 계층
+    def test_extract_preserve_marker_and_tail(self):
+        body = "합류 안내드립니다.\n> 인라인 인용\n\n" + self._KQ
+        out = extract_new_content(body, preserve_quotes=True)
+        self.assertIn("합류 안내드립니다", out)
+        self.assertNotIn("인라인 인용", out)          # 신규분의 > 줄은 종전대로 제거
+        self.assertIn(PRESERVED_MARK, out)
+        tail = out.split(PRESERVED_MARK)[1]
+        self.assertIn("원 논의 내용입니다", tail)
+        self.assertIn("> 더 이전 인용", tail)          # 보존부 > 줄 유지
+        self.assertIn("강미래 선임", tail)             # 보존부 서명 유지 (체인의 일부)
+        # 기본(비보존)은 종전 동작 그대로
+        cut = extract_new_content(body)
+        self.assertNotIn(PRESERVED_MARK, cut)
+        self.assertNotIn("원 논의 내용", cut)
+
+    def test_extract_preserve_noop_without_quotes(self):
+        self.assertEqual(extract_new_content("네, 알겠습니다.", preserve_quotes=True),
+                         "네, 알겠습니다.")
+
+    def test_extract_preserve_quote_only_body(self):
+        out = extract_new_content(self._KQ, preserve_quotes=True)
+        self.assertTrue(out.startswith(PRESERVED_MARK))
+
+    def test_strip_preserved(self):
+        out = extract_new_content("본문.\n\n" + self._KQ, preserve_quotes=True)
+        self.assertEqual(strip_preserved(out), "본문.")
+        self.assertEqual(strip_preserved("마커 없는 본문"), "마커 없는 본문")
+
+    def test_sanitize_preserve_fold_split_label(self):
+        html = ("<p>회신입니다</p>"
+                "<div>--------- </div><div><b>Original Message</b></div>"
+                "<div> ---------</div><p>From: 김도현</p><p>이전 인용 내용</p>")
+        out = sanitize_html(html, preserve_quotes=True)
+        self.assertIn("details class='qfold'", out)
+        self.assertIn("이전 인용 내용", out)
+        self.assertTrue(out.endswith("</details>"))    # 폴드 닫힘 균형
+        self.assertNotIn("이전 인용 내용", sanitize_html(html))  # 기본은 절단
+
+    def test_sanitize_preserve_korean_header(self):
+        html = ("<p>본문입니다</p><div>________________________________</div>"
+                "<div>보낸 사람: 김민수</div><div>이전 본문 텍스트</div>")
+        out = sanitize_html(html, preserve_quotes=True)
+        self.assertIn("qfold", out)
+        self.assertIn("보낸 사람", out)
+        self.assertIn("이전 본문 텍스트", out)
+
+    def test_sanitize_preserve_single_fold_for_nested_labels(self):
+        html = ("<p>본문</p><p>-----원본 메시지-----</p><p>중간 인용</p>"
+                "<p>-----원본 메시지-----</p><p>더 깊은 인용</p>")
+        out = sanitize_html(html, preserve_quotes=True)
+        self.assertEqual(out.count("<details"), 1)     # 폴드는 메일당 하나
+        self.assertIn("중간 인용", out)
+        self.assertIn("더 깊은 인용", out)
+
+    # ---------------------------------------------------------- store 계층
+    def test_first_holding_preserves_then_replies_cut(self):
+        # References 가 미보유 메일(ghost)을 가리킴 — 새 스레드 = 내 첫 보유분
+        self.store.ingest([_rec("j1", "kang@c", [ME], "RE: 원 건",
+                                "2026-07-01T09:00:00",
+                                body="합류 안내드립니다.\n\n" + self._KQ,
+                                reply_to="ghost")])
+        m = self.store.message("1")
+        self.assertIn(PRESERVED_MARK, m["new_content"])
+        self.assertIn("원 논의 내용", m["new_content"])
+        # 후속 답장은 기존 스레드 합류 — 종전대로 절단 (중복 제거)
+        self.store.ingest([_rec("j2", "lee@c", [ME], "RE: 원 건",
+                                "2026-07-01T10:00:00",
+                                body="후속 답변입니다.\n\n" + self._KQ,
+                                reply_to="j1")])
+        m2 = self.store.message("2")
+        self.assertNotIn(PRESERVED_MARK, m2["new_content"])
+        self.assertNotIn("원 논의 내용", m2["new_content"])
+        self.assertEqual(self.store.stats()["threads"], 1)
+
+    def test_preserved_text_is_searchable(self):
+        self.store.ingest([_rec("j1", "kang@c", [ME], "RE: 원 건",
+                                "2026-07-01T09:00:00",
+                                body="합류 안내드립니다.\n\n" + self._KQ,
+                                reply_to="ghost")])
+        self.assertEqual(len(self.store.search("원 논의 내용")), 1)
+
+    def test_html_fold_stored_and_prune_parity(self):
+        body = "본문입니다.\n\n-----원본 메시지-----\nFrom: 강미래\n이전 본문 텍스트"
+        html = ("<p>본문입니다.</p><p>-----원본 메시지-----</p>"
+                "<p>From: 강미래</p><p>이전 본문 텍스트</p>")
+        self.store.ingest([MailRecord(
+            message_id="<h1@t>", subject="신규 건", sender_name="kang",
+            sender_addr="kang@c", to=[ME], sent_on="2026-01-01T09:00:00",
+            body_text=body, body_html=html)])
+        tid = self.store.message("1")["thread_id"]
+        row = self.store.thread_messages(tid)[0]
+        self.assertIn("qfold", row["body_html"])       # HTML 층 접힘 저장
+        self.assertIn("이전 본문 텍스트", row["body_html"])
+        # 프룬(이미지 없음 → 행 삭제) 후에도 텍스트 층 마커로 접힘 재현
+        self.store._prune_html(30)
+        row = self.store.thread_messages(tid)[0]
+        self.assertFalse(row["body_html"])
+        out = web.render_thread(self.store, tid)
+        self.assertIn("qfold", out)
+        self.assertIn("이전 본문 텍스트", out)
+
+    # ------------------------------------------------------- 신호·fetch 계층
+    def test_preserved_quote_not_deadline_signal(self):
+        cfg = Config(home=Path(self.tmp.name), my_addresses=[ME])
+        self.store.ingest([_rec("d1", "park@c", [ME], "일정 공유",
+                                "2026-07-02T09:00:00",
+                                body="공유드립니다.\n\n" + self._KQ.replace(
+                                    "원 논의 내용입니다.",
+                                    "7월 21일까지 회신 부탁드립니다."))])
+        self.assertEqual(review.deadline_signals(self.store, cfg, "2026-07-02"), [])
+        # 신규 작성분의 기한은 여전히 잡힌다
+        self.store.ingest([_rec("d2", "park@c", [ME], "다른 건",
+                                "2026-07-02T10:00:00",
+                                body="7월 21일까지 회신 부탁드립니다.")])
+        self.assertEqual(
+            len(review.deadline_signals(self.store, cfg, "2026-07-02")), 1)
+
+    def test_outlook_fetch_merges_folders_chronologically(self):
+        # COM 없이 병합 로직만 — inbox·sent 가 각자 시간순일 때 전역 시간순 yield
+        from mailkb.sources.outlook_com import OutlookComSource
+        inbox = [_rec(f"i{d}", "kim@c", [ME], "s", f"2026-07-0{d}T09:00:00")
+                 for d in (1, 3, 5)]
+        sent = [_rec(f"s{d}", ME, ["kim@c"], "s", f"2026-07-0{d}T10:00:00")
+                for d in (2, 4)]
+
+        class _Stub:
+            def _folder_stream(self, fc, name, since, cutoff):
+                return iter(inbox if name == "inbox" else sent)
+
+        got = [r.sent_on for r in OutlookComSource.fetch(_Stub(), None)]
+        self.assertEqual(len(got), 5)
+        self.assertEqual(got, sorted(got))
 
 
 class TestInlineImages(unittest.TestCase):

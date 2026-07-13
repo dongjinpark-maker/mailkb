@@ -827,6 +827,42 @@ def _scenario() -> list[_Mail]:
              f"nightly 회귀 #{500 + i}: {result}\n"
              "상세: http://build.nurisoft.co.kr/rtl/512", _day(day, hour), sig=False)
 
+    # ═════════════════ mid-join: 내가 중간에 추가된 스레드 ══════════════════
+    # 처음 두 통은 강미래·오태양 둘만 주고받아 내 사서함에 없다(미배달 — mails
+    # 리스트에 안 넣는다). 세 번째에서 내가 참조 추가 — References 가 미보유
+    # 메일을 가리켜 새 스레드가 되고, 첫 보유분의 인용 체인(유일본)이
+    # 마커/접힘으로 보존된다 (docs/PROPOSAL-midjoin.md 데모).
+    mj_h0 = _Mail("mj_h0", "kang", ["oh"], [],
+                  "NPX-200 커널 드라이버 DMA 캐시 정합성",
+                  "런타임에서 출력 텐서 캐시 미스매치가 간헐 재현됩니다.\n"
+                  "dma_alloc 경로가 non-coherent 버퍼를 주는데 컴파일러 런타임이\n"
+                  "invalidate 를 생략하는 경우가 있는 것으로 보입니다.",
+                  _day(6, 10))
+    mj_h1 = _Mail("mj_h1", "oh", ["kang"], [],
+                  "RE: NPX-200 커널 드라이버 DMA 캐시 정합성",
+                  "드라이버 쪽 확인했습니다. v2.3 부터 CMA 영역이 non-coherent 로\n"
+                  "바뀌었고 sync_for_cpu 훅 호출은 UMD 책임입니다.\n"
+                  "런타임 팀 확인이 필요합니다.",
+                  _day(5, 14))
+    mj_h1.full_body += _quote_block(mj_h0)
+    mj0 = send("mj0", "kang", ["oh", "me"], ["kim"],
+               "RE: NPX-200 커널 드라이버 DMA 캐시 정합성",
+               "김도현 님, 런타임 쪽 확인이 필요해서 참조 추가드립니다.\n"
+               "아래 히스토리 참고 부탁드립니다 — UMD 의 sync_for_cpu 호출 누락\n"
+               "가능성이 있습니다.",
+               _day(4, 9))
+    mj0.parent = mj_h1                  # References 가 미보유 메일을 가리킨다
+    mj0.full_body += _quote_block(mj_h1)
+    send("mj1", "me", ["kang", "oh"], ["kim"],
+         "RE: NPX-200 커널 드라이버 DMA 캐시 정합성",
+         "확인했습니다. UMD 2.3.1 에서 output 경로 invalidate 가 조건부로 빠지는\n"
+         "커밋을 찾았습니다. 핫픽스 브랜치로 내일까지 공유하겠습니다.",
+         _day(4, 15), reply_to="mj0")
+    send("mj2", "kang", ["me"], ["oh", "kim"],
+         "RE: NPX-200 커널 드라이버 DMA 캐시 정합성",
+         "감사합니다. 재현 케이스 3종으로 검증 준비해 두겠습니다.",
+         _day(3, 10), reply_to="mj1")
+
     # ═════════════════ 외부 스팸 (필터 대상) ════════════════════════════════
 
     spam = [

@@ -348,13 +348,17 @@ class _Sanitizer(HTMLParser):
 
     _PEND_MAX = 16  # 보류 이벤트 상한 — 병리적 문서에서 무한 보류 방지
 
-    def __init__(self) -> None:
+    def __init__(self, preserve_quotes: bool = False) -> None:
         super().__init__(convert_charrefs=True)
         self.out: list[str] = []
         self._drop = 0
         self._cut = False
         self._open: list[str] = []      # 방출된 열린 태그 (절단 시 닫기 균형용)
         self._pend: list[tuple] = []    # 보류 이벤트 (대시 조각 이후)
+        # mid-join 보존 모드: 인용 라벨에서 버리는 대신 접힘(details)으로 감싸
+        # 계속 정제한다 — 스레드 첫 보유 메일의 인용 체인은 DB 에 없는 유일본
+        self._preserve = preserve_quotes
+        self._preserving = False        # 폴드가 열렸나 (첫 라벨 이후)
 
     def _flush(self) -> None:
         """보류분을 정상 방출 (라벨이 아니었음)."""
@@ -383,6 +387,24 @@ class _Sanitizer(HTMLParser):
             self.out.append(f"</{tag}>")
         self._open.clear()
         self._cut = True
+
+    def _begin_preserve(self) -> None:
+        """보존 모드의 절단 지점 — 버리는 대신 접힘 컨테이너를 연다.
+
+        열린 태그를 닫아 균형을 맞춘 뒤 폴드를 열고, 보류분(대시 구분선)은
+        폴드 안 첫 내용으로 이월한다. 두 번째 이후 라벨(체인 속 중첩 인용)은
+        no-op — 폴드는 메일당 하나, 중첩 라벨은 내용으로 흐른다.
+        """
+        if self._preserving:
+            return
+        pend, self._pend = self._pend, []
+        for tag in reversed(self._open):
+            self.out.append(f"</{tag}>")
+        self._open.clear()
+        self.out.append(QFOLD_OPEN)
+        self._preserving = True
+        self._pend = pend
+        self._flush()                    # 구분선 등 보류분을 폴드 안으로
 
     def _hold(self, ev: tuple) -> None:
         self._pend.append(ev)
@@ -481,15 +503,20 @@ class _Sanitizer(HTMLParser):
         s = data.replace("\xa0", " ").strip()
         if s and _HTML_CUT_RX.match(s) and (
                 self._pend or sum(1 for ch in s if ch in "-—_=*") >= 2):
-            # 라벨 단독 청크는 대시 동반 또는 보류(대시 조각 선행) 시에만 절단
-            self._do_cut()
-            return
+            # 라벨 단독 청크는 대시 동반 또는 보류(대시 조각 선행) 시에만 절단.
+            # 보존 모드면 폴드를 열고 라벨부터 내용으로 계속 방출한다.
+            if not self._preserve:
+                self._do_cut()
+                return
+            self._begin_preserve()
         # 라벨 없는 한국어 Outlook 답장: "________" 구분선 뒤 "보낸 사람:" 헤더.
         # 구분선을 보류(_pend)한 상태에서 헤더 시작 청크가 오면 인용 시작으로 절단.
         # (텍스트 경로 _find_cut 의 _HDR_FIRST 판정을 HTML 경로에 맞춰 재현)
-        if s and _HDR_FIRST.match(s) and self._pend_has_sep():
-            self._do_cut()
-            return
+        elif s and _HDR_FIRST.match(s) and self._pend_has_sep():
+            if not self._preserve:
+                self._do_cut()
+                return
+            self._begin_preserve()
         esc = _data_esc(data)
         if s and len(s) >= 2 and _DASH_ONLY_RX.match(s):
             self._hold(("text", esc))
@@ -505,13 +532,23 @@ class _Sanitizer(HTMLParser):
         super().close()
         if not self._cut:
             self._flush()   # 라벨 없이 끝남 — 보류분(서명 구분선 등) 보존
+        if self._preserving:
+            # 원본이 태그를 안 닫고 끝나도 폴드는 균형 있게 닫는다
+            for tag in reversed(self._open):
+                self.out.append(f"</{tag}>")
+            self._open.clear()
+            self.out.append(QFOLD_CLOSE)
 
 
-def sanitize_html(html: str) -> str:
-    """이메일 HTML → 웹 UI 표시용 안전 HTML (허용목록·원격이미지 차단)."""
+def sanitize_html(html: str, preserve_quotes: bool = False) -> str:
+    """이메일 HTML → 웹 UI 표시용 안전 HTML (허용목록·원격이미지 차단).
+
+    preserve_quotes: 인용 라벨에서 절단하는 대신 details 접힘(QFOLD)으로 감싸
+    보존 — 스레드의 첫 보유 메일(mid-join)은 인용 체인이 유일본이다.
+    """
     if not html:
         return ""
-    p = _Sanitizer()
+    p = _Sanitizer(preserve_quotes=preserve_quotes)
     try:
         p.feed(html)
         p.close()
@@ -521,6 +558,24 @@ def sanitize_html(html: str) -> str:
 
 
 # ---------------------------------------------------------- 인용문 절단 지점
+
+# mid-join 보존 (docs/PROPOSAL-midjoin.md): 스레드의 첫 보유 메일은 인용 체인이
+# 내 사서함에 없는 유일본이라 절단하지 않고 남긴다. 두 층의 경계 표식 —
+#  - 텍스트(new_content): PRESERVED_MARK 한 줄. FTS·AI·검색은 전문을 보고,
+#    신호 정규식 등 '신규 작성분'만 봐야 하는 소비자는 strip_preserved() 사용.
+#  - HTML(message_html): QFOLD(details 접힘, 기본 닫힘). 프룬되면 웹 렌더러가
+#    PRESERVED_MARK 를 같은 접힘으로 재현한다 (저장 증가 없이 렌더링만).
+PRESERVED_MARK = "--- 이전 대화 (인용 보존) ---"
+QFOLD_OPEN = ("<details class='qfold'><summary>이전 대화 (인용 보존)</summary>"
+              "<div class='qbody'>")
+QFOLD_CLOSE = "</div></details>"
+
+
+def strip_preserved(text: str) -> str:
+    """보존 인용 블록을 뗀 '신규 작성분'만 반환 — 신호/요청 판정용."""
+    i = (text or "").find(PRESERVED_MARK)
+    return text if i < 0 else text[:i].rstrip()
+
 
 # 인용 시작 라벨 (구분선 패턴 공용)
 _QUOTE_LABEL = (
@@ -593,20 +648,27 @@ def _strip_signature(lines: list[str]) -> list[str]:
     return lines
 
 
-def extract_new_content(body_text: str) -> str:
+def extract_new_content(body_text: str, preserve_quotes: bool = False) -> str:
     """메일 본문에서 '새로 쓰인 부분'만 추출.
 
     1) 인용 시작 지점에서 절단
     2) `>` 인용 줄 제거
     3) 꼬리 서명/법적 고지 제거
+
+    preserve_quotes(mid-join 첫 보유 메일): 절단 지점 이후를 버리지 않고
+    PRESERVED_MARK 아래에 원문 그대로 잇는다 (`>` 줄·서명도 보존 — 체인 속
+    서명은 기록의 일부고, 서명 절단 패턴이 체인 전체를 지울 수 있다). 캡 없음.
     """
     lines = body_text.split("\n")
-    lines = lines[: _find_cut(lines)]
-    lines = [l for l in lines if not l.lstrip().startswith(">")]
-    lines = _strip_signature(lines)
-    text = "\n".join(lines)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+    cut = _find_cut(lines)
+    head = [l for l in lines[:cut] if not l.lstrip().startswith(">")]
+    head = _strip_signature(head)
+    text = re.sub(r"\n{3,}", "\n\n", "\n".join(head)).strip()
+    if preserve_quotes and cut < len(lines):
+        tail = re.sub(r"\n{3,}", "\n\n", "\n".join(lines[cut:])).strip()
+        if tail:
+            text = (text + "\n\n" if text else "") + PRESERVED_MARK + "\n" + tail
+    return text
 
 
 # ------------------------------------------------------------------ 제목 정규화

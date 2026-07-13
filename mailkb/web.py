@@ -21,6 +21,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from . import __version__, config as cfgmod, report, review
+from .clean import PRESERVED_MARK, QFOLD_CLOSE, QFOLD_OPEN, strip_preserved
 from .store import Store, image_cutoff_for
 
 # 데일리 생성 백그라운드 잡(단일) — 웹은 단일 스레드라 리뷰(수 초~수십 초)는 별 스레드로
@@ -363,6 +364,12 @@ input, select, textarea { background: var(--surface); color: var(--ink); }
 .imgstrip { background: var(--surface-3); border: 1px dashed var(--border-strong);
     border-radius: 6px; padding: 5px 10px; font-size: 12.5px; color: var(--ink-3);
     margin-bottom: 8px; }
+/* mid-join 보존 인용 접힘 — HTML 층(store 저장분)과 텍스트 층(렌더 시 변환) 공용 */
+.mbody details.qfold { margin: 10px 0 2px; }
+.mbody details.qfold > summary { cursor: pointer; color: var(--ink-3);
+    font-size: 12.5px; padding: 4px 0; border-top: 1px dashed var(--border-strong); }
+.mbody details.qfold > .qbody { margin-top: 6px;
+    border-left: 3px solid var(--border-2); padding-left: 10px; }
 .imgnote-inline { display: inline-block; font-size: 12px; color: var(--muted);
     border: 1px dashed var(--border); border-radius: 4px; padding: 1px 6px; }
 .rvbar { max-width: 420px; height: 8px; background: var(--surface-3);
@@ -544,6 +551,16 @@ def _render_table(heads: list[str], aligns: list[str], rows: list[list[str]]) ->
     return "<table class='md-table'>" + thead + tbody + "</table>"
 
 
+def _split_preserved(raw: str) -> tuple[str, str]:
+    """new_content 를 (신규 작성분, 보존 인용) 으로 분할 — PRESERVED_MARK 기준.
+
+    마커가 없으면 (원문, "") — mid-join 첫 보유 메일에만 마커가 있다."""
+    if PRESERVED_MARK not in (raw or ""):
+        return raw, ""
+    head, _sep, tail = raw.partition(PRESERVED_MARK)
+    return head.rstrip(), tail.strip()
+
+
 def _mail_md_to_html(text: str) -> str:
     """text-only 메일 본문 마크다운을 안전 HTML 로. escape 먼저 → 화이트리스트만.
 
@@ -706,7 +723,8 @@ def format_detail(store, thread_id: int) -> dict:
     # '내 응답 대기' 카테고리와 같은 용어(2026-07-12 정렬).
     if not last["is_sent"] and len(last_to) < 3 and (set(last_to) & me):
         signals.append("↩ 내 응답 대기")
-    if any(review.DEADLINE_RX.search(m["new_content"] or "") for m in msgs if not m["is_sent"]):
+    if any(review.DEADLINE_RX.search(strip_preserved(m["new_content"] or ""))
+           for m in msgs if not m["is_sent"]):
         signals.append("⏰ 기한/요청")
 
     analysis = [
@@ -1564,7 +1582,7 @@ def _deadline_thread_ids(store) -> set:
             "WHERE m.is_sent=0 AND (t.hidden IS NULL OR t.hidden=0)"):
         if r["thread_id"] in out:
             continue
-        if review.DEADLINE_RX.search(r["new_content"] or ""):
+        if review.DEADLINE_RX.search(strip_preserved(r["new_content"] or "")):
             out.add(r["thread_id"])
     return out
 
@@ -1854,14 +1872,17 @@ def render_thread(store, tid: int) -> str:
 
     raws = ["" if (blk["html"] and not _is_strip_marker(blk["html"]))
             else "\n".join(blk["body"]) for blk in d["timeline"]]
+    # 보존 인용(mid-join) 분할 — 텍스트 표시 경로(프룬 후 포함)에서도 HTML 층과
+    # 같은 접힘 경험을 재현한다 (저장 증가 없음 — 렌더 시 마커를 폴드로 변환)
+    parts = [_split_preserved(r) for r in raws]
     # 토글 버튼은 '진짜 텍스트 메일'에만 — 프룬 마커 메일은 아래에서 서식을
     # 기본 렌더하므로 토글 대상이 아니다
-    any_md = any(r and _looks_like_markdown(r) and not blk["html"]
-                 for blk, r in zip(d["timeline"], raws))
+    any_md = any(h and _looks_like_markdown(h) and not blk["html"]
+                 for blk, (h, _t) in zip(d["timeline"], parts))
     out.append("<div class='mthread'>")
     if any_md:
         out.append("<button type='button' class='md-toggle'>서식 보기</button>")
-    for blk, raw in zip(d["timeline"], raws):
+    for blk, (raw, qtail) in zip(d["timeline"], parts):
         sent = " sent" if blk["is_sent"] else ""
         arrow = "→" if blk["is_sent"] else ""
         att = f" 📎{esc(blk['attach'])}" if blk["attach"] else ""
@@ -1886,13 +1907,13 @@ def render_thread(store, tid: int) -> str:
                            + _mail_md_to_html(raw) + "</div>")
             elif raw.strip():
                 out.append("<pre style='white-space:pre-wrap'>" + esc(raw) + "</pre>")
-            else:
+            elif not qtail:
                 out.append("<p class='dim'>본문 없음 — Outlook에서 확인</p>")
         elif blk["html"]:
             if "data-blocked-src" in blk["html"]:
                 out.append("<div class='imgnote'>🚫 일부 이미지를 표시할 수 없습니다"
                            "(원격 차단 또는 추출 실패) — 원문은 Outlook에서</div>")
-            out.append(blk["html"])          # 이미 정제됨(store)
+            out.append(blk["html"])          # 이미 정제됨(store) — 폴드도 저장분에 포함
         elif raw and _looks_like_markdown(raw):
             # 원문(기본)과 서식(숨김) 둘 다 실어 토글은 순수 show/hide 로 처리.
             out.append("<pre class='md-raw' style='white-space:pre-wrap'>"
@@ -1900,9 +1921,13 @@ def render_thread(store, tid: int) -> str:
             out.append("<div class='md-rich'>" + _mail_md_to_html(raw) + "</div>")
         elif raw.strip():
             out.append("<pre style='white-space:pre-wrap'>" + esc(raw) + "</pre>")
-        else:
+        elif not qtail:
             # 이미지-전용 메일 등 텍스트가 비면(빈 본문 가드) 안내만
             out.append("<p class='dim'>본문 없음 — Outlook에서 확인</p>")
+        if qtail:
+            # 보존 인용을 HTML 층과 같은 접힘으로 — 서식 렌더(체인은 md 산출물)
+            out.append(QFOLD_OPEN + "<div class='md-rich md-show'>"
+                       + _mail_md_to_html(qtail) + "</div>" + QFOLD_CLOSE)
         out.append("</div></div>")
     out.append("</div>")   # .mthread
     return "\n".join(out)

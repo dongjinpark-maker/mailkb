@@ -14,6 +14,7 @@ import subprocess
 import time
 from datetime import date, timedelta
 
+from .clean import strip_preserved
 from .config import Config
 from .store import Store
 
@@ -224,7 +225,7 @@ def today_digest(store: Store, cfg: Config, date_iso: str) -> dict:
             "subject": msgs[0]["subject"],
             "is_sent": bool(last["is_sent"]),
             "who": origin["sender_name"] or origin["sender_addr"],
-            "lead": _lead_line(last["new_content"] or ""),
+            "lead": _lead_line(strip_preserved(last["new_content"] or "")),
             "ai_core": "",
             "last_on": last["sent_on"],
         })
@@ -246,9 +247,11 @@ def deadline_signals(store: Store, cfg: Config, date_iso: str) -> list[tuple[str
             continue  # Invitation 류의 "…까지" 오염 차단
         if len([a for a in m["to_addrs"].split(";") if a]) >= 3:
             continue
-        found = DEADLINE_RX.search(m["new_content"])
+        # 보존 인용(mid-join)은 신호 대상이 아님 — 신규 작성분만 스캔
+        body = strip_preserved(m["new_content"])
+        found = DEADLINE_RX.search(body)
         if found:
-            signals.append((m["subject"], _line_at(m["new_content"], found.start())))
+            signals.append((m["subject"], _line_at(body, found.start())))
     return signals
 
 
@@ -308,7 +311,9 @@ def intervention_queue(
         me_in_to = bool(set(to) & me)
         broadcast = len(to) >= bcast
         noise = cfg.is_noise(t["sender_addr"])
-        content = t["new_content"] or ""
+        # 신호 판정은 신규 작성분만 — 보존 인용(mid-join) 속 과거 요청/기한은
+        # 이미 소화된 대화라 개입 근거가 아니다
+        content = strip_preserved(t["new_content"] or "")
         dec = _DECISION_RX.search(content)
         dead = DEADLINE_RX.search(content)
         wd = _workdays_since(t["sent_on"], d, holidays)

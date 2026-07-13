@@ -24,6 +24,8 @@ import unicodedata
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
 
+from .clean import strip_preserved
+
 # ------------------------------------------------------------------ 설정
 
 # 검토 기간 선택지 (주) — 모든 섹션(관계도 포함)이 이 기간을 따른다
@@ -150,7 +152,8 @@ def sig_evaporated(d: dict) -> list[dict]:
         last_req = None
         for m in ms:
             if m["is_sent"]:
-                body = (m["new_content"] or "") + " " + (m["subject"] or "")
+                # 보존 인용(mid-join FW 등) 속 과거 요청은 '내 요청'이 아님
+                body = strip_preserved(m["new_content"] or "") + " " + (m["subject"] or "")
                 if REQUEST_RX.search(body) and (m["to_addrs"] or "").strip():
                     last_req = m
             elif last_req is not None and m["sent_on"] > last_req["sent_on"]:

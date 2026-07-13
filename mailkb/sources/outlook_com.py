@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import email.parser
 import email.utils
+import heapq
 import os
 import re
 import tempfile
@@ -134,24 +135,41 @@ class OutlookComSource:
 
     def fetch(self, since_iso: str | None,
               image_cutoff: str | None = None) -> Iterator[MailRecord]:
-        """image_cutoff(YYYY-MM-DD): 이 날짜 이전 메일은 인라인 이미지 추출을
+        """Inbox·Sent 두 스트림을 sent_on 기준 병합해 전역 시간순으로 yield.
+
+        폴더 순차 순회(구현 초기)는 폴더 안에서만 시간순이라, 내가 시작한
+        스레드의 백필에서 상대 답장(Inbox)이 내 원 메일(Sent)보다 먼저 들어와
+        store 의 '시간순 입력' 가정과 mid-join 판정(새 스레드 생성 = 첫 보유분)
+        을 깨뜨렸다. 각 폴더가 이미 시간 정렬이므로 병합은 heapq.merge 로 lazy.
+
+        image_cutoff(YYYY-MM-DD): 이 날짜 이전 메일은 인라인 이미지 추출을
         건너뛴다 — 대량 백필에서 곧 프룬될 이미지에 COM 왕복을 쓰지 않는다."""
-        for folder_const, folder_name in ((FOLDER_INBOX, "inbox"), (FOLDER_SENT, "sent")):
-            folder = self._ns.GetDefaultFolder(folder_const)
-            items = folder.Items
-            items.Sort("[ReceivedTime]")
-            if since_iso:
-                # DASL 필터 — 로캘 무관, 단 날짜는 UTC 로 비교됨 → 변환 필수
-                when = _dasl_utc(since_iso)
-                items = items.Restrict(
-                    f"@SQL=\"urn:schemas:httpmail:datereceived\" > '{when}'"
-                )
-            item = items.GetFirst()
-            while item is not None:
-                rec = self._to_record(item, folder_name, image_cutoff)
-                if rec is not None:
-                    yield rec
-                item = items.GetNext()
+        streams = [
+            self._folder_stream(fc, name, since_iso, image_cutoff)
+            for fc, name in ((FOLDER_INBOX, "inbox"), (FOLDER_SENT, "sent"))
+        ]
+        yield from heapq.merge(*streams, key=lambda r: r.sent_on)
+
+    def _folder_stream(self, folder_const: int, folder_name: str,
+                       since_iso: str | None,
+                       image_cutoff: str | None) -> Iterator[MailRecord]:
+        folder = self._ns.GetDefaultFolder(folder_const)
+        items = folder.Items
+        if since_iso:
+            # DASL 필터 — 로캘 무관, 단 날짜는 UTC 로 비교됨 → 변환 필수.
+            # Restrict 결과 컬렉션은 정렬을 승계하지 않을 수 있어 Sort 는 뒤에.
+            when = _dasl_utc(since_iso)
+            items = items.Restrict(
+                f"@SQL=\"urn:schemas:httpmail:datereceived\" > '{when}'"
+            )
+        # 병합 키(rec.sent_on)와 같은 필드로 정렬 — inbox 는 수신시각, sent 는 발신시각
+        items.Sort("[ReceivedTime]" if folder_name == "inbox" else "[SentOn]")
+        item = items.GetFirst()
+        while item is not None:
+            rec = self._to_record(item, folder_name, image_cutoff)
+            if rec is not None:
+                yield rec
+            item = items.GetNext()
 
     def _to_record(self, item, folder_name: str,
                    image_cutoff: str | None = None) -> MailRecord | None:

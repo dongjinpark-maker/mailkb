@@ -229,8 +229,14 @@ class Store:
         if exists:
             return False
 
-        new_content = extract_new_content(rec.body_text)
-        body_html = sanitize_html(rec.body_html) if rec.body_html else ""
+        thread_id, t_created = self._assign_thread(rec, stats)
+        # mid-join 보존 (docs/PROPOSAL-midjoin.md): 새 스레드를 만든 메일 = 그
+        # 스레드의 '내 첫 보유분'(fetch 가 시간순 병합 입력이라는 전제). 그 인용
+        # 체인은 DB 에 없는 유일본이므로 절단 대신 보존한다 — 텍스트는 마커,
+        # HTML 은 접힘. 기존 스레드 합류분은 종전대로 절단(중복 제거 철학).
+        new_content = extract_new_content(rec.body_text, preserve_quotes=t_created)
+        body_html = (sanitize_html(rec.body_html, preserve_quotes=t_created)
+                     if rec.body_html else "")
         # 인라인 이미지 주입 — 정제(인용 절단) '후' 살아남은 cid 에만 (중복 1회).
         # 컷오프 이전 메일은 스킵 (어차피 프룬 대상 — 대량 백필 낭비 방지).
         if body_html and rec.inline_images and not (
@@ -242,7 +248,6 @@ class Store:
         stats.raw_chars += len(rec.body_text)
         stats.kept_chars += len(new_content)
         is_sent = int(rec.sender_addr.lower() in self.my_addresses)
-        thread_id = self._assign_thread(rec, stats)
 
         cur = self.db.execute(
             """INSERT INTO messages
@@ -277,7 +282,12 @@ class Store:
         self._update_people(rec, is_sent)
         return True
 
-    def _assign_thread(self, rec: MailRecord, stats: SyncStats) -> int:
+    def _assign_thread(self, rec: MailRecord, stats: SyncStats) -> tuple[int, bool]:
+        """스레드 배정 — (thread_id, 새로 만들었나).
+
+        created=True 는 '이 메일이 그 스레드의 내 첫 보유분'이라는 뜻
+        (시간순 입력 전제) — _insert 가 mid-join 인용 보존 트리거로 쓴다.
+        """
         # 1순위: References/In-Reply-To 가 가리키는 기존 메시지의 스레드
         refs = list(rec.references)
         if rec.in_reply_to:
@@ -287,7 +297,7 @@ class Store:
                 "SELECT thread_id FROM messages WHERE message_id=?", (ref,)
             ).fetchone()
             if row:
-                return row["thread_id"]
+                return row["thread_id"], False
         # 2순위: 소스가 준 대화 키 (Outlook ConversationIndex 루트)
         if rec.conversation_key:
             row = self.db.execute(
@@ -295,7 +305,7 @@ class Store:
                 (rec.conversation_key,),
             ).fetchone()
             if row:
-                return row["id"]
+                return row["id"], False
         # 3순위: 정규화 제목 일치 (최근 30일 내 활동 스레드만)
         norm = normalize_subject(rec.subject)
         if norm:
@@ -306,7 +316,7 @@ class Store:
                 (norm, rec.sent_on or "9999"),
             ).fetchone()
             if row:
-                return row["id"]
+                return row["id"], False
         # 새 스레드
         cur = self.db.execute(
             """INSERT INTO threads (norm_subject, conversation_key, first_date, last_date)
@@ -314,7 +324,7 @@ class Store:
             (norm, rec.conversation_key, rec.sent_on, rec.sent_on),
         )
         stats.new_threads += 1
-        return cur.lastrowid
+        return cur.lastrowid, True
 
     def _touch_thread(self, thread_id: int, sent_on: str) -> None:
         self.db.execute(
