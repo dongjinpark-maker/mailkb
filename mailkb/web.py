@@ -242,14 +242,17 @@ details.catfold { margin: 8px 0 4px; background: var(--fold); border: 1px solid 
     color: var(--ink-2); }
 .imgnote { background: var(--warn-bg); border: 1px solid var(--warn-border); border-radius: 6px;
     padding: 4px 10px; font-size: 12px; color: var(--warn); margin-bottom: 8px; }
-/* text-only 메일 마크다운 토글(#21): 기본 원문(md-raw), 버튼 누르면 서식(md-rich) */
+/* HTML 없는 본문(#21, 2026-07-13 반전): 기본 서식(md-rich), 버튼 누르면 저장
+   텍스트(md-raw). 실사용(COM)에서 HTML 없는 본문 = 프룬/변환 산출물이라 raw 는
+   원문이 아니다 — 서식이 원 의도에 가깝고, 텍스트는 검증용 토글로.
+   .md-show 는 토글 무관 상시 서식(mid-join 접힘 내용 등). */
 .md-toggle { font-size: 12px; padding: 2px 12px; margin: 0 0 10px; cursor: pointer;
     color: var(--accent); background: var(--surface); border: 1px solid var(--border-strong); border-radius: 12px; }
 .md-toggle:hover { background: var(--hover-bg); border-color: var(--accent); }
-.md-rich { display: none; }
-.md-rich.md-show { display: block; }   /* 프룬 메일 — 서식이 기본 */
-.mthread.md-on .md-raw { display: none; }
-.mthread.md-on .md-rich { display: block; }
+.md-raw { display: none; }
+.md-rich { display: block; }
+.mthread.md-on .md-raw { display: block; }
+.mthread.md-on .md-rich:not(.md-show) { display: none; }
 .md-rich > :first-child { margin-top: 0; }
 .md-rich h3, .md-rich h4, .md-rich h5, .md-rich h6 { margin: 12px 0 4px; font-size: 15px; }
 .md-rich p { margin: 6px 0; }
@@ -1132,7 +1135,7 @@ _APP_JS = r"""
     load(href).catch(function () { location.href = href; });
   });
 
-  /* ---- #21 마크다운 서식 토글: 원문 <pre> ↔ 렌더 결과 show/hide (서버가 둘 다 실어줌) */
+  /* ---- #21 마크다운 토글: 기본 서식 ↔ 저장 텍스트 show/hide (서버가 둘 다 실어줌) */
   document.addEventListener("click", function (e) {
     var b = e.target.closest ? e.target.closest(".md-toggle") : null;
     if (!b) return;
@@ -1140,7 +1143,7 @@ _APP_JS = r"""
     if (!box) return;
     e.preventDefault();
     var on = box.classList.toggle("md-on");
-    b.textContent = on ? "원문 보기" : "서식 보기";
+    b.textContent = on ? "서식 보기" : "텍스트 보기";
   });
 
   /* ---- #16 폼 가로채기: 전체 화면이 좌측으로 리셋되지 않게 ---- */
@@ -1878,13 +1881,12 @@ def render_thread(store, tid: int) -> str:
     # 보존 인용(mid-join) 분할 — 텍스트 표시 경로(프룬 후 포함)에서도 HTML 층과
     # 같은 접힘 경험을 재현한다 (저장 증가 없음 — 렌더 시 마커를 폴드로 변환)
     parts = [_split_preserved(r) for r in raws]
-    # 토글 버튼은 '진짜 텍스트 메일'에만 — 프룬 마커 메일은 아래에서 서식을
-    # 기본 렌더하므로 토글 대상이 아니다
-    any_md = any(h and _looks_like_markdown(h) and not blk["html"]
-                 for blk, (h, _t) in zip(d["timeline"], parts))
+    # HTML 없는 본문(프룬·텍스트)이 마크다운으로 보이면 스레드당 토글 1개 —
+    # 기본은 서식, 버튼은 저장 텍스트(변환 산출물)를 보여준다 (검증용)
+    any_md = any(h and _looks_like_markdown(h) for h, _t in parts)
     out.append("<div class='mthread'>")
     if any_md:
-        out.append("<button type='button' class='md-toggle'>서식 보기</button>")
+        out.append("<button type='button' class='md-toggle'>텍스트 보기</button>")
     for blk, (raw, qtail) in zip(d["timeline"], parts):
         sent = " sent" if blk["is_sent"] else ""
         arrow = "→" if blk["is_sent"] else ""
@@ -1901,27 +1903,21 @@ def render_thread(store, tid: int) -> str:
             f"<span class='mh-who'>{arrow} {who}{att}</span>"
             f"<span class='mh-when'>{esc(blk['sent_on'])}</span></div>")
         out.append("<div class='mbody'>")
-        if blk["html"] and _is_strip_marker(blk["html"]):
-            # 보존 기간 경과 — 마커 배너 + 텍스트 본문. 원 서식은 이미 회수됐으므로
-            # 마크다운(표·목록 — html_to_markdown 산출)을 서식으로 직접 렌더한다.
-            out.append(blk["html"])          # 마커는 프룬이 만든 고정 형식
-            if raw and _looks_like_markdown(raw):
-                out.append("<div class='md-rich md-show'>"
-                           + _mail_md_to_html(raw) + "</div>")
-            elif raw.strip():
-                out.append("<pre style='white-space:pre-wrap'>" + esc(raw) + "</pre>")
-            elif not qtail:
-                out.append("<p class='dim'>본문 없음 — Outlook에서 확인</p>")
-        elif blk["html"]:
+        is_marker = bool(blk["html"]) and _is_strip_marker(blk["html"])
+        if is_marker:
+            out.append(blk["html"])          # 프룬 배너 (마커는 프룬이 만든 고정 형식)
+        if blk["html"] and not is_marker:
             if "data-blocked-src" in blk["html"]:
                 out.append("<div class='imgnote'>🚫 일부 이미지를 표시할 수 없습니다"
                            "(원격 차단 또는 추출 실패) — 원문은 Outlook에서</div>")
             out.append(blk["html"])          # 이미 정제됨(store) — 폴드도 저장분에 포함
         elif raw and _looks_like_markdown(raw):
-            # 원문(기본)과 서식(숨김) 둘 다 실어 토글은 순수 show/hide 로 처리.
+            # HTML 없는 본문(프룬 마커·행 삭제·텍스트 메일 공통) — 서식 기본.
+            # 저장 텍스트는 변환 산출물이라 raw 가 원문이 아니다; 텍스트는
+            # 토글(md-raw)로 실어 문법 리터럴 검증용으로만 쓴다.
+            out.append("<div class='md-rich'>" + _mail_md_to_html(raw) + "</div>")
             out.append("<pre class='md-raw' style='white-space:pre-wrap'>"
                        + esc(raw) + "</pre>")
-            out.append("<div class='md-rich'>" + _mail_md_to_html(raw) + "</div>")
         elif raw.strip():
             out.append("<pre style='white-space:pre-wrap'>" + esc(raw) + "</pre>")
         elif not qtail:

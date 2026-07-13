@@ -842,7 +842,7 @@ class TestInlineImages(unittest.TestCase):
         self.assertIn("<hr>", _mail_md_to_html(kept))
 
     def test_pruned_markdown_table_renders_formatted(self):
-        # 프룬된 메일의 텍스트(마크다운 표)는 서식으로 직접 렌더 — 토글 불요
+        # 프룬된 메일의 텍스트(마크다운 표)는 서식 기본 렌더 + 텍스트 토글
         from mailkb import web
         old_day = (date.today() - timedelta(days=20)).isoformat()
         self.store.ingest([MailRecord(
@@ -856,10 +856,10 @@ class TestInlineImages(unittest.TestCase):
         tid = self.store.message("1")["thread_id"]
         out = web.render_thread(self.store, tid)
         self.assertIn("class='imgstrip'", out)            # 마커
-        self.assertIn("md-rich md-show", out)             # 서식 기본 표시
+        self.assertIn("class='md-rich'", out)             # 서식 기본 표시 (CSS 기본값)
         self.assertIn("<table class='md-table'>", out)    # 표 렌더
         self.assertIn("<td>GDS</td>", out)
-        self.assertNotIn("md-toggle", out)                # 프룬 메일만으론 토글 없음
+        self.assertIn("md-toggle", out)                   # 저장 텍스트 검증 토글 (2026-07-13)
 
     def test_prune_disabled_when_zero(self):
         self.assertIsNone(self.store.maybe_prune_html(0))
@@ -2406,7 +2406,8 @@ class TestWeb(unittest.TestCase):
         self.assertIn("일부 이미지를 표시할 수 없습니다", out)   # 안내 배너
 
     def test_thread_markdown_toggle_for_text_mail(self):
-        # text-only 메일이 마크다운으로 보이면 토글 버튼 + 원문(md-raw) + 서식(md-rich)
+        # HTML 없는 메일이 마크다운으로 보이면 서식(md-rich) 기본 +
+        # '텍스트 보기' 토글(md-raw — 저장 텍스트 검증용)
         self.store.ingest([
             MailRecord(message_id="<md@t>", subject="주간 보고",
                        sender_name="lee", sender_addr="lee@corp.example",
@@ -2417,8 +2418,8 @@ class TestWeb(unittest.TestCase):
             "SELECT thread_id FROM messages WHERE subject='주간 보고'"
         ).fetchone()["thread_id"]
         out = self.web.render_thread(self.store, tid)
-        self.assertIn("md-toggle", out)                 # 토글 버튼
-        self.assertIn("class='md-raw'", out)            # 원문 보존
+        self.assertIn(">텍스트 보기</button>", out)      # 토글 버튼 (서식이 기본)
+        self.assertIn("class='md-raw'", out)            # 저장 텍스트 보존(토글용)
         self.assertIn("md-rich", out)                   # 렌더 결과
         self.assertIn("<strong>완료</strong>", out)      # 굵게
         self.assertIn("<ul>", out)                      # 목록
