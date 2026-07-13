@@ -152,6 +152,10 @@ class _MarkdownConverter(HTMLParser):
             self._emit("\n" + "  " * depth + marker)
         elif tag == "blockquote":
             self._emit("\n\n> ")
+        elif tag == "hr":
+            # 구분선 보존 — 섹션 나눔의 가독성 신호 (렌더러가 <hr> 로 복원.
+            # 서명 절단 패턴은 정확히 '--' 라 '---' 는 안전)
+            self._emit("\n\n---\n\n")
         elif tag == "table":
             self._rows = []
         elif tag == "tr":

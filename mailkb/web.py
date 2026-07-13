@@ -208,11 +208,6 @@ h1 { font-size: 20px; } h2 { font-size: 17px; margin-top: 22px; }
 .item.hot { border-left-color: var(--danger); }
 .item.personal { border-left-color: var(--accent2); }
 .item .who { color: var(--ink-2); } .item .day { color: var(--ink-3); font-size: 13px; }
-.item form.qhide { float: right; margin: -2px -4px 0 8px; }
-.item form.qhide button { font-size: 11px; padding: 1px 7px; color: var(--muted);
-    border-color: var(--border); background: none; }
-.item form.qhide button:hover { color: var(--ink-2); border-color: var(--border-strong);
-    background: var(--surface-2); }
 .item .snip { color: var(--ink-2); font-size: 13px; display: block; margin-top: 2px; }
 .star { color: var(--accent2); font-weight: 700; }
 .dim { color: var(--ink-3); }
@@ -1168,7 +1163,7 @@ _APP_JS = r"""
         if (msg) toast(msg);
         /* 스레드 상태 변경(플래그·숨김·추적)은 왼쪽 목록에도 즉시 반영 */
         if (leftCur &&
-            /\/thread\/\d+\/(flag|unflag|hide|unhide|qmute|qunmute)$/.test(action)) {
+            /\/thread\/\d+\/(flag|unflag|hide|unhide)$/.test(action)) {
           var sc = left.scrollTop;
           load(leftCur, "left", false)
             .then(function () { left.scrollTop = sc; })   /* 스크롤 유지 */
@@ -1479,10 +1474,6 @@ def _item_html(it: dict) -> str:
         cls += " hot"
     elif it.get("personal"):
         cls += " personal"
-    hide = (f"<form class='qhide' method='post' "
-            f"action='/thread/{it['thread_id']}/qmute'>"
-            "<button title='지금 할 일에서 제외 — 목록·검색엔 그대로, "
-            "새 메일 오면 자동 복귀'>✕</button></form>")
     star = "<span class='star'>★ </span>" if it.get("personal") else ""
     tag = f" {esc(it['tag'])}" if it.get("tag") else ""
     snip = (f"<span class='snip'>「{esc(it['snippet'])}」</span>"
@@ -1492,7 +1483,7 @@ def _item_html(it: dict) -> str:
         act = f" · 제안: {esc(it['ai_action'])}" if it.get("ai_action") else ""
         reason = f"<span class='snip'>↳ {esc(it['ai_reason'])}{act}</span>"
     return (
-        f"<div class='{cls}'>{hide}{star}"
+        f"<div class='{cls}'>{star}"
         f"<a href='/thread/{it['thread_id']}'>{esc(it['subject'])}</a> "
         f"<span class='who'>· {esc(it['who'])}</span> "
         f"<span class='day'>— {esc(review.day_label(it))}{tag}</span>"
@@ -1797,8 +1788,7 @@ def render_threads(store, cfg, offset: int = 0, flt: str = "") -> str:
             + f"<div class='mlist'>{body}{more}</div>")
 
 
-def _actions_bar(tid: int, t, has_attach: bool, decider: str = "",
-                 qmuted: bool = False) -> str:
+def _actions_bar(tid: int, t, has_attach: bool, decider: str = "") -> str:
     flagged = bool(t["flagged"]) if t else False
     hidden = bool(t["hidden"]) if t else False
     forms: list[str] = []
@@ -1820,9 +1810,6 @@ def _actions_bar(tid: int, t, has_attach: bool, decider: str = "",
         _btn("unhide", "🙈 숨김 해제")
     else:
         _btn("hide", "숨기기")
-    # '지금 할 일' 전용 제외 상태 — 복원만 노출(제외는 홈 큐의 ✕)
-    if qmuted:
-        _btn("qunmute", "지금 할 일에 복원")
     # 노트/열기/첨부 (발신자 차단은 주소별 보기 페이지로 이동 — 이름 클릭)
     _btn("note", "노트 생성")
     _btn("open", "Outlook 열기")
@@ -1851,8 +1838,7 @@ def render_thread(store, tid: int) -> str:
         # 결정자 기본값 = 최신 수신 메일 발신인 (타임라인은 최신 먼저)
         decider = next((blk["sender"] for blk in d["timeline"]
                         if not blk["is_sent"]), "")
-        out.append(_actions_bar(tid, t, has_attach, decider=decider,
-                                qmuted=store.is_queue_muted(tid)))
+        out.append(_actions_bar(tid, t, has_attach, decider=decider))
     out.append("<div class='analysis'>")
     for a in d["analysis"]:
         if not a:
@@ -2399,13 +2385,6 @@ def perform_action(store, cfg, path: str, form: dict) -> str:
         if action == "unflag":
             store.set_flag(tid, False)
             return back + "?msg=" + _q("플래그 해제")
-        if action == "qmute":
-            # '지금 할 일' 전용 제외 — 숨기기와 구분(목록·검색·통계 무영향)
-            store.set_queue_mute(tid, True)
-            return "/?msg=" + _q("지금 할 일에서 제외 — 새 메일 오면 자동 복귀")
-        if action == "qunmute":
-            store.set_queue_mute(tid, False)
-            return back + "?msg=" + _q("지금 할 일에 복원")
         if action == "hide":
             # 숨김: 목록·추적에서 제외, 새 수신 메일이 오면 자동 해제
             store.hide_thread(tid, True)

@@ -575,6 +575,16 @@ class TestInlineImages(unittest.TestCase):
         self.assertIn("<table class='md-table'>", out)
         self.assertIn("<td>GDS</td>", out)
 
+    def test_hr_preserved_through_pipeline(self):
+        # <hr> → '---' → 렌더 <hr> — 섹션 구분 가독성 보존, 서명 절단('--')과 무충돌
+        from mailkb.clean import extract_new_content, html_to_markdown
+        from mailkb.web import _mail_md_to_html
+        md = html_to_markdown("<p>결정 사항</p><hr><p>참고 사항</p>")
+        self.assertIn("---", md)
+        kept = extract_new_content(md)
+        self.assertIn("참고 사항", kept)             # 절단 안 됨
+        self.assertIn("<hr>", _mail_md_to_html(kept))
+
     def test_pruned_markdown_table_renders_formatted(self):
         # 프룬된 메일의 텍스트(마크다운 표)는 서식으로 직접 렌더 — 토글 불요
         from mailkb import web
@@ -3133,39 +3143,6 @@ class TestWeb(unittest.TestCase):
             self.store, self.cfg, f"/thread/{tid}/record-decision",
             {"title": [" "]})
         self.assertEqual(len(self.store.decisions()), 1)
-
-    def test_home_queue_items_have_qmute_button(self):
-        out = self.web.render_home(self.store, self.cfg, "2026-07-04")
-        tid = self.store.message("1")["thread_id"]
-        self.assertIn(f"class='qhide' method='post' action='/thread/{tid}/qmute'",
-                      out)                                # 큐 항목 ✕(지금 할 일 제외)
-
-    def test_qmute_removes_from_queue_only_and_auto_restores(self):
-        tid = self.store.message("1")["thread_id"]
-        # 제외: 큐에서만 빠지고 메일함·스레드 목록·↩ 필터엔 그대로
-        loc = self.web.perform_action(self.store, self.cfg,
-                                      f"/thread/{tid}/qmute", {})
-        self.assertTrue(loc.startswith("/?msg="))
-        q = review.intervention_queue(self.store, self.cfg, "2026-07-04")
-        self.assertNotIn(tid, [it["thread_id"] for it in q])
-        self.assertIn("검토 요청", self.web.render_mail(self.store, self.cfg))
-        self.assertIn("검토 요청",
-                      self.web.render_threads(self.store, self.cfg, flt="awaiting"))
-        # 스레드 상세에 복원 버튼 → 복원
-        out = self.web.render_thread(self.store, tid)
-        self.assertIn(f"action='/thread/{tid}/qunmute'", out)
-        self.assertIn("지금 할 일에 복원", out)
-        self.web.perform_action(self.store, self.cfg, f"/thread/{tid}/qunmute", {})
-        q2 = review.intervention_queue(self.store, self.cfg, "2026-07-04")
-        self.assertIn(tid, [it["thread_id"] for it in q2])
-        # 다시 제외 후 새 수신 메일 → 자동 복귀
-        self.store.set_queue_mute(tid, True)
-        self.store.ingest([MailRecord(
-            message_id="<qm2@t>", subject="RE: 검토 요청", sender_name="kim",
-            sender_addr="kim@corp.example", to=[ME],
-            sent_on="2026-07-04T12:00:00", body_text="추가 의견 부탁드립니다.",
-            in_reply_to="<w1@t>", references=["<w1@t>"])])
-        self.assertFalse(self.store.is_queue_muted(tid))
 
     def test_home_ledger_lens_counts(self):
         out = self.web.render_home(self.store, self.cfg, "2026-07-04")

@@ -297,12 +297,9 @@ def intervention_queue(
 
     items: list[dict] = []
     candidates: list[dict] = []
-    muted = store.queue_muted_ids()   # '지금 할 일' 전용 제외 (✕ 버튼)
     for t in store.open_thread_tails():
         # (숨김 스레드는 open_thread_tails 가 이미 제외한다)
         tid = t["thread_id"]
-        if tid in muted:
-            continue
         to = [a for a in (t["to_addrs"] or "").split(";") if a]
         # 제목 노이즈 — 4분류 전부 이 한 지점에서 차단
         if _subject_noise(cfg, t["subject"],

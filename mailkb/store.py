@@ -102,14 +102,6 @@ CREATE TABLE IF NOT EXISTS decisions (
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_status ON decisions(status);
 
--- '지금 할 일'(개입 큐) 전용 제외 — 숨기기(목록에서 안 보임)와 구분:
--- 스레드는 메일함·스레드·필터에 그대로 두고 강조 큐에서만 뺀다.
--- 새 수신 메일이 오면 자동 복귀(_insert) — 새 활동 = 다시 판단 대상.
-CREATE TABLE IF NOT EXISTS queue_mute (
-    thread_id INTEGER PRIMARY KEY,
-    created   TEXT DEFAULT ''
-);
-
 -- 인물·프로젝트 신호 (데일리 수확 → Phase 2 주간 증류가 소화)
 CREATE TABLE IF NOT EXISTS distill_signals (
     id        INTEGER PRIMARY KEY,
@@ -282,9 +274,6 @@ class Store:
                 "UPDATE threads SET hidden=0 WHERE id=? AND hidden=1",
                 (thread_id,),
             )
-            # '지금 할 일' 제외도 새 수신이면 자동 복귀 — 새 활동 = 재판단
-            self.db.execute(
-                "DELETE FROM queue_mute WHERE thread_id=?", (thread_id,))
         self._update_people(rec, is_sent)
         return True
 
@@ -554,26 +543,6 @@ class Store:
             "UPDATE threads SET flagged=? WHERE id=?", (1 if on else 0, thread_id)
         )
         self.db.commit()
-
-    def set_queue_mute(self, thread_id: int, on: bool) -> None:
-        """'지금 할 일' 전용 제외 설정/해제 — 목록·검색·통계는 무영향."""
-        if on:
-            self.db.execute(
-                "INSERT OR IGNORE INTO queue_mute(thread_id, created) "
-                "VALUES (?, datetime('now'))", (thread_id,))
-        else:
-            self.db.execute(
-                "DELETE FROM queue_mute WHERE thread_id=?", (thread_id,))
-        self.db.commit()
-
-    def queue_muted_ids(self) -> set:
-        return {r["thread_id"] for r in
-                self.db.execute("SELECT thread_id FROM queue_mute")}
-
-    def is_queue_muted(self, thread_id: int) -> bool:
-        return self.db.execute(
-            "SELECT 1 FROM queue_mute WHERE thread_id=?", (thread_id,)
-        ).fetchone() is not None
 
     def hide_thread(self, thread_id: int, on: bool) -> None:
         """숨김 설정/해제. 숨기면 추적(미답변·개입)·메일함·스레드 기본목록에서 제외.
