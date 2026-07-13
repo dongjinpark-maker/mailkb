@@ -17,6 +17,7 @@ from mailkb import distill, notes, review, web
 from mailkb.clean import (
     PRESERVED_MARK,
     extract_new_content,
+    hide_image_signatures,
     html_to_markdown,
     html_to_text,
     normalize_subject,
@@ -256,6 +257,89 @@ class TestMarkdownNotificationMail(unittest.TestCase):
     def test_web_renders_del(self):
         out = web._mail_md_to_html("~~지운 문장~~ 새 문장")
         self.assertIn("<del>지운 문장</del>", out)
+
+
+class TestHideImageSignatures(unittest.TestCase):
+    """꼬리 이미지 서명 숨김 — 임베드 PNG·height≤210·본문 뒤 (2026-07-14)."""
+
+    PNG = "data:image/png;base64,iVBORw0KGgoAAAANS"
+
+    def _img(self, h=120, style="", src=None):
+        src = src or self.PNG
+        hattr = f" height='{h}'" if h is not None else ""
+        st = f" style='{style}'" if style else ""
+        return f"<img src='{src}'{hattr}{st}>"
+
+    def test_tail_signature_replaced(self):
+        html = f"<p>본문입니다. 확인 부탁드립니다.</p>{self._img(120)}"
+        out = hide_image_signatures(html)
+        self.assertIn("Signature 숨김", out)
+        self.assertNotIn("data:image/png", out)
+        self.assertIn("본문입니다", out)
+
+    def test_signature_in_bordered_table_removed_whole(self):
+        html = ("<p>회신드립니다.</p>"
+                "<table border='1'><tr><td>" + self._img(90) + "</td></tr></table>")
+        out = hide_image_signatures(html)
+        self.assertIn("Signature 숨김", out)
+        self.assertNotIn("<table", out)          # 테두리 table 째 제거
+        self.assertNotIn("data:image/png", out)
+
+    def test_tall_image_kept(self):
+        # height > 210 = 콘텐츠 이미지(차트 등) → 유지
+        html = f"<p>파형 공유합니다.</p>{self._img(400)}"
+        out = hide_image_signatures(html)
+        self.assertNotIn("Signature 숨김", out)
+        self.assertIn("data:image/png", out)
+
+    def test_undeclared_height_kept(self):
+        # height 미선언 → ≤210 확인 불가 → 대상 아님(보수적)
+        html = f"<p>본문.</p>{self._img(h=None)}"
+        self.assertNotIn("Signature 숨김", hide_image_signatures(html))
+
+    def test_style_height_detected(self):
+        html = f"<p>본문 텍스트입니다.</p>{self._img(h=None, style='height:180px')}"
+        out = hide_image_signatures(html)
+        self.assertIn("Signature 숨김", out)
+
+    def test_image_only_mail_kept(self):
+        # 앞에 실질 본문 없음 → 접지 않음(볼 게 없어짐)
+        html = self._img(100)
+        out = hide_image_signatures(html)
+        self.assertNotIn("Signature 숨김", out)
+        self.assertIn("data:image/png", out)
+
+    def test_content_image_then_text_kept(self):
+        # 이미지 뒤에 실질 텍스트 → 꼬리 아님 → 유지
+        html = f"<p>스크린샷:</p>{self._img(100)}<p>위 화면을 확인해 주세요.</p>"
+        out = hide_image_signatures(html)
+        self.assertNotIn("Signature 숨김", out)
+
+    def test_remote_image_not_matched(self):
+        # 임베드(data:)만 대상 — 원격/차단 이미지는 제외
+        html = "<p>본문.</p><img data-blocked-src='https://x/logo.png' height='80'>"
+        self.assertNotIn("Signature 숨김", hide_image_signatures(html))
+
+    def test_non_png_embedded_not_matched(self):
+        html = ("<p>본문.</p><img src='data:image/jpeg;base64,/9j/4AAQ' height='80'>")
+        self.assertNotIn("Signature 숨김", hide_image_signatures(html))
+
+    def test_multiple_stacked_signatures_one_note(self):
+        html = f"<p>감사합니다.</p>{self._img(80)}{self._img(60)}"
+        out = hide_image_signatures(html)
+        self.assertEqual(out.count("Signature 숨김"), 1)
+        self.assertNotIn("data:image/png", out)
+
+    def test_fast_path_identity(self):
+        # 임베드 PNG 없으면 입력 그대로(무변경)
+        html = "<p>그냥 텍스트 메일</p>"
+        self.assertEqual(hide_image_signatures(html), html)
+
+    def test_qfold_mail_skipped(self):
+        # mid-join 인용 접기가 있으면 안전하게 건너뜀
+        html = (f"<p>본문.</p><details class='qfold'><summary>이전</summary>"
+                f"<div class='qbody'>{self._img(80)}</div></details>")
+        self.assertEqual(hide_image_signatures(html), html)
 
 
 class TestSanitizeHtml(unittest.TestCase):

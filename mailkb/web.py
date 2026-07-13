@@ -21,7 +21,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from . import __version__, config as cfgmod, report, review
-from .clean import PRESERVED_MARK, QFOLD_CLOSE, QFOLD_OPEN, strip_preserved
+from .clean import (PRESERVED_MARK, QFOLD_CLOSE, QFOLD_OPEN,
+                    hide_image_signatures, strip_preserved)
 from .store import Store, image_cutoff_for
 
 # 데일리 생성 백그라운드 잡(단일) — 웹은 단일 스레드라 리뷰(수 초~수십 초)는 별 스레드로
@@ -270,6 +271,13 @@ details.catfold { margin: 8px 0 4px; background: var(--fold); border: 1px solid 
 :root[data-theme='dark'] .mailhtml blockquote { border-left-color: var(--border-2) !important;
     color: var(--ink-2) !important; }
 :root[data-theme='dark'] .mailhtml details.qfold > summary { color: var(--ink-3) !important; }
+/* 이미지 서명 숨김 표식 — 꼬리 로고·명함 카드를 대체한 한 줄 */
+.sighide { display: inline-block; font-size: 12px; color: var(--ink-3);
+    background: var(--surface-2); border: 1px dashed var(--border); border-radius: 6px;
+    padding: 3px 10px; margin: 6px 0; }
+.sighide::before { content: "✂ "; }
+:root[data-theme='dark'] .mailhtml .sighide { color: var(--ink-3) !important;
+    background: var(--surface-2) !important; border-color: var(--border) !important; }
 /* HTML 없는 본문(#21, 2026-07-13 반전): 기본 서식(md-rich), 버튼 누르면 저장
    텍스트(md-raw). 실사용(COM)에서 HTML 없는 본문 = 프룬/변환 산출물이라 raw 는
    원문이 아니다 — 서식이 원 의도에 가깝고, 텍스트는 검증용 토글로.
@@ -1946,10 +1954,13 @@ def render_thread(store, tid: int) -> str:
             if "data-blocked-src" in blk["html"]:
                 out.append("<div class='imgnote'>🚫 일부 이미지를 표시할 수 없습니다"
                            "(원격 차단 또는 추출 실패) — 원문은 Outlook에서</div>")
+            # 꼬리 이미지 서명(임베드 PNG·height≤210·본문 뒤)은 "Signature 숨김"
+            # 한 줄로 대체 — 공간만 먹는 로고·명함 카드 제거(clean.hide_image_signatures).
+            mail_html = hide_image_signatures(blk["html"])
             # 메일 원본 HTML — 흰 배경 전제의 인라인 색을 담고 있어 다크에서
             # 검은 글씨·흰 블록·파란 링크로 깨진다. .mailhtml 로 감싸 다크 모드
             # CSS 가 그 색만 테마 색으로 평탄화한다(우리 콘텐츠엔 영향 없음).
-            out.append("<div class='mailhtml'>" + blk["html"] + "</div>")
+            out.append("<div class='mailhtml'>" + mail_html + "</div>")
         elif raw and _looks_like_markdown(raw):
             # HTML 없는 본문(프룬 마커·행 삭제·텍스트 메일 공통) — 서식 기본.
             # 저장 텍스트는 변환 산출물이라 raw 가 원문이 아니다; 텍스트는

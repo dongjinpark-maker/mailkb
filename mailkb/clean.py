@@ -702,6 +702,123 @@ def sanitize_html(html: str, preserve_quotes: bool = False) -> str:
     return "".join(p.out).strip()
 
 
+# ------------------------------------------------- 이미지 서명 숨김 (표시 시점)
+# 본문 꼬리의 '이미지 블록 서명'(로고·명함 카드)을 "Signature 숨김" 한 줄로
+# 대체한다. 아주 좁은 AND 조건만 — 콘텐츠 이미지(차트·파형)와 확실히 구분:
+#   ① data:image/png;base64 로 임베드된 이미지 (원격/차단 이미지는 대상 아님)
+#   ② 선언된 height ≤ 210px (height 속성 또는 style:height — 미선언은 대상 아님)
+#   ③ 본문 뒤쪽 경계 — 그 뒤로 실질 텍스트/콘텐츠 이미지가 없음(테두리 table
+#      로 감싸였으면 그 table 째 제거). 앞에 실질 본문이 있을 때만(이미지 단독
+#      메일은 손대지 않음 — 접으면 볼 게 없어진다).
+_SIG_PNG_PREFIX = "data:image/png;base64,"
+_SIG_MAX_H = 210
+_SIG_NOTE = "<div class='sighide'>Signature 숨김</div>"
+_STYLE_HEIGHT_RX = re.compile(r"height\s*:\s*(\d+)")
+
+
+class _SigImageHider(HTMLParser):
+    """정제된 HTML 을 faithful 재직렬화하며, 꼬리의 서명 이미지 블록을 찾는다.
+
+    '실질 콘텐츠'(비공백 텍스트 또는 서명 아닌 이미지)를 만날 때마다 절단
+    후보 지점을 그 뒤로 옮긴다. 끝까지 갔을 때 마지막 실질 콘텐츠 이후가
+    서명 이미지뿐이면, 그 지점에서 잘라 열린 태그를 닫고 노트를 붙인다
+    (_Sanitizer 의 인용 절단과 같은 기법)."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.out: list[str] = []
+        self.stack: list[str] = []       # 현재 열린 태그
+        self.cut_len: int | None = None  # 마지막 실질 콘텐츠 직후의 out 길이
+        self.cut_stack: list[str] = []   # 그 시점의 열린 태그 스냅샷
+        self.has_content = False
+        self.tail_sig = False            # 마지막 실질 콘텐츠 이후 서명 이미지 존재
+
+    def _ser_attrs(self, attrs) -> str:
+        parts = []
+        for k, v in attrs:
+            if v is None:
+                parts.append(f" {k}")
+            else:
+                parts.append(f' {k}="{_attr_esc(v)}"')
+        return "".join(parts)
+
+    def _mark_content(self) -> None:
+        self.has_content = True
+        self.cut_len = len(self.out)
+        self.cut_stack = list(self.stack)
+        self.tail_sig = False
+
+    def _is_sig_img(self, attrs) -> bool:
+        a = {k.lower(): (v or "") for k, v in attrs}
+        if not a.get("src", "").startswith(_SIG_PNG_PREFIX):
+            return False
+        h = None
+        if a.get("height", "").strip().isdigit():
+            h = int(a["height"].strip())
+        else:
+            m = _STYLE_HEIGHT_RX.search(a.get("style", ""))
+            if m:
+                h = int(m.group(1))
+        return h is not None and h <= _SIG_MAX_H
+
+    def _img(self, tag, attrs, void: str) -> None:
+        self.out.append(f"<{tag}{self._ser_attrs(attrs)}{void}>")
+        if self._is_sig_img(attrs):
+            self.tail_sig = True
+        else:
+            self._mark_content()          # 콘텐츠 이미지 = 블로킹
+
+    def handle_starttag(self, tag, attrs) -> None:
+        if tag == "img":
+            self._img(tag, attrs, "")
+            return
+        self.out.append(f"<{tag}{self._ser_attrs(attrs)}>")
+        if tag not in _VOID_HTML:
+            self.stack.append(tag)
+
+    def handle_startendtag(self, tag, attrs) -> None:
+        if tag == "img":
+            self._img(tag, attrs, " /")
+            return
+        self.out.append(f"<{tag}{self._ser_attrs(attrs)} />")
+
+    def handle_endtag(self, tag) -> None:
+        self.out.append(f"</{tag}>")
+        for i in range(len(self.stack) - 1, -1, -1):
+            if self.stack[i] == tag:
+                del self.stack[i]
+                break
+
+    def handle_data(self, data) -> None:
+        self.out.append(_data_esc(data))
+        if data.replace("\xa0", " ").strip():
+            self._mark_content()
+
+    def result(self) -> str | None:
+        if not (self.has_content and self.tail_sig and self.cut_len is not None):
+            return None
+        kept = self.out[:self.cut_len]
+        closes = [f"</{t}>" for t in reversed(self.cut_stack)]
+        return "".join(kept) + "".join(closes) + _SIG_NOTE
+
+
+def hide_image_signatures(html: str) -> str:
+    """꼬리 이미지 서명(임베드 PNG·height≤210)을 "Signature 숨김" 으로 대체.
+
+    조건 미충족이면 입력을 그대로 반환(무변경). mid-join 인용 접기(qfold)가
+    있는 메일은 안전하게 건너뛴다(접힘 구조를 절단하지 않도록)."""
+    if (not html or _SIG_PNG_PREFIX not in html
+            or "class='qfold'" in html or 'class="qfold"' in html):
+        return html
+    p = _SigImageHider()
+    try:
+        p.feed(html)
+        p.close()
+    except Exception:
+        return html
+    return p.result() or html
+
+
 # ---------------------------------------------------------- 인용문 절단 지점
 
 # mid-join 보존 (docs/PROPOSAL-midjoin.md): 스레드의 첫 보유 메일은 인용 체인이
