@@ -262,6 +262,7 @@ details.catfold { margin: 8px 0 4px; background: var(--fold); border: 1px solid 
 .md-rich blockquote { border-left: 3px solid var(--border-2); margin: 6px 0; padding-left: 10px;
     color: var(--ink-2); }
 .md-rich hr { border: none; border-top: 1px solid var(--border-2); margin: 12px 0; }
+.md-rich del { color: var(--ink-3); }   /* 취소선(diff 삭제분) — 흐리게 */
 .md-rich table.md-table { border-collapse: collapse; margin: 8px 0; }
 .md-rich table.md-table th { background: var(--surface-3); }
 .daily { background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
@@ -468,6 +469,7 @@ _MAIL_CODE_RX = re.compile(r"`([^`]+)`")
 _MAIL_LINK_RX = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
 _MAIL_STRONG_RX = re.compile(r"\*\*(\S(?:.*?\S)?)\*\*")
 _MAIL_EM_RX = re.compile(r"(?<![*\w])\*(\S(?:.*?\S)?)\*(?![*\w])")
+_MAIL_DEL_RX = re.compile(r"~~(\S(?:[^~\n]*\S)?)~~")   # 취소선 (diff 삭제분 등)
 # GFM 표 구분행: `|---|:--:|--:|` (2열 이상). `---` 단독 수평선과 안 겹치게 파이프 필수.
 _MAIL_TDELIM_RX = re.compile(r"^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)+\|?\s*$")
 # 파이프 행: `| a | b |` — 구분행 없는 표(구버전 html_to_markdown 저장분) 인식용
@@ -505,6 +507,7 @@ def _mail_md_inline(s: str) -> str:
     s = _MAIL_LINK_RX.sub(_link, s)
     s = _MAIL_STRONG_RX.sub(lambda m: "<strong>%s</strong>" % m.group(1), s)
     s = _MAIL_EM_RX.sub(lambda m: "<em>%s</em>" % m.group(1), s)
+    s = _MAIL_DEL_RX.sub(lambda m: "<del>%s</del>" % m.group(1), s)
     s = re.sub(r"\x00(\d+)\x00",
                lambda m: "<code>%s</code>" % codes[int(m.group(1))], s)
     return s

@@ -148,6 +148,107 @@ class TestClean(unittest.TestCase):
         self.assertEqual(normalize_subject("[RE] 검토 요청"), "검토 요청")
 
 
+class TestMarkdownNotificationMail(unittest.TestCase):
+    """알림형 메일(Confluence 류) 변환 — 중첩/레이아웃 표, 숨김, 코드, 체크박스,
+    취소선, 셀 내 블록, 이미지 alt, 목록 정리 (2026-07-13 개선 1~9)."""
+
+    def test_nested_table_content_not_lost(self):
+        # 레이아웃 표 안의 본문(제목·문단·데이터 표)이 소실되지 않는다
+        html = ("<table role='presentation'><tr><td>"
+                "<h2>결정 사항</h2><p>프리즈는 7/21 입니다.</p>"
+                "<table border='1'><tr><th>항목</th><th>기한</th></tr>"
+                "<tr><td>ECO</td><td>7/18</td></tr></table>"
+                "</td></tr></table>")
+        out = html_to_markdown(html)
+        self.assertIn("## 결정 사항", out)
+        self.assertIn("프리즈는 7/21 입니다.", out)
+        self.assertIn("| ECO | 7/18 |", out)
+
+    def test_layout_table_transparent_keeps_newlines(self):
+        # role=presentation/전부-0 표는 컨테이너 — 문단 경계(개행) 보존, 파이프 없음
+        for attrs in ("role='presentation'",
+                      "border='0' cellpadding='0' cellspacing='0'"):
+            html = (f"<table {attrs}><tr><td><p>첫 문단.</p><p>둘째 문단.</p>"
+                    "</td></tr></table>")
+            out = html_to_markdown(html)
+            self.assertNotIn("|", out, msg=attrs)
+            self.assertIn("첫 문단.\n\n둘째 문단.", out, msg=attrs)
+
+    def test_plain_data_table_still_pipes(self):
+        # 속성 없는 표(붙여넣기 표의 전형)는 종전대로 데이터 표
+        out = html_to_markdown("<table><tr><td>a</td><td>b</td></tr></table>")
+        self.assertIn("| a | b |", out)
+
+    def test_hidden_preheader_skipped(self):
+        html = ("<span style='display:none; max-height:0px;'>미리보기 문구</span>"
+                "<p>실제 본문</p>")
+        out = html_to_markdown(html)
+        self.assertNotIn("미리보기", out)
+        self.assertIn("실제 본문", out)
+
+    def test_pre_becomes_fence_with_indent(self):
+        html = "<div><pre>  if x:\n      run()</pre></div>"
+        out = html_to_markdown(html)
+        self.assertIn("```\n  if x:\n      run()\n```", out)
+
+    def test_checkbox_state_glyphs(self):
+        html = ("<ul><li><input type='checkbox' checked> 회귀 통과</li>"
+                "<li><input type='checkbox'> 실보드 검증</li></ul>")
+        out = html_to_markdown(html)
+        self.assertIn("☑ 회귀 통과", out)
+        self.assertIn("☐ 실보드 검증", out)
+
+    def test_strikethrough_tag_and_style(self):
+        out = html_to_markdown("<p><s>7/18 예정</s> 7/17 로 변경</p>")
+        self.assertIn("~~7/18 예정~~", out)
+        out = html_to_markdown(
+            "<p><span style='text-decoration: line-through;'>구 문장</span>"
+            " 새 문장</p>")
+        self.assertIn("~~구 문장~~", out)
+
+    def test_cell_multi_block_separator(self):
+        # 셀 안 다중 문단은 ' · ' 로 경계 보존, 텍스트 노드의 소스 개행은 공백
+        html = ("<table border='1'><tr><td><p>flags 추가.</p><p>소스 호환.</p>"
+                "</td><td>줄1\n줄2</td></tr></table>")
+        out = html_to_markdown(html)
+        self.assertIn("| flags 추가. · 소스 호환. | 줄1 줄2 |", out)
+
+    def test_img_alt_content_only(self):
+        # 콘텐츠 이미지(큰 것/width 미지정)만 alt 방출 — 아바타·추적픽셀 제외
+        out = html_to_markdown(
+            "<p><img src='x' alt='레이턴시 차트' width='480'>"
+            "<img src='y' alt='김민수' width='32'>"
+            "<img src='z' alt='추적' width='1'>"
+            "<img src='w' alt='첨부 다이어그램'></p>")
+        self.assertIn("[그림: 레이턴시 차트]", out)
+        self.assertIn("[그림: 첨부 다이어그램]", out)
+        self.assertNotIn("김민수", out)
+        self.assertNotIn("추적", out)
+
+    def test_list_items_not_split_by_source_newlines(self):
+        html = "<ul>\n  <li>항목 하나</li>\n\n  <li>항목 둘</li>\n</ul>"
+        out = html_to_markdown(html)
+        self.assertIn("- 항목 하나\n- 항목 둘", out)
+
+    def test_notification_mail_end_to_end(self):
+        # 셸(중첩 레이아웃) + 발췌 본문 — 본문은 살고 프리헤더는 죽는다
+        html = ("<span style='display:none'>프리헤더</span>"
+                "<table role='presentation'><tr><td>"
+                "<table border='0' cellpadding='0' cellspacing='0'><tr><td>"
+                "<p><b>김민수</b>님이 수정했습니다</p>"
+                "<h2>회의 결과</h2><p>납기는 유지합니다.</p>"
+                "</td></tr></table></td></tr></table>")
+        nc = extract_new_content(html_to_markdown(html))
+        self.assertIn("## 회의 결과", nc)
+        self.assertIn("납기는 유지합니다.", nc)
+        self.assertNotIn("프리헤더", nc)
+        self.assertNotIn("|", nc)
+
+    def test_web_renders_del(self):
+        out = web._mail_md_to_html("~~지운 문장~~ 새 문장")
+        self.assertIn("<del>지운 문장</del>", out)
+
+
 class TestSanitizeHtml(unittest.TestCase):
     def test_strips_script_and_iframe(self):
         out = sanitize_html("<p>안녕<script>alert(1)</script><iframe src=x></iframe>끝</p>")

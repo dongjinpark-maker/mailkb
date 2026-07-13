@@ -65,17 +65,26 @@ def html_to_text(html: str) -> str:
 _HEADING = {"h1": "# ", "h2": "## ", "h3": "### ",
             "h4": "#### ", "h5": "##### ", "h6": "###### "}
 _INLINE_MARK = {"b": "**", "strong": "**", "i": "*", "em": "*",
-                "code": "`", "tt": "`"}
+                "code": "`", "tt": "`",
+                "s": "~~", "del": "~~", "strike": "~~"}
 # 강조 마커를 붙일 수 있는 인라인 태그(구조 태그와 분리 — <div style=bold> 같은
 # 블록에는 마커를 안 붙여 "\n\n**" 깨짐을 피한다). span/font 는 style 로만 판정.
 _INLINE_STYLE_TAGS = {"b", "strong", "i", "em", "code", "tt",
-                      "u", "span", "font", "mark", "small"}
+                      "u", "span", "font", "mark", "small",
+                      "s", "del", "strike"}
 _STYLE_BOLD_RX = re.compile(r"font-weight\s*:\s*(bold|[6-9]00)")
 _STYLE_ITALIC_RX = re.compile(r"font-style\s*:\s*italic")
+# 취소선 — Confluence 변경 알림의 삭제분(diff-html-removed)·취소 표기 구분
+_STYLE_STRIKE_RX = re.compile(r"text-decoration[^;]*line-through")
+# 숨김 서브트리 — 알림 메일의 프리헤더(미리보기 문구) 등이 본문으로 새는 것 방지
+_HIDE_STYLE_RX = re.compile(
+    r"display\s*:\s*none|mso-hide\s*:\s*all|visibility\s*:\s*hidden")
+# 레이아웃(컨테이너) 표 식별자 — 알림 메일 셸의 관례적 id/class
+_LAYOUT_TABLE_ID_RX = re.compile(r"wrapper|container|pattern|footer|header|email")
 
 
 def _style_marks(attrs) -> list[str]:
-    """style 속성에서 굵게/기울임을 읽어 마커로. (Word/Outlook 은 <b> 대신
+    """style 속성에서 굵게/기울임/취소선을 읽어 마커로. (Word/Outlook 은 <b> 대신
     <span style='font-weight:bold'> 를 즐겨 쓴다.)"""
     style = ""
     for k, v in attrs:
@@ -86,22 +95,36 @@ def _style_marks(attrs) -> list[str]:
         marks.append("**")
     if _STYLE_ITALIC_RX.search(style):
         marks.append("*")
+    if _STYLE_STRIKE_RX.search(style):
+        marks.append("~~")
     return marks
 
 
 class _MarkdownConverter(HTMLParser):
+    """HTML → 마크다운. 알림형 메일(Confluence/JIRA 류)의 중첩 레이아웃 표를
+    견디도록 설계됐다 — 표 상태는 스택으로(중첩 표 무손실), 레이아웃 표는
+    컨테이너로 투명화(셀 내용을 블록으로 방출해 개행 보존)."""
+
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self._out: list[str] = []
         self._skip = 0
+        self._hidden = 0                    # display:none 서브트리 깊이 (프리헤더)
         self._list_stack: list[list] = []          # ['ul'] | ['ol', n]
         self._href: list[str] = []
         self._mark_stack: list[tuple] = []          # (sink, idx, marks)
-        # 표 상태
+        # 표 상태 — 데이터 표는 스택(_tstack)으로 중첩을 견디고, 레이아웃 표는
+        # 모드 스택(_tmode)에 True 로 쌓여 셀 처리를 건너뛴다
+        self._tstack: list[dict] = []
+        self._tmode: list[bool] = []        # top = 현재(가장 안쪽) 표, True=투명
         self._cell: list[str] | None = None
         self._row: list[str] | None = None
         self._rows: list[list[str]] | None = None
         self._row_is_header = False
+        # <pre> 원문 보관 — result() 의 공백 정리에서 코드 들여쓰기를 보호
+        self._in_pre = False
+        self._pre_parts: list[str] = []
+        self._pre_store: list[str] = []
 
     def _sink(self) -> list[str]:
         return self._cell if self._cell is not None else self._out
@@ -109,11 +132,39 @@ class _MarkdownConverter(HTMLParser):
     def _emit(self, s: str) -> None:
         self._sink().append(s)
 
+    @staticmethod
+    def _is_layout_table(attrs) -> bool:
+        """레이아웃(컨테이너) 표 판정 — 이메일 조판 관례 기반.
+
+        오판해도 손실은 없다: 투명 오판이면 블록 텍스트로 강등(개행 보존),
+        데이터 오판이면 파이프 표로 렌더될 뿐이다."""
+        a = {k.lower(): (v or "").lower() for k, v in attrs}
+        if a.get("role") == "presentation":
+            return True
+        ident = a.get("id", "") + " " + a.get("class", "")
+        if "confluencetable" in ident:      # Confluence 본문 데이터 표
+            return False
+        if _LAYOUT_TABLE_ID_RX.search(ident):
+            return True
+        # 이메일 레이아웃 표의 전형: border/cellpadding/cellspacing 전부 0
+        return (a.get("border", "0") in ("", "0")
+                and a.get("cellpadding") == "0"
+                and a.get("cellspacing") == "0")
+
     def handle_starttag(self, tag: str, attrs) -> None:
         if tag in _SKIP_TAGS:
             self._skip += 1
             return
         if self._skip:
+            return
+        if self._hidden:                    # 숨김 서브트리 — 깊이만 추적
+            if tag not in _VOID_HTML:
+                self._hidden += 1
+            return
+        style = next((v for k, v in attrs if k == "style" and v), "")
+        if style and _HIDE_STYLE_RX.search(style.lower()):
+            if tag not in _VOID_HTML:
+                self._hidden = 1
             return
         if tag in _INLINE_STYLE_TAGS:
             marks = ([_INLINE_MARK[tag]] if tag in _INLINE_MARK else []) + _style_marks(attrs)
@@ -130,6 +181,26 @@ class _MarkdownConverter(HTMLParser):
             self._emit("\n")
         elif tag in _HEADING:
             self._emit("\n\n" + _HEADING[tag])
+        elif tag == "pre":
+            # 코드 블록 — 원문 그대로 보관했다가 result() 에서 펜스로 복원
+            self._in_pre = True
+            self._pre_parts = []
+        elif tag == "input":
+            # 작업 목록 체크박스 (Confluence 할 일 등) — 상태를 글리프로 보존
+            a = {k.lower(): v for k, v in attrs}
+            if (a.get("type") or "").lower() == "checkbox":
+                self._emit("☑ " if "checked" in a else "☐ ")
+        elif tag == "img":
+            # 콘텐츠 이미지의 대체텍스트는 AI/검색 재료 — 아바타(작음)·추적
+            # 픽셀(1px)은 width 로 거른다 (width 미지정 = 콘텐츠로 간주)
+            a = {k.lower(): (v or "") for k, v in attrs}
+            alt = a.get("alt", "").strip()
+            try:
+                w = int(a.get("width") or 9999)
+            except ValueError:
+                w = 9999
+            if alt and w >= 48:
+                self._emit(f"[그림: {alt}]")
         elif tag == "a":
             href = ""
             for k, v in attrs:
@@ -157,14 +228,28 @@ class _MarkdownConverter(HTMLParser):
             # 서명 절단 패턴은 정확히 '--' 라 '---' 는 안전)
             self._emit("\n\n---\n\n")
         elif tag == "table":
-            self._rows = []
+            if self._is_layout_table(attrs):
+                self._tmode.append(True)    # 투명 — 셀 내용이 블록으로 흐른다
+                self._emit("\n")
+            else:
+                self._tmode.append(False)
+                # 바깥 표 상태를 저장하고 새로 시작 — 중첩 표 무손실
+                self._tstack.append(dict(rows=self._rows, row=self._row,
+                                         cell=self._cell,
+                                         hdr=self._row_is_header))
+                self._rows, self._row, self._cell = [], None, None
+                self._row_is_header = False
         elif tag == "tr":
-            self._row = []
-            self._row_is_header = False
+            if self._tmode and not self._tmode[-1]:
+                self._row = []
+                self._row_is_header = False
         elif tag in ("td", "th"):
-            self._cell = []
-            if tag == "th":
-                self._row_is_header = True
+            if self._tmode and not self._tmode[-1]:
+                self._cell = []
+                if tag == "th":
+                    self._row_is_header = True
+            else:
+                self._emit("\n")            # 투명 표의 셀 = 블록 경계
 
     def handle_startendtag(self, tag: str, attrs) -> None:
         # <br/> 등 자기완결 태그 — 인라인 강조 태그가 자기완결이면 무시(빈 강조)
@@ -179,6 +264,10 @@ class _MarkdownConverter(HTMLParser):
             return
         if self._skip:
             return
+        if self._hidden:
+            if tag not in _VOID_HTML:
+                self._hidden -= 1
+            return
         if tag in _INLINE_STYLE_TAGS:
             if self._mark_stack:
                 sink, idx, marks = self._mark_stack.pop()
@@ -188,6 +277,13 @@ class _MarkdownConverter(HTMLParser):
                 else:
                     for mk in reversed(marks):
                         self._emit(mk)
+            return
+        if tag == "pre":
+            raw = "".join(self._pre_parts).strip("\n")
+            self._in_pre = False
+            if raw.strip():
+                self._pre_store.append(raw)
+                self._emit("\n\n\x01%d\x01\n\n" % (len(self._pre_store) - 1))
             return
         if tag == "p" or tag in _HEADING:
             self._emit("\n\n")
@@ -200,34 +296,62 @@ class _MarkdownConverter(HTMLParser):
                 self._list_stack.pop()
             self._emit("\n")
         elif tag in ("td", "th"):
-            if self._cell is not None and self._row is not None:
-                cell = re.sub(r"\s+", " ", "".join(self._cell)).strip().replace("|", r"\|")
-                self._row.append(cell)
-            self._cell = None
+            if self._tmode and not self._tmode[-1]:
+                if self._cell is not None and self._row is not None:
+                    # 셀 안 블록(문단/목록 항목) 경계를 ' · ' 로 보존
+                    parts = [re.sub(r"\s+", " ", p).strip()
+                             for p in "".join(self._cell).split("\n")]
+                    cell = " · ".join(p for p in parts if p)
+                    self._row.append(cell.replace("|", r"\|"))
+                self._cell = None
+            else:
+                self._emit("\n")
         elif tag == "tr":
-            if self._row is not None and self._rows is not None:
-                self._rows.append(self._row)
-                if self._row_is_header:
-                    self._rows.append(["---"] * len(self._row))
-            self._row = None
+            if self._tmode and not self._tmode[-1]:
+                if self._row is not None and self._rows is not None:
+                    self._rows.append(self._row)
+                    if self._row_is_header:
+                        self._rows.append(["---"] * len(self._row))
+                self._row = None
+            else:
+                self._emit("\n")
         elif tag == "table":
-            if self._rows:
-                # GFM 유효성: 첫 행 뒤 구분행이 없으면(th 없는 Outlook 표 —
-                # 붙여넣기 표의 전형) 삽입해 다운스트림 표 렌더가 인식하게 한다
-                if (len(self._rows) < 2
-                        or not all(c == "---" for c in self._rows[1])):
-                    self._rows.insert(1, ["---"] * len(self._rows[0]))
+            if not self._tmode:
+                return                      # 짝 안 맞는 </table>
+            if self._tmode.pop():           # 투명 표 — 닫기만
+                self._emit("\n")
+                return
+            rows, self._rows = self._rows, None
+            st = self._tstack.pop()         # 바깥 표 상태 복원
+            self._rows, self._row = st["rows"], st["row"]
+            self._cell, self._row_is_header = st["cell"], st["hdr"]
+            if not rows:
+                return
+            # GFM 유효성: 첫 행 뒤 구분행이 없으면(th 없는 Outlook 표 —
+            # 붙여넣기 표의 전형) 삽입해 다운스트림 표 렌더가 인식하게 한다
+            if (len(rows) < 2 or not all(c == "---" for c in rows[1])):
+                rows.insert(1, ["---"] * len(rows[0]))
+            if self._cell is not None:
+                # 데이터 표 속 데이터 표(희귀) — 바깥 셀에 평탄화(무손실)
+                flat = " ; ".join(" / ".join(r) for r in rows
+                                  if not all(c == "---" for c in r))
+                self._cell.append(flat)
+            else:
                 self._out.append("\n\n")
-                for r in self._rows:
+                for r in rows:
                     self._out.append("| " + " | ".join(r) + " |\n")
                 self._out.append("\n")
-            self._rows = None
 
     def handle_data(self, data: str) -> None:
-        if self._skip:
+        if self._skip or self._hidden:
+            return
+        if self._in_pre:
+            self._pre_parts.append(data)    # 코드 원문 — 공백 정리 없이 보관
             return
         text = data.replace("\xa0", " ").replace("​", "")
         if self._cell is not None:
+            # 텍스트 노드의 개행(소스 프리티프린트)은 공백으로 — 셀 안 블록
+            # 경계는 p/br/div/li 핸들러가 방출한 '\n' 만이다 (td 닫힘서 ' · ')
             text = re.sub(r"\s+", " ", text)
             if text:
                 self._emit(text)
@@ -241,6 +365,18 @@ class _MarkdownConverter(HTMLParser):
         text = re.sub(r"[ \t]+", " ", text)
         text = re.sub(r" *\n", "\n", text)
         text = re.sub(r"\n{3,}", "\n\n", text)
+        # 목록 항목 사이 빈 줄 제거 — 소스 들여쓰기 개행이 항목을 쪼개
+        # 렌더러가 목록을 분리 인식하는 것을 방지 (연속 항목만 병합)
+        item = r"[ ]*(?:-|\d+\.)\s"
+        for _ in range(4):
+            new = re.sub(rf"(?m)^({item}[^\n]*)\n\n(?={item})", r"\1\n", text)
+            if new == text:
+                break
+            text = new
+        # <pre> 원문을 코드펜스로 복원 (위 공백 정리에서 들여쓰기 보호됨)
+        def _restore_pre(m):
+            return "```\n" + self._pre_store[int(m.group(1))] + "\n```"
+        text = re.sub(r"\x01(\d+)\x01", _restore_pre, text)
         return text.strip()
 
 
