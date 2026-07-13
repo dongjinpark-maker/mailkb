@@ -3502,6 +3502,18 @@ class TestReport(unittest.TestCase):
         out8 = self.report.render_stats(self.store, self.cfg, 8)
         self.assertIn("최근 56일 기준", out8)
 
+    def test_ego_graph_edge_for_any_exchange(self):
+        # §5 그래프: 상위 8 발신/수신 목록 밖의 방향(수신 1통)도 실측(rows)
+        # 기반으로 선이 그려진다 — 선 없음은 그 방향 교류 0 일 때만
+        rows = [{"name": f"p{i}", "addr": f"p{i}@c", "sent": 50 - i, "recv": 30}
+                for i in range(9)]
+        rows.append({"name": "민수", "addr": "m@c", "sent": 40, "recv": 1})
+        rows.sort(key=lambda r: -(r["sent"] + r["recv"]))
+        vol = {"sent": [], "recv": [], "rows": rows, "days": 28}
+        svg = self.report.svg_ego_graph(vol)   # 상위 목록이 비어도 무관해야 함
+        self.assertIn("민수 → 나 · 수신 1통", svg)
+        self.assertIn("나 → 민수 · 발신 40통", svg)
+
     def test_my_addresses_excluded_from_volume(self):
         # self-CC(r4 의 To 에 ME 포함)가 §6 상대 목록에 나오면 안 됨
         d = self.report.load(self.store.db, 4, {ME})

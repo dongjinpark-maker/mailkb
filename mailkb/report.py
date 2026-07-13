@@ -427,16 +427,15 @@ def svg_count_bars(items: list[dict], alt: bool = False, tip_word: str = "발신
 
 
 def svg_ego_graph(vol: dict) -> str:
-    """§5 방향 그래프 — 나(중심)와 상대들, 발신/수신 화살표 굵기 = 통수."""
+    """§5 방향 그래프 — 나(중심)와 상대들, 발신/수신 화살표 굵기 = 통수.
+
+    상대 선정·통수는 vol["rows"](합집합의 실측 카운트)를 쓴다 — 상위 8
+    발신/수신 목록(vol["sent"/"recv"])을 병합하면 목록 밖 방향이 0 으로
+    보여 '주고받은 적이 있는데 선이 없는' 노드가 생겼다(2026-07-13).
+    한 통이라도 있으면 가장 가는 선으로라도 연결하고, 선이 없는 방향은
+    그 방향 교류가 정말 0 일 때뿐이다."""
     import math
-    merged: dict[str, dict] = {}
-    for key, field in (("sent", "sent"), ("recv", "recv")):
-        for it in vol[key]:
-            m = merged.setdefault(it["addr"],
-                                  {"name": it["name"], "sent": 0, "recv": 0})
-            m[field] = it["n"]
-    people = sorted(merged.values(),
-                    key=lambda m: -(m["sent"] + m["recv"]))[:10]
+    people = vol["rows"][:10]        # 이미 발신+수신 합계 내림차순
     if len(people) < 2:
         return ""
     W, H = 640, 520
@@ -476,13 +475,14 @@ def svg_ego_graph(vol: dict) -> str:
                    f'data-tip="{html.escape(tip, quote=True)}"/>')
             return e + hit
 
+        # 1통 = 최소 1px 에서 시작해 통수(√)에 비례 — 0통만 선 없음
         if p["sent"]:
-            w = 1.5 + 6.5 * math.sqrt(p["sent"] / max_edge)
+            w = 1.0 + 7.0 * math.sqrt(p["sent"] / max_edge)
             edges.append(arc((cx, cy), (nx, ny), rc + 2, rn + 7, 7, w,
                              "edge out", "arr-out",
                              f'나 → {p["name"]} · 발신 {p["sent"]}통'))
         if p["recv"]:
-            w = 1.5 + 6.5 * math.sqrt(p["recv"] / max_edge)
+            w = 1.0 + 7.0 * math.sqrt(p["recv"] / max_edge)
             edges.append(arc((nx, ny), (cx, cy), rn + 2, rc + 7, -7, w,
                              "edge in", "arr-in",
                              f'{p["name"]} → 나 · 수신 {p["recv"]}통'))
