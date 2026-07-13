@@ -484,7 +484,23 @@ def cmd_diagnose(args) -> None:
               f"직접수신만: {len(resp) - personal}  "
               f"(요청 없는 대규모 그룹 FYI 는 이미 제외됨)")
 
-    # 6) 노이즈 설정 요약
+    # 6) 이미지·본문 수명주기 상태 — "프룬이 안 도는" 문제의 1차 진단
+    retain = int(cfg.opt("web", "image_retain_days", default=60) or 0)
+    stamp = store.get_state("last_image_prune") or "(없음)"
+    n_html = db.execute("SELECT COUNT(*) n FROM message_html").fetchone()["n"]
+    n_mark = db.execute(
+        "SELECT COUNT(*) n FROM message_html WHERE html LIKE '<div class=''imgstrip''%'"
+    ).fetchone()["n"]
+    n_img = db.execute(
+        "SELECT COUNT(*) n FROM message_html WHERE html LIKE '%data:image/%'"
+    ).fetchone()["n"]
+    print(f"\n[이미지·본문] 보존 {retain}일 (config [web] image_retain_days)"
+          f" · 마지막 프룬 {stamp}")
+    print(f"  html {n_html}행 · 이미지 임베드 {n_img} · 프룬 마커 {n_mark}")
+    if retain == 60 and cfg.opt("web", "image_retain_days") is None:
+        print("  (설정 미검출 — config.toml 에 [web] 섹션 헤더 아래 두었는지 확인)")
+
+    # 7) 노이즈 설정 요약
     print(f"\n[노이즈] ignore_senders {len(cfg.ignore_senders)}개 · "
           f"internal_domains {cfg.internal_domains} · 차단 {len(cfg.blocked_senders)}개")
     print("  발신자 상위/일방 다량 후보:  mailkb noise")
