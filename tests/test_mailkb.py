@@ -3513,9 +3513,14 @@ class TestReport(unittest.TestCase):
                        '<div class="periods">',
                        'href="/stats?weeks=2"', 'href="/stats?weeks=16"',
                        'class="popt active" href="/stats?weeks=4"',   # 현재 기간 강조
-                       "증발한 내 요청", "조용해진 사람", "응답 지연",
-                       "야간·주말", "자주 주고받는 상대"):
+                       # 6개 개편 섹션 (2026-07-13)
+                       "볼륨 추세", "활동 히트맵", "응답 시간",
+                       "받은 메일 구성", "왕복 많은 논의", "자주 주고받는 상대"):
             self.assertIn(marker, out, msg=marker)
+        # 제거된 옛 섹션은 없어야
+        self.assertNotIn("조용해진 사람", out)
+        self.assertNotIn("증발한 내 요청", out)
+        self.assertNotIn("응답 지연 추세", out)
         # [분석] 버튼·라디오·폼은 제거됨
         self.assertNotIn("분석</button>", out)
         self.assertNotIn('type="radio"', out)
@@ -3524,8 +3529,63 @@ class TestReport(unittest.TestCase):
         self.assertNotIn("<!doctype", out.lower())
         self.assertNotIn("<script", out)
         self.assertNotIn("← Minerva 홈", out)
-        # 증발 요청이 잡힘 (r5: asof 7/10 기준 10일 경과)
+        # 답 대기 목록(구 증발)이 §3 으로 흡수됨 (r5: asof 7/10 기준 10일 경과)
         self.assertIn("지그 도면 요청", out)
+        self.assertIn("답을 기다리는 내 발신", out)
+
+    def test_stats_new_sections_render(self):
+        out = self.report.render_stats(self.store, self.cfg, 4)
+        # §1 2계열 라인 (발신+수신 payload — data-chart 는 escape 되어 &quot;)
+        self.assertIn('id="trend"', out)
+        self.assertIn("series2", out)
+        # §2 히트맵 (발신/수신 2개)
+        self.assertEqual(out.count('class="heatmap"'), 2)
+        # §4 받은 메일 구성 누적 막대 + 범례
+        self.assertIn('class="mixbar"', out)
+        self.assertIn("업무 · 직접(To)", out)
+        # §6 이름 클릭 → /person 링크 (그래프 노드·표)
+        self.assertIn('href="/person?addr=', out)
+
+    def test_stats_person_links_navigate(self):
+        # §6 표·그래프의 이름이 그 사람 메일로 연결 (요청: 이름 클릭 → email 창)
+        out = self.report.render_stats(self.store, self.cfg, 4)
+        self.assertIn("/person?addr=kim%40corp.example", out)
+
+    def test_sig_inbox_mix_priority(self):
+        # 상호배타 우선순위: 스팸 > 공지 > 직접 > 참조
+        d = self.report.load(self.store.db, 8, {ME})
+        mix = self.report.sig_inbox_mix(d, self.cfg)
+        self.assertEqual(mix["total"], sum(mix["seg"].values()))
+        # r1/r3/r6 은 To=[ME] 직접 수신
+        self.assertGreaterEqual(mix["seg"]["direct"], 3)
+
+    def test_sig_pingpong_counts_turns(self):
+        # kim 스레드: r1(수신)→r2(발신) = 1왕복(2미만)이라 제외.
+        # 왕복 2+ 스레드를 하나 구성해 검증
+        self.store.ingest([
+            _rec("pp1", "kim@corp.example", [ME], "핑퐁 논의",
+                 "2026-07-08T09:00:00", "질문1 부탁드립니다?"),
+            _rec("pp2", ME, ["kim@corp.example"], "RE: 핑퐁 논의",
+                 "2026-07-08T10:00:00", "답1.", reply_to="pp1"),
+            _rec("pp3", "kim@corp.example", [ME], "RE: 핑퐁 논의",
+                 "2026-07-08T11:00:00", "재질문2?", reply_to="pp2"),
+            _rec("pp4", ME, ["kim@corp.example"], "RE: 핑퐁 논의",
+                 "2026-07-08T12:00:00", "답2.", reply_to="pp3"),
+        ])
+        d = self.report.load(self.store.db, 8, {ME})
+        ping = self.report.sig_pingpong(d, self.cfg)
+        hit = [p for p in ping if p["subject"] == "핑퐁 논의"]
+        self.assertTrue(hit)
+        self.assertEqual(hit[0]["turns"], 3)   # 수→발→수→발 = 3 전환
+
+    def test_sig_response_both_directions(self):
+        d = self.report.load(self.store.db, 8, {ME})
+        my = self.report._reply_pairs(d)
+        their = self.report._their_pairs(d)
+        resp = self.report.sig_response(d, my, their)
+        # r1→r2: 내 응답 5h. r3→r4: 내 응답 23h. 표본 2건.
+        self.assertEqual(resp["mine_n"], 2)
+        # r5→(무응답) 은 their 에 안 잡힘; r6 은 kim 발신이나 앞선 내 발신 없음
 
     def test_volume_period_follows_weeks(self):
         out2 = self.report.render_stats(self.store, self.cfg, 2)
