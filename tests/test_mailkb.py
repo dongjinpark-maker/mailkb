@@ -2791,6 +2791,13 @@ class TestWeb(unittest.TestCase):
         self.assertIn("/settings/update", inspect.getsource(self.web._Handler.do_POST))
         self.assertIn("pull", inspect.getsource(self.web._git_update))
 
+    def test_latest_freshness(self):
+        # DB 변경(새 메일)을 토큰으로 감지해 열린 목록/홈을 자동 최신화(수집 주기와 분리)
+        import inspect
+        self.assertIn("/latest", inspect.getsource(self.web._Handler.do_GET))
+        self.assertIn("/latest", self.web._APP_JS)
+        self.assertIn("refreshDisplay", self.web._APP_JS)
+
     def test_timeline_newest_first(self):
         # 스레드 상세는 최신 메일이 먼저 (메일 클라이언트 관례)
         self.store.ingest([

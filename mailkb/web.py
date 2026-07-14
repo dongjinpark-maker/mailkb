@@ -999,28 +999,38 @@ _APP_JS = r"""
       "w=" + window.outerWidth + "&h=" + window.outerHeight); } catch (e) {}
   });
 
-  /* ---- 자동 동기화: 주기(분)를 서버에서 받아 백그라운드로 /autosync POST ---- */
+  /* ---- 표시 최신화: DB 변경(새 메일)을 토큰으로 감지해 현재 목록/홈을 조용히 다시 그림.
+     autosync 든 스케줄러 등 외부 sync 든 DB 만 바뀌면 반영한다(수집 주기와 분리). ---- */
+  var lastTok = null;
+  function refreshDisplay() {
+    var p = location.pathname.replace(/\/+$/, "") || "/";
+    if (p === "/") {
+      load(location.pathname + location.search, "left", false).catch(function () {});
+    } else if ((p === "/mail" || p === "/threads") && left && left.scrollTop < 150) {
+      var sc = left.scrollTop;                 /* 상단 근처만 — 깊이 스크롤 중이면 방해 안 함 */
+      load(location.pathname + location.search, "left", false)
+        .then(function () { left.scrollTop = sc; }).catch(function () {});
+    }
+  }
+  function checkFresh() {
+    return fetch("/latest").then(function (r) { return r.text(); }).then(function (tok) {
+      if (lastTok === null) { lastTok = tok; return; }   /* 첫 호출 = 기준선 */
+      if (tok !== lastTok) { lastTok = tok; refreshDisplay(); }
+    }).catch(function () {});
+  }
+  checkFresh();                                /* 기준선 */
+  setInterval(checkFresh, 60000);              /* 60초마다 표시 최신화(가벼운 DB 조회) */
+
+  /* ---- 자동 동기화(Outlook 수집): 주기(분)마다 /autosync. 새 메일이면 토스트 + 즉시 최신화 ---- */
   fetch("/syncmin").then(function (r) { return r.text(); }).then(function (s) {
     var min = parseInt(s, 10);
     if (!(min > 0)) return;                    /* 0=끔 */
     setInterval(function () {
-      fetch("/autosync", { method: "POST",
-        headers: { "X-Requested-With": "fetch" } })
+      fetch("/autosync", { method: "POST", headers: { "X-Requested-With": "fetch" } })
         .then(function (r) { return r.text(); })
         .then(function (t) {
-          var n = parseInt(t, 10);
-          if (!(n > 0)) return;                /* 새 메일 없으면 조용히 */
-          toast("새 메일 " + n + "통");
-          var p = location.pathname.replace(/\/+$/, "") || "/";
-          if (p === "/") {                     /* 홈이면 '지금 할 일'만 조용히 갱신 */
-            load(location.pathname + location.search, "left", false)
-              .catch(function () {});
-          } else if ((p === "/mail" || p === "/threads") && left && left.scrollTop < 150) {
-            /* 메일함·스레드: 목록 상단 근처면 갱신(새 메일=최상단), 깊이 스크롤 중이면 방해 안 함 */
-            var sc = left.scrollTop;
-            load(location.pathname + location.search, "left", false)
-              .then(function () { left.scrollTop = sc; }).catch(function () {});
-          }                                    /* 그 외·깊은 스크롤: 토스트만 */
+          var n = parseInt(t, 10) || 0;
+          if (n > 0) { toast("새 메일 " + n + "통"); checkFresh(); }
         }).catch(function () {});
     }, min * 60000);
   }).catch(function () {});
@@ -2670,6 +2680,20 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path == "/syncmin":            # 자동 동기화 주기(분) → app.js setInterval
             body = str(_sync_interval_min(self.cfg)).encode("ascii")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path == "/latest":             # 표시 최신화 토큰 — DB 변경(새 메일) 감지용(가벼움)
+            st = Store(self.cfg.db_path, self.cfg.my_addresses)
+            try:
+                row = st.db.execute(
+                    "SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM messages").fetchone()
+            finally:
+                st.close()
+            body = f"{row[0]}:{row[1]}".encode("ascii")
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
