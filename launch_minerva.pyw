@@ -1,10 +1,10 @@
 """Minerva 아이콘 실행기 — 클릭 한 번에:
-  1) git pull      (최신 소스 준비, 오프라인·충돌이면 현재 코드로 계속)
-  2) 옛 서버 종료   (PID 파일 — 결정: 재시작 시 기존 서버 kill 후 새로)
-  3) 서버 시작      (콘솔 없이)
-  4) Edge 앱 창 열기 (고유 임시 프로필 → 창 프로세스를 정확히 추적)
-그리고 **그 창이 닫히면 서버도 함께 종료**한다. 재시작·종료 버튼이 따로 없다 —
-다시 아이콘을 누르면 pull 후 새 서버로 뜬다.
+  1) 옛 서버 종료   (PID 파일 — 재시작 시 기존 서버 kill 후 새로)
+  2) 서버 시작      (콘솔 없이)
+  3) Edge 앱 창 열기 (고정 프로필 재사용 → 창 프로세스를 추적, 빠르게 뜸)
+그리고 **그 창이 닫히면 서버도 함께 종료**한다. 다시 아이콘을 누르면 새 서버로 뜬다.
+최신 코드 반영은 매 실행마다 pull 하지 않는다(시간 낭비) — 설정의 '최신으로 업데이트'
+(또는 수동 git pull) 후 창을 닫았다 다시 열면 적용된다.
 
 콘솔 없이 쓰려면 바로 가기 대상을 python.exe 가 아니라 **pythonw.exe** 로 둔다:
   pythonw.exe "<경로>\\launch_minerva.pyw"
@@ -44,18 +44,6 @@ def _port_open() -> bool:
         return True
     except OSError:
         return False
-
-
-def _git_pull() -> None:
-    import shutil
-    git = shutil.which("git")
-    if not git:
-        return
-    try:
-        subprocess.run([git, "pull", "--ff-only"], cwd=str(HERE), timeout=30,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except (OSError, subprocess.SubprocessError):
-        pass                                    # 오프라인·충돌 → 현재 코드로 진행
 
 
 def _kill_old() -> None:
@@ -106,7 +94,6 @@ def _open_window(profile_dir: str):
 
 
 def main() -> None:
-    _git_pull()
     _kill_old()
     server = subprocess.Popen([_pythonw(), "-m", "mailkb", "serve"], cwd=str(HERE))
 

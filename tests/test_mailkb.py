@@ -2780,9 +2780,16 @@ class TestWeb(unittest.TestCase):
         p = Path(__file__).resolve().parent.parent / "launch_minerva.pyw"
         self.assertTrue(p.exists())
         src = p.read_text(encoding="utf-8")
-        for marker in ("pull", "minerva.pid", "--app=", "--user-data-dir",
+        for marker in ("minerva.pid", "--app=", "--user-data-dir",
                        ".wait()", "terminate"):
             self.assertIn(marker, src)
+
+    def test_settings_update_button(self):
+        # 설정의 '최신으로 업데이트' — git pull 버튼/핸들러/디스패치
+        import inspect
+        self.assertIn("/settings/update", inspect.getsource(self.web.render_settings))
+        self.assertIn("/settings/update", inspect.getsource(self.web._Handler.do_POST))
+        self.assertIn("pull", inspect.getsource(self.web._git_update))
 
     def test_timeline_newest_first(self):
         # 스레드 상세는 최신 메일이 먼저 (메일 클라이언트 관례)

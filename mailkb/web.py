@@ -2130,8 +2130,34 @@ def render_settings(store, cfg) -> str:
         "<a href='https://github.com/dongjinpark-maker/mailkb' "
         "target='_blank' rel='noopener noreferrer'>GitHub</a> · "
         "MIT © 2026 Dongjin Park</p>")
+    out.append(
+        "<form method='post' action='/settings/update' class='setadd'>"
+        "<button type='submit'>최신으로 업데이트 (git pull)</button>"
+        "<span class='dim'> — 받은 뒤 창을 닫았다 다시 열면 적용됩니다</span></form>")
     out.append("</div>")
     return "\n".join(out)
+
+
+def _git_update() -> str:
+    """설정의 '최신으로 업데이트' — 코드 폴더에서 git pull --ff-only 후 결과 경로.
+    고정 명령·고정 cwd(리포)라 인젝션 없음. 적용은 창을 닫았다 다시 열 때(새 서버)."""
+    import shutil
+    import subprocess
+    repo = Path(__file__).resolve().parent.parent
+    git = shutil.which("git")
+    if not git:
+        return "/settings?msg=" + _q("git 을 찾지 못했습니다 — 수동으로 git pull 하세요")
+    try:
+        r = subprocess.run([git, "pull", "--ff-only"], cwd=str(repo),
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        return "/settings?msg=" + _q(f"업데이트 실패: {e}")
+    out = (r.stdout + r.stderr).strip()
+    if r.returncode != 0:
+        return "/settings?msg=" + _q("업데이트 실패: " + (out[:120] or "git pull 오류"))
+    if "up to date" in out.lower():
+        return "/settings?msg=" + _q("이미 최신입니다")
+    return "/settings?msg=" + _q("업데이트 완료 — 창을 닫았다 다시 열면 적용됩니다")
 
 
 _SETTINGS_INTS = [   # (폼 필드, 오버라이드 섹션, 키, 최소값)
@@ -2765,6 +2791,8 @@ class _Handler(BaseHTTPRequestHandler):
                 ai = bool((form.get("ai") or [""])[0])
                 _start_review(self.cfg, ai, today)
                 location = "/review/status"
+            elif path == "/settings/update":
+                location = _git_update()          # git pull — 적용은 창 닫았다 재실행
             elif path in ("/settings/save", "/settings/noise"):
                 # 오버라이드 파일 저장 후 cfg 재로드 → 즉시 반영(다음 요청부터)
                 home = self.cfg.home
