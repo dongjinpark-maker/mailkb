@@ -835,6 +835,15 @@ def _nav_html(active: str | None = None) -> str:
                         f'<a href="{active}" class="active">', 1)
 
 
+_FAVICON_SVG = (
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'>"
+    "<rect width='32' height='32' rx='7' fill='#22262b'/>"
+    "<text x='16' y='23' text-anchor='middle'"
+    " font-family='Segoe UI,system-ui,sans-serif' font-size='21' font-weight='700'"
+    " fill='#e8975a'>M</text></svg>"
+)
+
+
 def _head(title: str, refresh: int | None = None, extra_css: str = "",
           read_w: int | None = None, active: str | None = None,
           theme: str = "light") -> str:
@@ -851,7 +860,9 @@ def _head(title: str, refresh: int | None = None, extra_css: str = "",
         f"<!doctype html><html lang='ko' data-theme='{th}'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
         f"{meta_refresh}"
-        f"<title>{esc(title)} · Minerva</title>{extra}<style>{_CSS}</style>{rw}"
+        f"<title>{esc(title)} · Minerva</title>"
+        "<link rel='icon' type='image/svg+xml' href='/favicon.svg'>"
+        f"{extra}<style>{_CSS}</style>{rw}"
         "</head><body>"
         f"<header class='top'><span class='brand'>Minerva</span>"
         f"{_nav_html(active)}</header>"
@@ -2602,6 +2613,15 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_response(204)
             self.end_headers()
             return
+        if path == "/favicon.svg":
+            body = _FAVICON_SVG.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "image/svg+xml")
+            self.send_header("Cache-Control", "max-age=86400")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if path in ("/app.js", "/report.js"):
             js = _APP_JS if path == "/app.js" else report.REPORT_JS
             body = js.encode("utf-8")
@@ -2840,6 +2860,12 @@ def serve(cfg, port: int = 8765,
     except Exception:
         _com = False
     httpd = HTTPServer((host, port), _Handler)
+    import os
+    pidfile = cfg.home / "minerva.pid"          # 런처가 재시작 때 옛 서버를 찾아 종료
+    try:
+        pidfile.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        pidfile = None
     url = f"http://{host}:{port}/"
     print(f"Minerva 웹 UI: {url}  (Ctrl-C 로 종료)")
     if open_browser or app_mode:
@@ -2850,6 +2876,12 @@ def serve(cfg, port: int = 8765,
         print("\n종료")
     finally:
         httpd.server_close()
+        if pidfile is not None:
+            try:
+                if pidfile.read_text(encoding="utf-8").strip() == str(os.getpid()):
+                    pidfile.unlink()            # 우리 것일 때만 삭제(새 서버가 덮어썼으면 보존)
+            except OSError:
+                pass
         if _com:
             try:
                 import pythoncom

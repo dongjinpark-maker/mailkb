@@ -2760,6 +2760,30 @@ class TestWeb(unittest.TestCase):
         self.assertNotIn("host", sig.parameters)               # 바인딩 주소 인자 없음
         self.assertIn('host = "127.0.0.1"', inspect.getsource(self.web.serve))
 
+    def test_serve_writes_pidfile(self):
+        # 런처가 재시작 때 옛 서버를 찾도록 serve 가 minerva.pid 기록/정리
+        import inspect
+        src = inspect.getsource(self.web.serve)
+        self.assertIn("minerva.pid", src)
+        self.assertIn("getpid", src)
+
+    def test_favicon_svg(self):
+        # 앱 창·탭·PWA 아이콘용 SVG 파비콘 + head link
+        import inspect
+        self.assertIn("<svg", self.web._FAVICON_SVG)
+        self.assertIn("/favicon.svg", inspect.getsource(self.web._Handler.do_GET))
+        self.assertIn("/favicon.svg", self.web._head("t"))
+
+    def test_launcher_present(self):
+        # 아이콘 실행기 — 존재 + 핵심 단계 포함
+        from pathlib import Path
+        p = Path(__file__).resolve().parent.parent / "launch_minerva.pyw"
+        self.assertTrue(p.exists())
+        src = p.read_text(encoding="utf-8")
+        for marker in ("pull", "minerva.pid", "--app=", "--user-data-dir",
+                       ".wait()", "terminate"):
+            self.assertIn(marker, src)
+
     def test_timeline_newest_first(self):
         # 스레드 상세는 최신 메일이 먼저 (메일 클라이언트 관례)
         self.store.ingest([
