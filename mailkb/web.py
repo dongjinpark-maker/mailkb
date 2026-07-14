@@ -126,6 +126,12 @@ header.top { display: flex; align-items: baseline; gap: 14px; flex: none;
 header.top .brand { font-weight: 700; font-size: 18px; }
 header.top nav { flex: 1; display: flex; align-items: baseline; }
 header.top nav a { margin-right: 12px; font-size: 14px; }
+header.top nav .navsearch { margin: 0 0 0 18px; display: flex; }
+header.top nav .navsearch input { width: 230px; max-width: 32vw; padding: 5px 12px;
+    font-size: 13px; border: 1px solid var(--border-strong); border-radius: 999px;
+    background: var(--surface); color: var(--ink); }
+header.top nav .navsearch input:focus { outline: none; border-color: var(--accent);
+    width: 300px; }
 header.top nav a.gear { margin-left: auto; margin-right: 0; font-size: 17px;
     text-decoration: none; }
 /* 현재 위치한 메뉴 — 밑줄로 표시 */
@@ -835,10 +841,14 @@ def format_detail(store, thread_id: int) -> dict:
     return {"title": subject, "analysis": analysis, "timeline": timeline}
 
 
+# 검색은 nav 링크가 아니라 헤더 상시 검색창으로 승격(2026-07-15) — 어느 화면에서든
+# 바로 검색. 값은 app.js syncNavSearch 가 /search 일 때 URL 의 q 로 채운다.
 _NAV = ('<nav><a href="/">홈</a>'
         '<a href="/mail">메일함</a><a href="/threads">스레드</a>'
-        '<a href="/search">검색</a><a href="/records">기록</a>'
-        '<a href="/stats">통계</a>'
+        '<a href="/records">기록</a><a href="/stats">통계</a>'
+        "<form class='navsearch' method='get' action='/search' role='search'>"
+        "<input name='q' placeholder='🔍 검색' aria-label='검색' autocomplete='off'>"
+        "</form>"
         '<a href="/settings" class="gear" title="설정" aria-label="설정">⚙</a></nav>')
 
 # 우측(읽기) 패널의 기본 안내 — 좌측에서 항목을 열기 전까지 표시.
@@ -1126,7 +1136,18 @@ _APP_JS = r"""
     }
     return null;  /* /thread, /person 등 하위 화면은 직전 메뉴 유지 */
   }
+  /* 헤더 검색창: /search 에선 URL 의 q 를 채워 현재 질의를 반영, 그 외엔 비움.
+     결과는 URL(/search?q=…)에 있으므로 다른 화면 갔다 '뒤로' 오면 그대로 복원된다. */
+  function syncNavSearch() {
+    var inp = document.querySelector("header.top .navsearch input");
+    if (!inp || inp === document.activeElement) return;   /* 입력 중이면 건드리지 않음 */
+    var p = location.pathname.replace(/\/+$/, "") || "/";
+    inp.value = (p === "/search")
+      ? (new URLSearchParams(location.search).get("q") || "") : "";
+  }
+
   function markNav() {
+    syncNavSearch();
     var target = navTarget(location.pathname);
     if (!target) return;
     var nav = document.querySelector("header.top nav");
@@ -1330,6 +1351,11 @@ _APP_JS = r"""
     if (t && (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.isContentEditable))
       return;                  /* 입력 중엔 개입 안 함 */
     var k = e.key, rows, i;
+    if (k === "/") {           /* '/' → 헤더 검색창 포커스 (검색이 1순위 동작) */
+      var s = document.querySelector("header.top .navsearch input");
+      if (s) { e.preventDefault(); s.focus(); s.select(); }
+      return;
+    }
     if (k === "j") {
       rows = navRows(); if (!rows.length) return;
       e.preventDefault(); i = curIdx(rows);
@@ -2379,10 +2405,8 @@ def _search_facets(rows, effective: str) -> str:
 
 def render_search(store, cfg, qs, today: str) -> str:
     raw, effective = _search_effective(qs, today)
-    box = ("<form class='search' method='get' action='/search'>"
-           f"<input type='text' name='q' value='{esc(effective)}' autofocus "
-           "placeholder='검색 — 예: from:강미래 after:2026-06 리포트'> "
-           "<button>검색</button></form>")
+    # 검색 입력은 헤더 상시 검색창(_NAV navsearch)이 담당 — 여기선 중복 박스 없이
+    # 힌트·상세(빌더)·패싯·결과만. 헤더 박스 값은 app.js 가 URL 의 q 로 채운다.
     # 상세: 검색식을 만들어 검색창(q)에 병합. datalist 로 사람 이름 자동완성.
     ppl = store.frequent_people(200)
     opts = "".join(f"<option value='{esc(p['name'])}'>{esc(p['addr'])}</option>"
@@ -2403,7 +2427,7 @@ def render_search(store, cfg, qs, today: str) -> str:
         "<label><input type='checkbox' name='f_has' value='1'> 첨부</label>"
         "<button>적용</button></form>"
         f"<datalist id='ppl'>{opts}</datalist></details>")
-    out = ["<h1>검색</h1>", box, _SEARCH_HINT, adv]
+    out = ["<h1>검색</h1>", _SEARCH_HINT, adv]
     if effective:
         rows = store.search(effective, limit=50)
         out.append(f"<p class='dim'>{len(rows)}건</p>")

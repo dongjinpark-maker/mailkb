@@ -2818,10 +2818,14 @@ class TestWeb(unittest.TestCase):
 
     def test_nav_order_with_mail_menu(self):
         nav = self.web._NAV
-        order = ["홈", "메일함", "스레드", "검색", "기록", "통계"]
+        # 검색은 링크가 아니라 헤더 검색창으로 승격 — 링크 순서는 통계까지
+        order = ["홈", "메일함", "스레드", "기록", "통계"]
         pos = [nav.index(f">{t}</a>") for t in order]
         self.assertEqual(pos, sorted(pos))   # 명시된 순서 그대로
         self.assertIn('href="/mail"', nav)
+        # 검색창은 통계 뒤, 설정(gear) 앞
+        self.assertLess(nav.index(">통계</a>"), nav.index("navsearch"))
+        self.assertLess(nav.index("navsearch"), nav.index("gear"))
 
     def test_render_mail_list_and_noise_filter(self):
         self.store.ingest(
@@ -4020,9 +4024,16 @@ class TestSearchWeb(unittest.TestCase):
                          ["after:2026-06", "before:2026-07"])
         self.assertEqual(web._period_tokens("thisyear", "2026-07-13"), ["after:2026"])
 
-    def test_render_has_box_hint_datalist(self):
+    def test_search_input_promoted_to_header(self):
+        # 검색 입력은 헤더 상시 검색창(navsearch)으로 승격 — nav '검색' 링크 없음
+        self.assertIn("class='navsearch'", web._NAV)
+        self.assertIn("action='/search'", web._NAV)
+        self.assertNotIn('href="/search"', web._NAV)      # 링크는 제거됨
+        self.assertIn("syncNavSearch", web._APP_JS)       # /search 시 q 로 채움
+
+    def test_render_has_hint_datalist(self):
         html = web.render_search(self.store, self.cfg, {"q": [""]}, "2026-07-13")
-        self.assertIn("form class='search'", html)
+        self.assertNotIn("form class='search'", html)     # 페이지 중복 박스 제거
         self.assertIn("shint", html)                      # 힌트
         self.assertIn("<datalist id='ppl'>", html)        # 사람 자동완성
         self.assertIn("강미래 선임", html)                  # people 옵션
