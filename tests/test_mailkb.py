@@ -14,6 +14,7 @@ from urllib.parse import unquote as urllib_unquote
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from mailkb import distill, notes, review, web
+from mailkb import search as search_mod
 from mailkb.clean import (
     PRESERVED_MARK,
     extract_new_content,
@@ -3840,6 +3841,201 @@ class TestWindowsCompat(unittest.TestCase):
             ["python3", "-c", "import sys; print(sys.stdin.read())"],
             "긴급 🔴 확인", timeout=30, retries=0)
         self.assertEqual(out, "긴급 🔴 확인")
+
+
+def _recx(mid, sender, subject, when, body="본문", to=None, cc=None,
+          attachments=None, sender_name=None):
+    """검색 테스트용 레코드 — cc·첨부·표시명을 직접 지정."""
+    return MailRecord(
+        message_id=f"<{mid}@t>",
+        subject=subject,
+        sender_name=sender_name if sender_name is not None else sender.split("@")[0],
+        sender_addr=sender,
+        to=to if to is not None else [ME],
+        cc=cc or [],
+        sent_on=when,
+        body_text=body,
+        attachments=attachments or [],
+    )
+
+
+class TestSearchParse(unittest.TestCase):
+    def test_operators_and_terms(self):
+        q = search_mod.parse_query('from:강미래 after:2026-06 has:attachment 캐시 "정확한 구"')
+        self.assertEqual(q.from_, ["강미래"])
+        self.assertEqual(q.after, "2026-06-01")
+        self.assertTrue(q.has_attach)
+        self.assertIn("캐시", q.terms)
+        self.assertIn("정확한 구", q.phrases)
+
+    def test_quoted_operator_value_keeps_space(self):
+        q = search_mod.parse_query('from:"강 미래" 리포트')
+        self.assertEqual(q.from_, ["강 미래"])
+        self.assertEqual(q.terms, ["리포트"])
+
+    def test_is_and_thread_and_file(self):
+        q = search_mod.parse_query("is:unread is:sent thread:12 file:xlsx")
+        self.assertEqual(q.is_flags, {"unread", "sent"})
+        self.assertEqual(q.thread, 12)
+        self.assertEqual(q.files, ["xlsx"])
+
+    def test_unknown_key_is_a_term(self):
+        q = search_mod.parse_query("http://x.co/1 검토")
+        self.assertIn("http://x.co/1", q.terms)
+        self.assertEqual(q.from_, [])
+
+    def test_date_boundaries(self):
+        self.assertEqual(search_mod.date_floor("2026"), "2026-01-01")
+        self.assertEqual(search_mod.date_floor("2026-06"), "2026-06-01")
+        self.assertEqual(search_mod.date_ceil("2026-06"), "2026-07-01")
+        self.assertEqual(search_mod.date_ceil("2026-12"), "2027-01-01")
+        self.assertEqual(search_mod.date_ceil("2026-06-15"), "2026-06-16")
+        self.assertIsNone(search_mod.date_floor("nope"))
+
+    def test_on_sets_both_bounds(self):
+        q = search_mod.parse_query("on:2026-06")
+        self.assertEqual(q.after, "2026-06-01")
+        self.assertEqual(q.before, "2026-07-01")
+
+    def test_short_vs_fts_terms(self):
+        q = search_mod.parse_query("모델 리포트 평가")
+        self.assertEqual(set(search_mod.terms_fts(q)), {"리포트"})
+        self.assertEqual(set(search_mod.terms_short(q)), {"모델", "평가"})
+
+    def test_build_match_tiers(self):
+        q = search_mod.parse_query("모델 평가 리포트")
+        self.assertEqual(search_mod.build_match(q, 1), '"모델 평가 리포트"')  # 연속 구
+        self.assertEqual(search_mod.build_match(q, 2), '"리포트"')            # ≥3자만 AND
+        # OR: ≥3자 하나뿐이면 None (OR 무의미)
+        self.assertIsNone(search_mod.build_match(q, 3))
+        q2 = search_mod.parse_query("리포트 침투테스트")
+        self.assertEqual(search_mod.build_match(q2, 3), '"리포트" OR "침투테스트"')
+
+
+class TestSearchEngine(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "t.sqlite", [ME])
+        self.store.ingest([
+            _recx("s1", "kang@corp.example", "모델 평가 리포트 공유",
+                  "2026-06-10T09:00:00", body="사내 모델 평가 파이프라인 정리",
+                  sender_name="강미래 선임", attachments=["report.xlsx"]),
+            _recx("s2", "kang@corp.example", "RE: 모델 평가 리포트 공유",
+                  "2026-07-02T09:00:00", body="침투테스트 결과 후속 조치 필요",
+                  sender_name="강미래 선임"),
+            _recx("s3", "lee@corp.example", "주간 리포트 W25",
+                  "2026-05-20T09:00:00", body="가동률 72% 입니다",
+                  sender_name="이서연", to=[ME], cc=["kang@corp.example"]),
+            _recx("s4", ME, "보낸 메일 예시", "2026-07-05T09:00:00",
+                  body="회신드립니다", to=["kang@corp.example"], sender_name="나"),
+        ])
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_phrase_tier_and_snippet(self):
+        rows = self.store.search("모델 평가")
+        self.assertTrue(rows)
+        self.assertEqual(rows[0]["tier"], 1)                 # 연속 구
+        self.assertIn("⟪", rows[0]["snippet"])               # 강조 마커
+
+    def test_two_char_korean_via_like(self):
+        # '평가'(2자)는 FTS 불가 → LIKE(tier3)로라도 잡혀야 한다
+        rows = self.store.search("평가")
+        self.assertTrue(rows)
+        self.assertTrue(all(r["tier"] == 3 for r in rows))
+
+    def test_from_name_space_normalized(self):
+        # 저장은 '강미래 선임' — 공백 무시로 'from:강미래선임' 도 맞아야
+        self.assertTrue(self.store.search("from:강미래선임"))
+        self.assertTrue(self.store.search("from:강미래"))
+
+    def test_from_filter_narrows(self):
+        only_kang = self.store.search("from:강미래 리포트")
+        self.assertTrue(only_kang)
+        self.assertTrue(all("kang@" in r["sender_addr"] for r in only_kang))
+
+    def test_date_filter(self):
+        after = self.store.search("리포트 after:2026-06")
+        self.assertTrue(after)
+        self.assertTrue(all(r["sent_on"] >= "2026-06-01" for r in after))
+        self.assertFalse(any(r["message_id"] == "<s3@t>" for r in after))  # 5월 제외
+
+    def test_is_sent_and_has_attachment(self):
+        self.assertTrue(all(r["is_sent"] for r in self.store.search("is:sent")))
+        att = self.store.search("has:attachment")
+        self.assertTrue(att)
+        self.assertTrue(all(r["attach_names"] for r in att))
+
+    def test_to_resolves_korean_name_via_people(self):
+        # cc:강미래 → people 에서 주소 해석 후 cc_addrs 매칭 (s3)
+        rows = self.store.search("cc:강미래")
+        self.assertTrue(any(r["message_id"] == "<s3@t>" for r in rows))
+
+    def test_empty_query_returns_nothing(self):
+        self.assertEqual(self.store.search(""), [])
+
+    def test_structured_only_no_text(self):
+        rows = self.store.search("is:sent")             # 텍스트 없이 필터만
+        self.assertTrue(rows)
+        self.assertTrue(all(r["tier"] == 0 for r in rows))
+
+    def test_frequent_people(self):
+        ppl = self.store.frequent_people()
+        names = [p["name"] for p in ppl]
+        self.assertIn("강미래 선임", names)
+
+
+class TestSearchWeb(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "t.sqlite", [ME])
+        from mailkb.config import Config
+        self.cfg = Config(home=Path(self.tmp.name), my_addresses=[ME])
+        self.store.ingest([
+            _recx("w1", "kang@corp.example", "모델 평가 공유", "2026-06-10T09:00:00",
+                  body="사내 모델 평가 리포트 정리", sender_name="강미래 선임"),
+            _recx("w2", "lee@corp.example", "주간 보고", "2026-06-11T09:00:00",
+                  body="가동률 리포트 보고", sender_name="이서연"),
+        ])
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_effective_merges_advanced_fields(self):
+        _, eff = web._search_effective(
+            {"q": ["리포트"], "f_from": ["강미래"], "f_period": ["thismonth"],
+             "f_dir": ["received"], "f_has": ["1"]}, "2026-07-13")
+        self.assertIn("리포트", eff)
+        self.assertIn("from:강미래", eff)
+        self.assertIn("after:2026-07", eff)
+        self.assertIn("is:received", eff)
+        self.assertIn("has:attachment", eff)
+
+    def test_period_tokens(self):
+        self.assertEqual(web._period_tokens("thismonth", "2026-07-13"), ["after:2026-07"])
+        self.assertEqual(web._period_tokens("lastmonth", "2026-07-13"),
+                         ["after:2026-06", "before:2026-07"])
+        self.assertEqual(web._period_tokens("thisyear", "2026-07-13"), ["after:2026"])
+
+    def test_render_has_box_hint_datalist(self):
+        html = web.render_search(self.store, self.cfg, {"q": [""]}, "2026-07-13")
+        self.assertIn("form class='search'", html)
+        self.assertIn("shint", html)                      # 힌트
+        self.assertIn("<datalist id='ppl'>", html)        # 사람 자동완성
+        self.assertIn("강미래 선임", html)                  # people 옵션
+
+    def test_render_snippet_and_facets(self):
+        html = web.render_search(self.store, self.cfg, {"q": ["리포트"]}, "2026-07-13")
+        self.assertIn("<mark>", html)                     # 스니펫 강조
+        self.assertIn("class='facet'", html)              # 좁히기 칩
+
+    def test_lowrel_divider_only_for_or_tier(self):
+        # 붙은 구/AND 는 '관련 낮음' 없음
+        html = web.render_search(self.store, self.cfg, {"q": ["모델 평가"]}, "2026-07-13")
+        self.assertNotIn("관련 낮음", html)
 
 
 if __name__ == "__main__":

@@ -316,6 +316,27 @@ form.search { margin: 10px 0; }
 form.search input[type=text] { padding: 7px 10px; width: 60%; font-size: 15px;
     border: 1px solid var(--border-strong); border-radius: 6px; }
 form.search button { padding: 7px 14px; font-size: 15px; }
+.shint { color: var(--ink-3); font-size: 12.5px; margin: 2px 0 8px; }
+.shint code { background: var(--surface); padding: 1px 5px; border-radius: 4px; }
+details.adv { margin: 4px 0 12px; }
+details.adv summary { cursor: pointer; color: var(--ink-2); font-size: 13px;
+    width: max-content; }
+details.adv .advbody { display: flex; flex-wrap: wrap; gap: 10px 14px;
+    align-items: center; padding: 10px 2px 2px; font-size: 13px; }
+details.adv label { color: var(--ink-2); }
+details.adv input[type=text], details.adv select { padding: 4px 7px; font-size: 13px;
+    border: 1px solid var(--border-strong); border-radius: 5px; }
+.facets { margin: 8px 0 4px; display: flex; flex-wrap: wrap; gap: 6px; }
+.facet { font-size: 12.5px; padding: 3px 9px; border: 1px solid var(--border);
+    border-radius: 999px; color: var(--ink-2); background: var(--surface);
+    text-decoration: none; }
+.facet:hover { border-color: var(--border-strong); }
+.facet b { color: var(--ink-3); font-weight: 600; margin-left: 3px; }
+.snip { color: var(--ink-2); font-size: 13px; margin: 1px 0 0 2px; line-height: 1.5; }
+.snip mark { background: rgba(232, 151, 90, .28); color: inherit;
+    padding: 0 1px; border-radius: 2px; }
+.lowrel { color: var(--ink-3); font-size: 12px; margin: 14px 0 4px;
+    border-top: 1px dashed var(--border); padding-top: 8px; }
 .empty { color: var(--ink-3); padding: 20px 0; }
 .digest { padding: 4px 10px; margin: 3px 0; border-left: 2px solid var(--border);
     background: var(--surface); font-size: 14px; }
@@ -2271,21 +2292,127 @@ def render_person(store, cfg, addr: str) -> str:
     return "\n".join(out)
 
 
-def render_search(store, q: str) -> str:
-    form = ("<form class='search' method='get' action='/search'>"
-            f"<input type='text' name='q' value='{esc(q)}' autofocus "
-            "placeholder='검색어'> <button>검색</button></form>")
-    out = [f"<h1>검색</h1>", form]
-    if q:
-        rows = store.search(q, limit=50)
+_SEARCH_HINT = ("<p class='shint'><code>from:</code> <code>to:</code> "
+                "<code>after:2026-06</code> <code>before:</code> "
+                "<code>has:attachment</code> <code>is:unread</code> "
+                "<code>is:sent</code> · <code>\"정확한 구\"</code></p>")
+
+
+def _period_tokens(period: str, today: str) -> list:
+    """상세 폼의 기간 선택 → DSL 날짜 토큰. today = 'YYYY-MM-DD'."""
+    try:
+        d = date.fromisoformat(today)
+    except (ValueError, TypeError):
+        return []
+    ym = today[:7]
+    if period == "thismonth":
+        return [f"after:{ym}"]
+    if period == "lastmonth":
+        prev = (d.replace(day=1) - timedelta(days=1)).isoformat()[:7]
+        return [f"after:{prev}", f"before:{ym}"]
+    if period == "3months":
+        m = d.replace(day=1)
+        for _ in range(3):
+            m = (m - timedelta(days=1)).replace(day=1)
+        return [f"after:{m.isoformat()[:7]}"]
+    if period == "thisyear":
+        return [f"after:{today[:4]}"]
+    return []
+
+
+def _search_effective(qs, today: str) -> tuple:
+    """(raw_q, effective_q) — 검색창 q 에 상세 폼(f_*) 을 DSL 토큰으로 병합.
+
+    상세 폼은 별도 쿼리 경로가 아니라 '검색식을 만들어 검색창에 써넣는' 빌더다
+    (단일 진실원). 병합된 effective 를 다시 검색창 value 로 보여 편집 가능하게 한다.
+    """
+    raw = (qs.get("q") or [""])[0].strip()
+    extra = []
+    ff = (qs.get("f_from") or [""])[0].strip()
+    if ff:
+        extra.append(f'from:"{ff}"' if " " in ff else f"from:{ff}")
+    extra += _period_tokens((qs.get("f_period") or [""])[0], today)
+    if (qs.get("f_has") or [""])[0] == "1":
+        extra.append("has:attachment")
+    if (qs.get("f_unread") or [""])[0] == "1":
+        extra.append("is:unread")
+    d = (qs.get("f_dir") or [""])[0]
+    if d == "sent":
+        extra.append("is:sent")
+    elif d == "received":
+        extra.append("is:received")
+    effective = (raw + " " + " ".join(extra)).strip() if extra else raw
+    return raw, effective
+
+
+def _snip_html(snippet: str) -> str:
+    """snippet() 의 ⟪⟫ 표시를 <mark> 로. HTML 은 먼저 escape."""
+    return esc(snippet).replace("⟪", "<mark>").replace("⟫", "</mark>")
+
+
+def _search_facets(rows, effective: str) -> str:
+    """결과에서 상위 발신자를 뽑아 좁히기 칩으로. 클릭 시 effective 에 from: 추가."""
+    counts: dict = {}
+    for r in rows:
+        nm = r["sender_name"] or r["sender_addr"]
+        if nm:
+            counts[nm] = counts.get(nm, 0) + 1
+    top = sorted(counts.items(), key=lambda kv: -kv[1])[:5]
+    if len(top) < 2:
+        return ""
+    chips = []
+    for nm, c in top:
+        tok = f'from:"{nm}"' if " " in nm else f"from:{nm}"
+        href = "/search?q=" + urllib.parse.quote(f"{effective} {tok}".strip())
+        chips.append(f"<a class='facet' href='{esc(href)}'>{esc(nm)}<b>{c}</b></a>")
+    return "<div class='facets'>" + "".join(chips) + "</div>"
+
+
+def render_search(store, cfg, qs, today: str) -> str:
+    raw, effective = _search_effective(qs, today)
+    box = ("<form class='search' method='get' action='/search'>"
+           f"<input type='text' name='q' value='{esc(effective)}' autofocus "
+           "placeholder='검색 — 예: from:강미래 after:2026-06 리포트'> "
+           "<button>검색</button></form>")
+    # 상세: 검색식을 만들어 검색창(q)에 병합. datalist 로 사람 이름 자동완성.
+    ppl = store.frequent_people(200)
+    opts = "".join(f"<option value='{esc(p['name'])}'>{esc(p['addr'])}</option>"
+                   for p in ppl)
+    adv = (
+        "<details class='adv'><summary>상세</summary>"
+        "<form class='advbody' method='get' action='/search'>"
+        f"<input type='hidden' name='q' value='{esc(raw)}'>"
+        "<label>사람 <input type='text' name='f_from' list='ppl' "
+        "placeholder='이름/주소'></label>"
+        "<label>기간 <select name='f_period'>"
+        "<option value=''>전체</option><option value='thismonth'>이번달</option>"
+        "<option value='lastmonth'>지난달</option><option value='3months'>최근3개월</option>"
+        "<option value='thisyear'>올해</option></select></label>"
+        "<label>방향 <select name='f_dir'>"
+        "<option value=''>전체</option><option value='received'>받은</option>"
+        "<option value='sent'>보낸</option></select></label>"
+        "<label><input type='checkbox' name='f_has' value='1'> 첨부</label>"
+        "<label><input type='checkbox' name='f_unread' value='1'> 안읽음</label>"
+        "<button>적용</button></form>"
+        f"<datalist id='ppl'>{opts}</datalist></details>")
+    out = ["<h1>검색</h1>", box, _SEARCH_HINT, adv]
+    if effective:
+        rows = store.search(effective, limit=50)
         out.append(f"<p class='dim'>{len(rows)}건</p>")
+        out.append(_search_facets(rows, effective))
+        low = False
         for r in rows:
+            if r["tier"] == 4 and not low:            # tier4 = FTS-OR(하나라도)만 느슨
+                out.append("<p class='lowrel'>— 관련 낮음 —</p>")
+                low = True
             arrow = "→" if r["is_sent"] else ""
+            snip = (f"<div class='snip'>{_snip_html(r['snippet'])}</div>"
+                    if r["snippet"] else "")
             out.append(
                 f"<div class='item'><a href='/thread/{r['thread_id']}'>"
                 f"{esc(r['subject'])}</a> <span class='who'>· {arrow} "
                 f"{esc(r['sender_name'])}</span> "
-                f"<span class='day'>{esc(r['sent_on'][:16])}</span></div>")
+                f"<span class='day'>{esc(r['sent_on'][:16])}</span>{snip}</div>")
         if not rows:
             out.append("<p class='empty'>결과 없음</p>")
     return "\n".join(out)
@@ -2585,7 +2712,7 @@ def route(store, cfg, path, qs, today):
         # 스레드에서 이름 클릭 → 주소별 메일(왼쪽 목록 프레임). 발신자 차단도 여기.
         return "주소별 메일", render_person(store, cfg, (qs.get("addr") or [""])[0]), 200, "left"
     if path == "/search":
-        return "검색", render_search(store, (qs.get("q") or [""])[0].strip()), 200, "left"
+        return "검색", render_search(store, cfg, qs, today), 200, "left"
     if path == "/settings":
         return "설정", render_settings(store, cfg), 200, "left"
     if path in ("/records", "/daily"):

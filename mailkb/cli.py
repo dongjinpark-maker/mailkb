@@ -214,11 +214,26 @@ def cmd_search(args) -> None:
     cfg = config_mod.load(args.home)
     store = _store(cfg)
     rows = store.search(args.query, args.limit)
+    if getattr(args, "json", False):
+        import json
+        # skill·도구 소비용 구조화 출력 — snippet 의 ⟪⟫ 강조 마커는 그대로 둔다.
+        out = [{
+            "id": m["id"], "thread_id": m["thread_id"], "subject": m["subject"],
+            "sender": m["sender_name"] or m["sender_addr"],
+            "sender_addr": m["sender_addr"], "date": m["sent_on"][:16],
+            "is_sent": bool(m["is_sent"]), "has_attach": bool(m["attach_names"]),
+            "tier": m["tier"], "snippet": m["snippet"],
+        } for m in rows]
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return
     if not rows:
         print("결과 없음")
         return
     for m in rows:
         print(_fmt_row(m))
+        snip = (m["snippet"] or "").replace("\n", " ").strip()
+        if snip:
+            print(f"        {snip[:88]}")
 
 
 def cmd_show(args) -> None:
@@ -553,9 +568,10 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("--limit", type=int, default=30)
     sp.set_defaults(fn=cmd_ls)
 
-    sp = sub.add_parser("search", help="전문검색")
-    sp.add_argument("query")
-    sp.add_argument("--limit", type=int, default=20)
+    sp = sub.add_parser("search", help="검색 (연산자 from: after: is: 등 지원)")
+    sp.add_argument("query", help='예: from:강미래 after:2026-06 리포트  ·  "정확한 구"')
+    sp.add_argument("--limit", type=int, default=30)
+    sp.add_argument("--json", action="store_true", help="구조화 JSON 출력(도구·skill용)")
     sp.set_defaults(fn=cmd_search)
 
     sp = sub.add_parser("show", help="메일 본문 (인용 제거본)")

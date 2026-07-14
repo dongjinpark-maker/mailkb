@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from . import search as search_mod
 from .clean import (extract_new_content, inject_inline_images,
                     normalize_subject, sanitize_html)
 from .sources.base import MailRecord
@@ -359,22 +360,146 @@ class Store:
 
     # ------------------------------------------------------------ queries
 
-    def search(self, query: str, limit: int = 20) -> list[sqlite3.Row]:
-        # trigram 은 3글자 미만 질의 불가 — LIKE 로 폴백
-        if self.fts_tokenizer == "trigram" and len(query) < 3:
-            like = f"%{query}%"
-            return self.db.execute(
-                """SELECT m.* FROM messages m
-                   WHERE m.new_content LIKE ? OR m.subject LIKE ?
-                   ORDER BY m.sent_on DESC LIMIT ?""",
-                (like, like, limit),
-            ).fetchall()
+    def search(self, query: str, limit: int = 50) -> list[sqlite3.Row]:
+        """DSL 질의 → 구조화 필터 + 단계적 FTS(phrase→AND→OR)→LIKE 폴백.
+
+        각 행에 파생컬럼 snippet(⟪⟫ 강조)·tier 를 얹어 돌려준다. 완화 순서 =
+        정밀→느슨: tier1 연속구 · tier2 FTS-AND · tier3 LIKE-AND(부분일치, 2자어
+        포함 모두 포함) · tier4 FTS-OR(하나라도 — 유일한 '관련 낮음'). tier 를 1차
+        정렬키, 같은 tier 안에서는 bm25(제목:본문=3:1)·최신순. id 로 중복 제거.
+        """
+        q = search_mod.parse_query(query)
+        where, params = self._build_filters(q)
+
+        if not q.has_text():
+            if not q.has_filters():
+                return []                                   # 빈 질의
+            sql = ("SELECT m.*, '' AS snippet, 0 AS tier FROM messages m "
+                   "LEFT JOIN threads t ON t.id = m.thread_id WHERE 1=1"
+                   + where + " ORDER BY m.sent_on DESC LIMIT ?")
+            return self.db.execute(sql, params + [limit]).fetchall()
+
+        short_w, short_p = self._like_terms_sql(search_mod.terms_short(q))
+        seen: set = set()
+        out: list = []
+
+        def collect(rows):
+            for r in rows:
+                if r["id"] in seen:
+                    continue
+                seen.add(r["id"])
+                out.append(r)
+
+        for tier in (1, 2):                                 # 연속구, FTS-AND
+            match = search_mod.build_match(q, tier)
+            if not match:
+                continue
+            collect(self._fts_tier(match, tier, where, params,
+                                   short_w, short_p, limit))
+            if len(out) >= limit:
+                return out[:limit]
+
+        if len(out) < limit:                                # tier3: LIKE-AND(부분일치)
+            like_w, like_p = self._like_terms_sql(list(q.terms) + list(q.phrases))
+            if like_w:
+                sql = ("SELECT m.*, '' AS snippet, 3 AS tier FROM messages m "
+                       "LEFT JOIN threads t ON t.id = m.thread_id WHERE 1=1"
+                       + like_w + where + " ORDER BY m.sent_on DESC LIMIT ?")
+                collect(self.db.execute(sql, like_p + params + [limit]).fetchall())
+
+        if len(out) < limit:                                # tier4: FTS-OR(관련 낮음)
+            match = search_mod.build_match(q, 3)            # build_match tier3 = OR
+            if match:
+                collect(self._fts_tier(match, 4, where, params, "", [], limit))
+        return out[:limit]
+
+    def _fts_tier(self, match, tier, where, params, short_w, short_p, limit):
+        sql = (f"SELECT m.*, snippet(messages_fts, 1, '⟪', '⟫', '…', 12) AS snippet, "
+               f"{int(tier)} AS tier, bm25(messages_fts, 3.0, 1.0) AS _score "
+               "FROM messages_fts f JOIN messages m ON m.id = f.rowid "
+               "LEFT JOIN threads t ON t.id = m.thread_id "
+               "WHERE messages_fts MATCH ?" + short_w + where +
+               " ORDER BY _score, m.sent_on DESC LIMIT ?")
+        return self.db.execute(sql, [match] + short_p + params + [limit]).fetchall()
+
+    @staticmethod
+    def _like_terms_sql(needles):
+        """각 키워드를 (제목 OR 본문) LIKE 로 AND. (sql조각, params) 반환."""
+        parts, params = [], []
+        for t in needles:
+            parts.append(" AND (m.subject LIKE ? OR m.new_content LIKE ?)")
+            params += [f"%{t}%", f"%{t}%"]
+        return "".join(parts), params
+
+    def _resolve_addr(self, name: str) -> str | None:
+        """사람 이름 → 대표 주소 (왕래 많은 순). to:/cc: 한글 이름 해석용.
+
+        to_addrs·cc_addrs 에는 표시명이 없고 주소만 있어, 한글 이름은 people 로
+        먼저 주소를 찾아야 매칭된다. 공백은 무시하고 비교.
+        """
+        ns = name.replace(" ", "")
+        if not ns:
+            return None
+        row = self.db.execute(
+            "SELECT addr FROM people WHERE REPLACE(name, ' ', '') LIKE ? "
+            "ORDER BY (from_count + to_count) DESC LIMIT 1", (f"%{ns}%",),
+        ).fetchone()
+        return row["addr"] if row else None
+
+    def _build_filters(self, q):
+        """Query 의 구조화 조건 → (' AND …' SQL, params). 주소 LIKE 는 ASCII 라
+        대소문자 무시(SQLite 기본). 사람 이름은 공백 무시 매칭."""
+        conds: list = []
+        params: list = []
+        if q.from_:
+            ors = []
+            for v in q.from_:
+                if "@" in v:
+                    ors.append("m.sender_addr LIKE ?")
+                    params.append(f"%{v}%")
+                else:
+                    ors.append("(REPLACE(m.sender_name, ' ', '') LIKE ? "
+                               "OR m.sender_addr LIKE ?)")
+                    params += [f"%{v.replace(' ', '')}%", f"%{v}%"]
+            conds.append("(" + " OR ".join(ors) + ")")
+        for vals, col in ((q.to, "m.to_addrs"), (q.cc, "m.cc_addrs")):
+            if not vals:
+                continue
+            ors = []
+            for v in vals:
+                addr = v if "@" in v else self._resolve_addr(v)
+                ors.append(f"{col} LIKE ?")
+                params.append(f"%{addr or v}%")
+            conds.append("(" + " OR ".join(ors) + ")")
+        if q.after:
+            conds.append("m.sent_on >= ?"); params.append(q.after)
+        if q.before:
+            conds.append("m.sent_on < ?"); params.append(q.before)
+        if q.thread is not None:
+            conds.append("m.thread_id = ?"); params.append(q.thread)
+        fl = q.is_flags
+        if "unread" in fl:
+            conds.append("m.read_at = ''")
+        if "read" in fl:
+            conds.append("m.read_at != ''")
+        if "sent" in fl:
+            conds.append("m.is_sent = 1")
+        if "received" in fl:
+            conds.append("m.is_sent = 0")
+        if "flagged" in fl:
+            conds.append("COALESCE(t.flagged, 0) = 1")
+        if q.has_attach:
+            conds.append("m.attach_names != ''")
+        for f in q.files:
+            conds.append("m.attach_names LIKE ?"); params.append(f"%{f}%")
+        return "".join(" AND " + c for c in conds), params
+
+    def frequent_people(self, limit: int = 200) -> list[sqlite3.Row]:
+        """왕래 많은 순 사람 목록 — 검색 상세의 이름 자동완성(datalist)용."""
         return self.db.execute(
-            """SELECT m.* FROM messages_fts f
-               JOIN messages m ON m.id = f.rowid
-               WHERE messages_fts MATCH ?
-               ORDER BY rank LIMIT ?""",
-            (f'"{query}"', limit),
+            "SELECT name, addr FROM people WHERE name != '' "
+            "ORDER BY (from_count + to_count) DESC, last_seen DESC LIMIT ?",
+            (limit,),
         ).fetchall()
 
     def unanswered(self, days: int = 14, max_recipients: int = 50) -> list[sqlite3.Row]:
