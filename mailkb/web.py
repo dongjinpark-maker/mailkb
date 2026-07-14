@@ -102,7 +102,7 @@ _CSS = """
 :root[data-theme='dark'] {
   color-scheme: dark;
   --bg:#16181b; --surface:#212529; --surface-2:#1b1f22; --surface-3:#282d31; --fold:#1e2225;
-  --ink:#e6e8ea; --ink-2:#b0b5ba; --ink-3:#868c92; --muted:#6b7178;
+  --ink:#f3f5f7; --ink-2:#ccd1d6; --ink-3:#a4aab1; --muted:#6b7178;
   --border:#333a40; --border-2:#3a4147; --border-strong:#4b535a;
   /* 강조 = 따뜻한 코랄 — 다크에서 파랑보다 눈이 편함(라이트는 파랑 유지) */
   --accent:#e8975a; --accent-strong:#f4b183; --sel-bg:#2e2317; --hover-bg:#35291b; --splitter:#5e472c;
@@ -1004,7 +1004,12 @@ _APP_JS = r"""
           if (p === "/") {                     /* 홈이면 '지금 할 일'만 조용히 갱신 */
             load(location.pathname + location.search, "left", false)
               .catch(function () {});
-          }                                    /* 메일함은 스크롤 유지 — 토스트만 */
+          } else if ((p === "/mail" || p === "/threads") && left && left.scrollTop < 150) {
+            /* 메일함·스레드: 목록 상단 근처면 갱신(새 메일=최상단), 깊이 스크롤 중이면 방해 안 함 */
+            var sc = left.scrollTop;
+            load(location.pathname + location.search, "left", false)
+              .then(function () { left.scrollTop = sc; }).catch(function () {});
+          }                                    /* 그 외·깊은 스크롤: 토스트만 */
         }).catch(function () {});
     }, min * 60000);
   }).catch(function () {});
