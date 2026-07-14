@@ -14,7 +14,6 @@ import signal
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -121,27 +120,31 @@ def main() -> None:
     if not ready:
         return                                   # 서버 안 뜸 — 창 안 열고 종료
 
-    profile = tempfile.mkdtemp(prefix="minerva-edge-")
-    win = _open_window(profile)
+    # 고정 Edge 프로필 재사용 — 매 실행 새 프로필을 만들면(콜드 스타트) 창이 늦게 뜬다.
+    # 첫 실행만 프로필 생성 비용을 치르고, 이후엔 빠르게 뜬다.
+    profile = _home() / "edge-profile"
+    profile.mkdir(parents=True, exist_ok=True)
+    win = _open_window(str(profile))
     if win is None:
         return                                   # Edge 없음 — 창 추적 불가, 서버는 남김
+    t0 = time.time()
+    win.wait()                                   # ← 핵심: 창이 닫힐 때까지 대기
+    if time.time() - t0 < 3.0:
+        # 너무 빨리 반환 = 이미 열려 있던 Minerva 창으로 핸드오프됨(다른 창이 살아있음).
+        # 그 창을 방해하지 않도록 서버를 죽이지 않고 종료.
+        return
+    server.terminate()                           # 창 닫힘 → 서버 종료
     try:
-        win.wait()                               # ← 핵심: 창이 닫힐 때까지 대기
-    finally:
-        server.terminate()                       # 창 닫힘 → 서버 종료
-        try:
-            server.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            server.kill()
-        # 서버가 신호로 죽으면 자기 finally 가 안 돌 수 있어 PID 파일을 여기서 정리
-        pidfile = _home() / "minerva.pid"
-        try:
-            if pidfile.read_text(encoding="utf-8").strip() == str(server.pid):
-                pidfile.unlink()
-        except OSError:
-            pass
-        import shutil
-        shutil.rmtree(profile, ignore_errors=True)
+        server.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        server.kill()
+    # 서버가 신호로 죽으면 자기 finally 가 안 돌 수 있어 PID 파일을 여기서 정리
+    pidfile = _home() / "minerva.pid"
+    try:
+        if pidfile.read_text(encoding="utf-8").strip() == str(server.pid):
+            pidfile.unlink()
+    except OSError:
+        pass
 
 
 if __name__ == "__main__":
