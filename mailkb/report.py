@@ -820,7 +820,6 @@ td a:hover{text-decoration:underline}
   visibility:hidden;z-index:9;max-width:320px;line-height:1.45;
   box-shadow:0 4px 14px rgba(0,0,0,.18)}
 #tip b{font-size:13.5px;font-variant-numeric:tabular-nums}
-footer{color:var(--muted);font-size:12px;margin-top:26px;text-align:center}
 @media (prefers-reduced-motion: no-preference){
   .bar-hit{transition:fill .12s}
 }
@@ -969,7 +968,7 @@ def _stats_inner(weeks: int, inner: str, meta: str = "") -> str:
 </header>
 {_period_bar(weeks)}
 {inner}
-<footer>Minerva · 통계 분석 — 조회 전용, DB 무변경</footer>"""
+"""
 
 
 def render_stats(store, cfg, weeks: int) -> str:

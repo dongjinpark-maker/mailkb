@@ -3176,7 +3176,7 @@ class TestWeb(unittest.TestCase):
                         "🚩 플래그", "🙈 숨김"):
                 self.assertIn(lbl, out)
             self.assertNotIn("추적제외", out)
-            self.assertLess(out.index("ltabs"), out.index("j/k 이동"))   # 탭 뒤에 j/k
+            self.assertNotIn("j/k 이동", out)   # 동작은 유지, 안내 문구는 숨김
         # 메일함 설명문 삭제 · 스레드 미답변 제거
         self.assertNotIn("노이즈 제외 수신 메일", self.web.render_mail(self.store, self.cfg))
         self.assertNotIn("미답변", self.web.render_threads(self.store, self.cfg))

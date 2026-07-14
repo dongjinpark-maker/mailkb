@@ -145,6 +145,10 @@ table.settbl th { color: var(--ink-2); font-weight: 600; }
 table.settbl input, table.settbl select { font-size: 13px; padding: 2px 4px; }
 .setadd { display: flex; gap: 6px; margin-top: 4px; }
 .setadd input[type=text] { flex: 1; font-size: 13px; padding: 4px 6px; }
+.setrow .setlabel { display: flex; flex-direction: column; gap: 1px; color: var(--ink-2); }
+.setrow .setsub { color: var(--muted); font-size: 12px; font-weight: 400; }
+.setrow .setval { color: var(--ink-2); font-size: 13px; text-align: right; }
+.setrow .setval a { color: var(--accent); }
 .settings h3 { font-size: 14px; margin: 14px 0 4px; color: var(--ink-2); }
 /* 화면 테마 — Android 스타일 세그먼트 토글 (해/달 아이콘) */
 .themepick { display: inline-flex; gap: 4px; margin: 8px 0 20px; padding: 4px;
@@ -171,11 +175,10 @@ table.settbl input, table.settbl select { font-size: 13px; padding: 2px 4px; }
 .selected { outline: 2px solid var(--sel-ring); background: var(--sel-bg); }
 .kbd { outline: 2px solid var(--accent); outline-offset: -1px; }
 .kbdhint { color: var(--muted); font-size: 12px; }
-/* 메일함·스레드 공통 필터 바: 탭(좌) + j/k(우) */
+/* 메일함·스레드 공통 필터 바: 탭(좌) */
 .listtabs { display: flex; justify-content: space-between; align-items: baseline;
     gap: 10px; margin: 2px 0 8px; font-size: 13px; flex-wrap: wrap; }
 .listtabs .ltabs a { color: var(--accent); } .listtabs .ltabs b { color: var(--ink); }
-.listtabs .kbdhint { flex: none; }
 .backlink { font-size: 13px; }
 /* 플래그 버튼: 다른 버튼과 같은 박스(패딩·높이), 글리프만 조금 크게 */
 button.iconbtn { font-size: 15px; padding: 6px 12px; }
@@ -1702,9 +1705,10 @@ def _list_filter_bar(base: str, active: str, counts: dict) -> str:
         else:
             href = base + (f"?{key}=1" if key else "")
             parts.append(f"<a href='{href}'>{esc(lbl)}</a>")
+    # j/k 키보드 이동은 유지하되 안내 문구는 감춤(app.js 가 동작 담당).
     return ("<div class='listtabs'><span class='ltabs'>"
             + " · ".join(parts)
-            + "</span><span class='kbdhint'>j/k 이동</span></div>")
+            + "</span></div>")
 
 
 def _noise_thread_ids(store, cfg) -> set:
@@ -2087,15 +2091,15 @@ def render_settings(store, cfg) -> str:
         return (f"<td><select name='{name}'>{opts}</select></td>")
     num_rows = (
         _num("broadcast_to", cfg.broadcast_to,
-             ("대량발송 제외선", 1, "수신인 이 수 이상이면 그룹공지로 보고 개입 큐 제외 (broadcast_to)"))
+             ("대량발송 제외선", 1, "수신인 이 수 이상이면 그룹공지로 보고 개입 큐 제외"))
         + _num("direct_to", cfg.direct_to,
-               ("직접수신 상한", 0, "수신인 이 수 이하면 '직접 온 메일'로 유지 (direct_to)"))
+               ("직접수신 상한", 0, "수신인 이 수 이하면 '직접 온 메일'로 유지"))
         + _num("stall_workdays", cfg.stall_workdays,
-               ("응답 정체(영업일)", 1, "내가 보낸 메일 무응답이 이 영업일 넘으면 정체 (stall_workdays)"))
+               ("응답 정체(영업일)", 1, "내가 보낸 메일 무응답이 이 영업일 넘으면 정체"))
         + _num("stale_workdays", cfg.stale_workdays,
-               ("스레드 정체(영업일)", 1, "열린 스레드 무활동이 이 영업일 넘으면 정체 (stale_workdays)"))
+               ("스레드 정체(영업일)", 1, "열린 스레드 무활동이 이 영업일 넘으면 정체"))
         + _num("summary_max_days", smd,
-               ("요약 창(일)", 1, "매 실행 최근 이 일수까지 소급 요약 (summary_max_days)")))
+               ("요약 창(일)", 1, "매 실행 최근 이 일수까지 소급 요약")))
     out.append("<h2>판정 기준</h2>")
     out.append("<form method='post' action='/settings/save'>"
                "<table class='settbl'>" + num_rows
@@ -2157,14 +2161,21 @@ def render_settings(store, cfg) -> str:
     # ── 정보 (About) ──
     out.append("<h2>정보</h2>")
     out.append(
-        f"<p class='dim'>Minerva (mailkb) v{esc(__version__)} · "
+        "<div class='setlist'>"
+        "<div class='setrow'>"
+        "<span class='setlabel'>버전</span>"
+        f"<span class='setval'>Minerva v{esc(__version__)}</span></div>"
+        "<div class='setrow'>"
+        "<span class='setlabel'>라이선스</span>"
+        "<span class='setval'>MIT © 2026 Dongjin Park · "
         "<a href='https://github.com/dongjinpark-maker/mailkb' "
-        "target='_blank' rel='noopener noreferrer'>GitHub</a> · "
-        "MIT © 2026 Dongjin Park</p>")
-    out.append(
-        "<form method='post' action='/settings/update' class='setadd'>"
-        "<button type='submit'>최신으로 업데이트 (git pull)</button>"
-        "<span class='dim'> — 받은 뒤 창을 닫았다 다시 열면 적용됩니다</span></form>")
+        "target='_blank' rel='noopener noreferrer'>GitHub</a></span></div>"
+        "<div class='setrow'>"
+        "<span class='setlabel'>최신 코드로 업데이트"
+        "<span class='setsub'>받은 뒤 창을 닫았다 다시 열면 적용됩니다</span></span>"
+        "<form method='post' action='/settings/update'>"
+        "<button type='submit'>업데이트</button></form></div>"
+        "</div>")
     out.append("</div>")
     return "\n".join(out)
 
@@ -2269,7 +2280,7 @@ def render_person(store, cfg, addr: str) -> str:
            f"<span class='pright'>{block_ctl}</span></div>",
            f"<p class='dim'>전체 {len(rows)} (양방향) · "
            f"<span class='mono'>{esc(addr)}</span> · "
-           "<span class='kbdhint'>→ 표시·배경색 = 내가 보낸 메일 · j/k 이동</span></p>"]
+           "<span class='kbdhint'>→ 표시·배경색 = 내가 보낸 메일</span></p>"]
     if not rows:
         out.append("<p class='empty'>주고받은 메일 없음</p>")
         return "\n".join(out)
@@ -2294,7 +2305,7 @@ def render_person(store, cfg, addr: str) -> str:
 
 _SEARCH_HINT = ("<p class='shint'><code>from:</code> <code>to:</code> "
                 "<code>after:2026-06</code> <code>before:</code> "
-                "<code>has:attachment</code> <code>is:unread</code> "
+                "<code>has:attachment</code> "
                 "<code>is:sent</code> · <code>\"정확한 구\"</code></p>")
 
 
@@ -2334,8 +2345,6 @@ def _search_effective(qs, today: str) -> tuple:
     extra += _period_tokens((qs.get("f_period") or [""])[0], today)
     if (qs.get("f_has") or [""])[0] == "1":
         extra.append("has:attachment")
-    if (qs.get("f_unread") or [""])[0] == "1":
-        extra.append("is:unread")
     d = (qs.get("f_dir") or [""])[0]
     if d == "sent":
         extra.append("is:sent")
@@ -2392,7 +2401,6 @@ def render_search(store, cfg, qs, today: str) -> str:
         "<option value=''>전체</option><option value='received'>받은</option>"
         "<option value='sent'>보낸</option></select></label>"
         "<label><input type='checkbox' name='f_has' value='1'> 첨부</label>"
-        "<label><input type='checkbox' name='f_unread' value='1'> 안읽음</label>"
         "<button>적용</button></form>"
         f"<datalist id='ppl'>{opts}</datalist></details>")
     out = ["<h1>검색</h1>", box, _SEARCH_HINT, adv]
@@ -2443,8 +2451,7 @@ def render_daily(cfg, day: str, today: str | None = None) -> str:
     out = [f"<h1>데일리 리뷰 · {esc(day)}</h1>", nav,
            "<div class='actions'>" + _review_button_forms() + "</div>"]
     if md is None:
-        out.append("<p class='empty'>해당 날짜 리뷰 없음 — "
-                   "<code>review [--ai] --date " + esc(day) + "</code></p>")
+        out.append("<p class='empty'>해당 날짜에 저장된 리뷰가 없습니다.</p>")
     else:
         out.append(_md_to_html(md))
     return "\n".join(out)
@@ -2853,12 +2860,15 @@ class _Handler(BaseHTTPRequestHandler):
                 rw = self.cfg.opt("web", "reading_width", default=1200)
                 theme = self.cfg.opt("web", "theme", default="light")
                 body = _shell(title, left, right, refresh, read_w=rw, theme=theme)
-        except Exception as e:  # 죽지 않게
-            inner = f"<pre>{esc(repr(e))}</pre>"
+        except Exception:  # 죽지 않게 — 상세는 콘솔(개발용), 화면엔 친절한 안내
+            import traceback
+            traceback.print_exc()
             code = 500
             th = self.cfg.opt("web", "theme", default="light")
-            body = inner if frag else _shell(
-                "오류", "<p class='empty'>오류</p>", inner, theme=th)
+            msg = ("<p class='empty'>문제가 발생해 이 화면을 열지 못했습니다.<br>"
+                   "잠시 후 다시 시도하거나 창을 닫았다 다시 열어 주세요.</p>")
+            body = msg if frag else _shell(
+                "오류", msg, "<p class='empty'>오류</p>", theme=th)
         finally:
             store.close()
         self._send_html(body, code)
