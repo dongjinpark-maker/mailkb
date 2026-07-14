@@ -133,6 +133,13 @@ def main() -> None:
             server.wait(timeout=5)
         except subprocess.TimeoutExpired:
             server.kill()
+        # 서버가 신호로 죽으면 자기 finally 가 안 돌 수 있어 PID 파일을 여기서 정리
+        pidfile = _home() / "minerva.pid"
+        try:
+            if pidfile.read_text(encoding="utf-8").strip() == str(server.pid):
+                pidfile.unlink()
+        except OSError:
+            pass
         import shutil
         shutil.rmtree(profile, ignore_errors=True)
 
