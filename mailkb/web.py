@@ -2820,9 +2820,10 @@ def _open_ui(url: str, app_mode: bool, window_size: str = "2000,1200") -> None:
         pass
 
 
-def serve(cfg, host: str = "127.0.0.1", port: int = 8765,
+def serve(cfg, port: int = 8765,
           open_browser: bool = False, app_mode: bool = False) -> None:
     _Handler.cfg = cfg
+    host = "127.0.0.1"          # 루프백 고정 — 원격 바인딩 미지원(로컬 1인 도구 전제)
     # 단일 스레드 HTTPServer: Outlook COM 은 스레드마다 초기화가 필요한데, 요청을
     # 이 서빙 스레드에서 처리하므로 여기서 CoInitialize 한 번이면 open/sync 가 동작한다
     # (ThreadingHTTPServer 면 요청 스레드마다 CoInitialize 필요 → 복잡·에러). sqlite

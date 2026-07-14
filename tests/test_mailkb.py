@@ -2753,6 +2753,13 @@ class TestWeb(unittest.TestCase):
         self.assertNotIn("ThreadingHTTPServer((", src)          # 호출로는 사용 금지
         self.assertIn("CoInitialize", src)
 
+    def test_serve_binds_loopback_only(self):
+        # 보안 #1: serve 는 루프백에만 바인딩 — 바인딩 주소를 바꿀 입력이 없어야 한다
+        import inspect
+        sig = inspect.signature(self.web.serve)
+        self.assertNotIn("host", sig.parameters)               # 바인딩 주소 인자 없음
+        self.assertIn('host = "127.0.0.1"', inspect.getsource(self.web.serve))
+
     def test_timeline_newest_first(self):
         # 스레드 상세는 최신 메일이 먼저 (메일 클라이언트 관례)
         self.store.ingest([

@@ -182,7 +182,7 @@ schtasks /Delete /TN mailkb-sync /F  # 해제
 | `hide <스레드ID> [--undo]` | 스레드 숨김/해제 (목록·추적 제외, 새 메일 오면 자동 해제) | ✗ |
 | `open <번호>` | Outlook에서 원문 열기 (회사 PC) | ✗ |
 | `attach <스레드ID>` | 스레드 첨부를 vault로 추출 — 큐레이션 시 Cold 보존 | ✗ |
-| `serve [--host --port --open --app]` | Minerva 웹 UI (localhost, 위 참고; 기본 127.0.0.1:8765) | ✗ |
+| `serve [--port --open --app]` | Minerva 웹 UI (localhost 고정, 위 참고) | ✗ |
 | `diagnose` | 진단: 스레딩·본문품질·요약 커버리지·AI 백엔드 응답·개입 큐 과탐 분해 | 선택 |
 | `stats` | 저장소 통계 (절감률, DB 크기) | ✗ |
 

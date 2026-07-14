@@ -511,7 +511,7 @@ def cmd_serve(args) -> None:
     cfg = config_mod.load(args.home)
     from . import web  # 지연 import
 
-    web.serve(cfg, host=args.host, port=args.port,
+    web.serve(cfg, port=args.port,
               open_browser=args.open, app_mode=args.app)
 
 
@@ -608,7 +608,6 @@ def main(argv: list[str] | None = None) -> None:
     sp.set_defaults(fn=cmd_unblock)
 
     sp = sub.add_parser("serve", help="Minerva 웹 UI (localhost) — 질문 렌즈+메일 서식 렌더")
-    sp.add_argument("--host", default="127.0.0.1", help="바인딩 호스트 (기본 localhost)")
     sp.add_argument("--port", type=int, default=8765)
     sp.add_argument("--open", action="store_true", help="브라우저 자동 열기")
     sp.add_argument("--app", action="store_true",
