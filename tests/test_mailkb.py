@@ -4031,12 +4031,19 @@ class TestSearchWeb(unittest.TestCase):
         self.assertNotIn('href="/search"', web._NAV)      # 링크는 제거됨
         self.assertIn("syncNavSearch", web._APP_JS)       # /search 시 q 로 채움
 
-    def test_render_has_hint_datalist(self):
+    def test_render_has_box_hint_datalist(self):
         html = web.render_search(self.store, self.cfg, {"q": [""]}, "2026-07-13")
-        self.assertNotIn("form class='search'", html)     # 페이지 중복 박스 제거
+        self.assertIn("form class='search'", html)        # 페이지 검색창(질의 편집)
         self.assertIn("shint", html)                      # 힌트
         self.assertIn("<datalist id='ppl'>", html)        # 사람 자동완성
         self.assertIn("강미래 선임", html)                  # people 옵션
+
+    def test_advanced_open_when_no_results(self):
+        # 결과 없을 땐 상세 검색이 펼쳐져 보이고, 결과 있으면 접힘
+        blank = web.render_search(self.store, self.cfg, {"q": [""]}, "2026-07-13")
+        self.assertIn("<details class='adv' open>", blank)
+        hit = web.render_search(self.store, self.cfg, {"q": ["리포트"]}, "2026-07-13")
+        self.assertIn("<details class='adv'>", hit)       # 접힘
 
     def test_render_snippet_and_facets(self):
         html = web.render_search(self.store, self.cfg, {"q": ["리포트"]}, "2026-07-13")
@@ -4138,6 +4145,19 @@ class TestAISearchPipeline(unittest.TestCase):
     def tearDown(self):
         self.store.close()
         self.tmp.cleanup()
+
+    def test_ai_search_run_meters_cost(self):
+        # claude -p --output-format json 응답에서 실제 비용·토큰을 뽑아 meter 에 누적
+        meter = {"usd": 0.0, "in": 0, "out": 0, "calls": 0}
+        payload = ('{"result": "{\\"dsl\\":\\"x\\"}", "total_cost_usd": 0.02, '
+                   '"usage": {"input_tokens": 100, "output_tokens": 20}}')
+        with mock.patch.object(review, "ai_run", return_value=payload) as run:
+            out = review._ai_search_run(self.cfg, "p", "sonnet", 30, meter)
+        self.assertEqual(out, '{"dsl":"x"}')          # result 텍스트만 추출
+        self.assertIn("--output-format", run.call_args[0][0])   # json 모드로 호출
+        self.assertAlmostEqual(meter["usd"], 0.02)
+        self.assertEqual(meter["calls"], 1)
+        self.assertEqual(meter["in"] + meter["out"], 120)
 
     def test_rank_cleans_invalid_ids(self):
         cands = [{"id": 1, "subject": "s", "sender": "a", "date": "d", "snippet": ""}]
@@ -4242,6 +4262,13 @@ class TestAISearchWeb(unittest.TestCase):
         self.assertIn("찾지 못했습니다", html)
         self.assertIn("일반 검색으로 보기", html)
 
+    def test_render_aisearch_shows_cost(self):
+        r = dict(self._RESULT, cost={"usd": 0.037, "in": 4000, "out": 500, "calls": 3})
+        html = web.render_aisearch(r)
+        self.assertIn("$0.037", html)
+        self.assertIn("4,500토큰", html)
+        self.assertIn("3회", html)
+
     def test_render_search_ai_branch(self):
         with mock.patch.object(review, "ai_search", return_value=self._RESULT) as m:
             html = web.render_search(self.store, self.cfg,
@@ -4266,7 +4293,16 @@ class TestAISearchWeb(unittest.TestCase):
 
     def test_app_js_has_ai_wait_and_css(self):
         self.assertIn("aiwait", web._APP_JS)                    # 대기 표시 핸들러
+        self.assertIn("aielapsed", web._APP_JS)                 # 경과 시간 카운터
+        self.assertNotIn("수 초 걸립니다", web._APP_JS)          # 비현실적 문구 제거됨
         self.assertIn(".aicards", web._CSS)                     # 카드 스타일
+
+    def test_render_aisearch_shows_time(self):
+        r = dict(self._RESULT, cost={"usd": 0.21, "in": 72000, "out": 900,
+                                     "calls": 3, "seconds": 154.0})
+        html = web.render_aisearch(r)
+        self.assertIn("2.6분", html)                            # 154초 → 2.6분
+        self.assertIn("$0.210", html)
 
     def test_settings_has_ai_search_backend(self):
         html = web.render_settings(self.store, self.cfg)

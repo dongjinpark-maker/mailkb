@@ -381,10 +381,16 @@ details.adv input[type=text], details.adv select { padding: 4px 7px; font-size: 
 .aifail { background: rgba(232,151,90,.14); border: 1px solid var(--border);
     color: var(--ink-2); font-size: 13px; padding: 8px 12px; border-radius: 8px;
     margin: 6px 0 12px; }
-.aiwait { display: flex; align-items: center; gap: 12px; padding: 40px 10px;
-    color: var(--ink-2); font-size: 14px; }
-.aiwait .spin { width: 20px; height: 20px; border: 3px solid var(--border);
-    border-top-color: var(--accent); border-radius: 50%; animation: aispin .8s linear infinite; }
+.aiwait { display: flex; align-items: flex-start; gap: 14px; padding: 44px 10px;
+    color: var(--ink-2); }
+.aiwait .spin { width: 22px; height: 22px; margin-top: 3px; flex: none;
+    border: 3px solid var(--border); border-top-color: var(--accent);
+    border-radius: 50%; animation: aispin .8s linear infinite; }
+.aiwaitmsg { font-size: 15px; font-weight: 600; color: var(--ink); }
+.aiwaitsub { font-size: 13px; color: var(--ink-3); margin-top: 5px;
+    line-height: 1.55; max-width: 460px; }
+.aiwaittime { font-size: 12.5px; color: var(--muted); margin-top: 9px;
+    font-variant-numeric: tabular-nums; }
 @keyframes aispin { to { transform: rotate(360deg); } }
 .empty { color: var(--ink-3); padding: 20px 0; }
 .digest { padding: 4px 10px; margin: 3px 0; border-left: 2px solid var(--border);
@@ -1176,14 +1182,12 @@ _APP_JS = r"""
     }
     return null;  /* /thread, /person 등 하위 화면은 직전 메뉴 유지 */
   }
-  /* 헤더 검색창: /search 에선 URL 의 q 를 채워 현재 질의를 반영, 그 외엔 비움.
-     결과는 URL(/search?q=…)에 있으므로 다른 화면 갔다 '뒤로' 오면 그대로 복원된다. */
+  /* 헤더 검색창 = '새 검색' 런처 — 이동하면 비운다(현재 질의는 /search 페이지의
+     검색창이 담고 편집한다). 결과는 URL(/search?q=…)에 있어 '뒤로'로 복원된다. */
   function syncNavSearch() {
     var inp = document.querySelector("header.top .navsearch input");
     if (!inp || inp === document.activeElement) return;   /* 입력 중이면 건드리지 않음 */
-    var p = location.pathname.replace(/\/+$/, "") || "/";
-    inp.value = (p === "/search")
-      ? (new URLSearchParams(location.search).get("q") || "") : "";
+    inp.value = "";
   }
 
   function markNav() {
@@ -1285,10 +1289,20 @@ _APP_JS = r"""
     if (a.closest(".more")) return; /* '더 보기'는 관찰자/전체 페이지 폴백이 처리 */
     e.preventDefault();
     if (a.classList && a.classList.contains("mrow")) a.classList.add("read");  /* 낙관적: 클릭 즉시 볼드 해제 */
-    if (a.classList && a.classList.contains("aibtn")) {   /* AI 검색은 수 초 걸림 — 대기 표시 */
+    if (a.classList && a.classList.contains("aibtn")) {   /* AI 검색은 1~3분 — 진행 표시 */
       var li = left.querySelector(".inner") || left;
-      li.innerHTML = "<div class='aiwait'><span class='spin'></span>"
-        + "AI가 찾는 중… 잠시만요 (수 초 걸립니다)</div>";
+      li.innerHTML =
+        "<div class='aiwait'><span class='spin'></span><div class='aiwaitbody'>"
+        + "<div class='aiwaitmsg'>AI가 찾고 있어요</div>"
+        + "<div class='aiwaitsub'>번역 → 검색 → 본문 확인을 차례로 거칩니다. "
+        + "정확도를 위해 <b>보통 1~3분</b> 걸려요. 창을 닫지 말고 기다려 주세요.</div>"
+        + "<div class='aiwaittime'><span id='aielapsed'>0</span>초 경과</div>"
+        + "</div></div>";
+      var t0 = Date.now(), tick = setInterval(function () {
+        var el = document.getElementById("aielapsed");
+        if (!el) { clearInterval(tick); return; }   /* 결과 주입되면 사라짐 → 정리 */
+        el.textContent = Math.round((Date.now() - t0) / 1000);
+      }, 1000);
     }
     load(href).catch(function () { location.href = href; });
   });
@@ -2491,9 +2505,19 @@ def render_aisearch(result: dict) -> str:
             "<ol class='aicards'>" + "".join(_ai_card(it) for it in others)
             + "</ol></details>")
     cache = " · 캐시됨" if result.get("from_cache") else ""
+    cost = result.get("cost") or {}
+    parts = []
+    secs = cost.get("seconds")
+    if secs:
+        parts.append(f"{secs / 60:.1f}분" if secs >= 60 else f"{secs:.0f}초")
+    if cost.get("calls"):
+        tok = int(cost.get("in", 0)) + int(cost.get("out", 0))
+        parts.append(f"${cost.get('usd', 0):.3f}")
+        parts.append(f"{tok:,}토큰·{cost['calls']}회")
+    extra = (" · " + " · ".join(parts)) if parts else ""
     out.append(
         "<p class='aifoot'>후보 " + str(result.get("candidate_count", 0))
-        + f"개 검토 · {esc(result.get('backend', ''))}{cache} · "
+        + f"개 검토 · {esc(result.get('backend', ''))}{extra}{cache} · "
         f"<a href='{esc(dsl_href)}'>일반 검색 결과 보기</a></p>")
     return "\n".join(out)
 
@@ -2509,14 +2533,20 @@ def render_search(store, cfg, qs, today: str) -> str:
             # AI CLI 부재·타임아웃 등 → 일반 검색으로 폴백(막다른 길 방지)
             ai_banner = ("<div class='aifail'>AI 검색을 쓸 수 없습니다 — "
                          f"{esc(str(e)[:90])}. 일반 검색 결과를 보여드립니다.</div>")
-    # 검색 입력은 헤더 상시 검색창(_NAV navsearch)이 담당 — 여기선 중복 박스 없이
-    # 힌트·상세(빌더)·패싯·결과만. 헤더 박스 값은 app.js 가 URL 의 q 로 채운다.
-    # 상세: 검색식을 만들어 검색창(q)에 병합. datalist 로 사람 이름 자동완성.
+    # /search 페이지는 편집 가능한 검색창 + 상세 빌더를 직접 둔다(질의 다듬기용).
+    # 헤더 검색창은 '새 검색' 런처(입력하면 새로 시작). 결과가 없을 땐 상세를 펼쳐
+    # 필터 옵션이 처음부터 보이게 한다.
+    rows = store.search(effective, limit=50) if effective else []
+    box = ("<form class='search' method='get' action='/search'>"
+           f"<input type='text' name='q' value='{esc(effective)}' autofocus "
+           "placeholder='검색 — 예: from:강미래 after:2026-06 리포트'> "
+           "<button>검색</button></form>")
     ppl = store.frequent_people(200)
     opts = "".join(f"<option value='{esc(p['name'])}'>{esc(p['addr'])}</option>"
                    for p in ppl)
+    adv_open = "" if rows else " open"       # 결과 없으면(첫 검색·0건) 상세를 펼쳐 노출
     adv = (
-        "<details class='adv'><summary>상세</summary>"
+        f"<details class='adv'{adv_open}><summary>상세 검색</summary>"
         "<form class='advbody' method='get' action='/search'>"
         f"<input type='hidden' name='q' value='{esc(raw)}'>"
         "<label>사람 <input type='text' name='f_from' list='ppl' "
@@ -2531,11 +2561,10 @@ def render_search(store, cfg, qs, today: str) -> str:
         "<label><input type='checkbox' name='f_has' value='1'> 첨부</label>"
         "<button>적용</button></form>"
         f"<datalist id='ppl'>{opts}</datalist></details>")
-    out = ["<h1>검색</h1>", _SEARCH_HINT, adv]
+    out = ["<h1>검색</h1>", box, _SEARCH_HINT, adv]
     if ai_banner:
         out.append(ai_banner)
     if effective:
-        rows = store.search(effective, limit=50)
         # 흐릿한 기억이면 AI로 — 명시적 클릭에서만(과금). 일반 결과 위에 노출.
         if raw:
             out.append(

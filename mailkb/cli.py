@@ -234,6 +234,13 @@ def cmd_search(args) -> None:
                   f"{it['sender']}: {it['subject']}")
             if it.get("reason"):
                 print(f"       └ {it['reason']}")
+        cost = res.get("cost") or {}
+        if cost.get("calls"):
+            tok = int(cost.get("in", 0)) + int(cost.get("out", 0))
+            secs = cost.get("seconds")
+            tstr = (f"{secs / 60:.1f}분 · " if secs and secs >= 60
+                    else f"{secs:.0f}초 · " if secs else "")
+            print(f"— {tstr}${cost.get('usd', 0):.3f} · {tok:,}토큰 · {cost['calls']}회 호출")
         return
     rows = store.search(args.query, args.limit)
     if getattr(args, "json", False):
