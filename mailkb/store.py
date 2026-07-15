@@ -60,6 +60,9 @@ CREATE TABLE IF NOT EXISTS threads (
 );
 CREATE INDEX IF NOT EXISTS idx_threads_norm ON threads(norm_subject);
 CREATE INDEX IF NOT EXISTS idx_threads_conv ON threads(conversation_key);
+-- 스레드 목록 ORDER BY last_date DESC LIMIT — 인덱스 없으면 전수 스캔+임시정렬.
+-- 스레드 수에 비례해 커지는 유일한 부분이라 스케일 보험(30k 스레드 2.06→0.03ms).
+CREATE INDEX IF NOT EXISTS idx_threads_last_date ON threads(last_date);
 
 CREATE TABLE IF NOT EXISTS people (
     addr        TEXT PRIMARY KEY,

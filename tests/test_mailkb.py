@@ -583,6 +583,17 @@ class TestStore(unittest.TestCase):
         ])
         self.assertEqual(self.store.stats()["threads"], 1)
 
+    def test_threads_last_date_index(self):
+        # 스레드 목록 정렬용 인덱스 존재 + 플래너가 실제 사용(전수 스캔+임시정렬 회피)
+        idx = {r["name"] for r in self.store.db.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'")}
+        self.assertIn("idx_threads_last_date", idx)
+        plan = " ".join(r[3] for r in self.store.db.execute(
+            "EXPLAIN QUERY PLAN SELECT id FROM threads "
+            "WHERE (hidden IS NULL OR hidden=0) ORDER BY last_date DESC LIMIT 50"))
+        self.assertIn("idx_threads_last_date", plan)
+        self.assertNotIn("TEMP B-TREE", plan)      # 임시 정렬 없음
+
     def test_date_range_queries_exact_boundaries(self):
         # date(sent_on)=? → 범위 재작성이 [일, 다음날) 경계에서 정확히 등가인지
         self.store.ingest([

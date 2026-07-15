@@ -62,18 +62,33 @@
   `/autosync`→논블로킹(`started`/`busy`)+`watchSyncToast` 가 완료 시 '신규 N' 토스트.
 - 완료 msg 는 `data-sync-msg` 로 실어 수동/자동 모두 토스트 보존.
 
-## 4. 적용 제외 (이번 배치) — 이유
+## 2-c. `idx_threads_last_date` 인덱스 (구현됨, 무재싱크·무위험)
 
-| 항목 | 제외 이유 |
-|---|---|
-| 전체 연결 재사용(요청간 1 커넥션) | keep-alive 로 안전한 절반 확보. 나머지는 트랜잭션 상태 관리 위험 → 결과 불변 확신 부족 |
-| `new_content` 별도 테이블 분리 | 스키마 변경 = **DB 재싱크 필요**('git pull 즉시 반영' 원칙 위배) |
-| 구 메일 HTMLBody 스킵 / 헤더 생략 | 저장 본문(검색 텍스트) 서식이 달라짐 = **결과 변경** |
-| Outlook `Items.SetColumns` | 결과 불변이나 Windows-COM 전용이라 WSL 에서 검증 불가 → 실기 검증 후 |
-| keyset 페이지네이션 | 결과 동일·안전하나 깊은 스크롤에만 이득 → 후순위 |
-| `ANALYZE` 주기 실행 | 안전. 스케일 도달 후 계획 품질용으로 후속 |
+`/threads` 목록의 `ORDER BY t.last_date DESC LIMIT` 이 인덱스 없이 전수 스캔+임시
+정렬(`USE TEMP B-TREE`)하던 것을 인덱스로. **30k 스레드 2.06→0.03ms(70x)**, EXPLAIN
+이 `USING INDEX idx_threads_last_date` 확인. 스레드 수에 비례해 커지는 유일한 부분이라
+스케일 보험. `CREATE INDEX IF NOT EXISTS`(빌드 8.6ms/30k, 다음 서버 시작 시 자동, 재싱크
+불필요). `test_threads_last_date_index` 가드.
+
+## 4. 재싱크 가정 시 순위 재평가 (측정으로 반증·정정)
+
+사용자 질의: "재싱크한다면 runtime 이득 순위". 측정 결과 대부분 재싱크가 불필요하거나
+가치가 없다고 판명:
+
+| 후보 | 판정 | 근거 |
+|---|---|---|
+| **sync COM — HTMLBody 조건부** | **reject** | 오래된 메일 저장 텍스트가 마크다운→평문 = **결과 변경**. 헤더 생략도 스레딩 결과 위험 |
+| sync COM — `SetColumns`·SMTP 캐시 | 보류 | 결과 불변이나 HTMLBody 제외 후 이득 작고 Windows 전용 WSL 검증 불가 → 실기 확인 |
+| **`new_content` 분리** | **비권장** | 목록 SELECT * 0.19 vs 컬럼선택 0.05ms — LIMIT 쿼리는 오버플로 안 읽어 이득 ~0 |
+| **threads 표시필드 비정규화** | **비권장** | 서브쿼리는 LIMIT 50 한정이라 스케일 무관(3k스레드 2ms). 스케일 부분(정렬)은 §2-c 인덱스로 **무재싱크** 해결 |
+| 전체 연결 재사용 | 보류 | keep-alive 로 안전한 절반 확보, 나머지는 트랜잭션 상태 위험 |
+| keyset 페이지네이션 / `ANALYZE` | 후속 | 안전하나 후순위 |
+
+**결론: read 이득은 Batch 1 + 신호 캐시 + last_date 인덱스로 재싱크 없이 대부분 확보됨.**
+재싱크가 실제로 필요한 가치 있는 항목은 사실상 없음(HTMLBody 는 결과 변경으로 reject).
 
 ## 5. 남은 것 (후속, 실 스케일 도달 시)
 
-- 멀티 GB 실측 후: `new_content` 분리(재싱크 1회 감수) · SetColumns(실기) · keyset 페이지네이션.
+- sync COM SetColumns/SMTP 캐시 — 실기(Windows+Outlook)에서 검증 후.
 - 무거운 GET(/통계)도 필요하면 백그라운드+폴링(AI검색 패턴 재사용).
+- keyset 페이지네이션 · `ANALYZE` — 스케일 도달 후.
