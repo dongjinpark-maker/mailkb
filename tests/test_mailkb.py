@@ -583,6 +583,28 @@ class TestStore(unittest.TestCase):
         ])
         self.assertEqual(self.store.stats()["threads"], 1)
 
+    def test_date_range_queries_exact_boundaries(self):
+        # date(sent_on)=? → 범위 재작성이 [일, 다음날) 경계에서 정확히 등가인지
+        self.store.ingest([
+            _rec("p0", "kim@c", [ME], "전날 자정직전", "2026-07-14T23:59:59"),
+            _rec("p1", "kim@c", [ME], "당일 자정", "2026-07-15T00:00:00"),
+            _rec("p2", "lee@c", [ME], "당일 낮", "2026-07-15T13:30:00"),
+            _rec("p3", "kim@c", [ME], "당일 자정직전", "2026-07-15T23:59:59"),
+            _rec("p4", "kim@c", [ME], "다음날 자정", "2026-07-16T00:00:00"),
+            _rec("s1", ME, ["kim@c"], "내가 보낸 당일", "2026-07-15T09:00:00"),
+        ])
+        recv = self.store.received_on_date("2026-07-15")
+        self.assertEqual([r["subject"] for r in recv],
+                         ["당일 자정", "당일 낮", "당일 자정직전"])   # p1,p2,p3 정렬순
+        sent = self.store.sent_on_date("2026-07-15")
+        self.assertEqual([r["subject"] for r in sent], ["내가 보낸 당일"])
+        # threads_active_on: 당일 활동 스레드(p1,p2,p3,s1) — 전날 p0·다음날 p4 제외
+        on = set(self.store.threads_active_on("2026-07-15"))
+        self.assertEqual(len(on), 4)
+        # between [14,15] 양끝 포함: p0 포함, p4(16일) 제외
+        btw = set(self.store.threads_active_between("2026-07-14", "2026-07-15"))
+        self.assertEqual(len(btw), 5)
+
     def test_hidden_thread_unhides_on_new_inbound(self):
         # 숨긴 스레드에 새 수신 메일이 오면 자동 숨김 해제 (구 추적제외의 복귀 흡수)
         self.store.ingest([_rec("d1", "kim@c", [ME], "질문 있습니다", "2026-07-01T09:00:00")])
@@ -895,7 +917,7 @@ class TestInlineImages(unittest.TestCase):
         self.assertIn("이미지 1장", self._html("img"))
 
     def test_web_sync_failure_still_prunes(self):
-        # Outlook 꺼짐 등 수집 실패에도 프룬(COM 불필요)은 실행된다
+        # Outlook 꺼짐 등 수집 실패에도 프룬(COM 불필요)은 실행된다 (_do_sync 보장)
         from mailkb import web
         old_day = (date.today() - timedelta(days=20)).isoformat()
         self.store.ingest([self._img_rec("img", f"{old_day}T09:00:00")])
@@ -904,9 +926,9 @@ class TestInlineImages(unittest.TestCase):
         with mock.patch("mailkb.sources.fake.FakeSource.fetch",
                         side_effect=RuntimeError("COM down")):
             try:
-                web.perform_action(self.store, self.cfg, "/sync", {})
+                web._do_sync(self.store, self.cfg)
             except RuntimeError:
-                pass                                  # 수집 실패는 상위에서 안내
+                pass                                  # 수집 실패는 잡이 안내
         self.assertIn("이미지 1장", self._html("img"))  # 프룬은 됐음
 
     def test_td_only_table_gets_delimiter_and_renders(self):
@@ -3084,9 +3106,30 @@ class TestWeb(unittest.TestCase):
         loc = self.web.perform_action(self.store, self.cfg, f"/thread/{tid}/note", {})
         self.assertIn("노트 생성", urllib_unquote(loc))
 
-    def test_perform_action_sync_fake(self):
-        loc = self.web.perform_action(self.store, self.cfg, "/sync", {})
-        self.assertIn("동기화", urllib_unquote(loc))
+    def test_do_sync_fake(self):
+        # 동기화 실동작(수집+프룬) — 완료 msg·신규 통수 반환
+        msg, n = self.web._do_sync(self.store, self.cfg)
+        self.assertIn("동기화", msg)
+        self.assertIsInstance(n, int)
+
+    def test_sync_job_and_status(self):
+        # 백그라운드 잡: _run_sync_job 완료 → render_sync_status 가 결과·토스트 마커 노출
+        self.web._sync_job.update(running=False, msg="", n=0)
+        self.web._run_sync_job(self.cfg)               # 스레드 함수 직접 호출(인라인)
+        self.assertFalse(self.web._sync_job["running"])
+        self.assertIn("동기화", self.web._sync_job["msg"])
+        inner, running = self.web.render_sync_status()
+        self.assertFalse(running)
+        self.assertIn("data-sync-msg", inner)          # 폴링 토스트용 마커
+        self.assertNotIn("data-sync-running", inner)
+
+    def test_sync_status_running_marker(self):
+        self.web._sync_job.update(running=True, msg="", n=0)
+        inner, running = self.web.render_sync_status()
+        self.web._sync_job.update(running=False, msg="", n=0)   # 정리
+        self.assertTrue(running)
+        self.assertIn("data-sync-running", inner)      # 폴링 훅 마커
+        self.assertIn("가져오는 중", inner)
 
     def test_attach_button_only_with_attachment(self):
         self.store.ingest([MailRecord(
@@ -3385,6 +3428,11 @@ class TestWeb(unittest.TestCase):
         js = self.web._APP_JS
         self.assertIn("/syncmin", js)
         self.assertIn("/autosync", js)
+        # 백그라운드 동기화: 완료 감시 토스트 + 수동 대기화면 폴링
+        self.assertIn("watchSyncToast", js)
+        self.assertIn("hookSyncPolling", js)
+        self.assertIn("/sync/status", js)
+        self.assertIn("data-sync-running", js)
 
     # ─────────────────── 라이트/다크 테마
     def test_theme_html_attr_and_tokens(self):

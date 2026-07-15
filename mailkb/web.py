@@ -38,6 +38,12 @@ _aisearch_job = {"running": False, "stage": "", "query": "", "fresh": False,
                  "result": None, "error": "", "prelim": None}
 _aisearch_lock = threading.Lock()
 
+# 메일 동기화 백그라운드 잡(단일) — Outlook COM 수집은 수 초~수십 초. 요청 스레드에서
+# 돌리면 그동안 UI 전체가 멈춘다(리뷰·AI검색은 이미 백그라운드인데 sync 만 인라인이었음).
+# 별 스레드에서 자체 CoInitialize 로 COM 을 열고, /sync/status 폴링으로 완료를 알린다.
+_sync_job = {"running": False, "msg": "", "n": 0}
+_sync_lock = threading.Lock()
+
 
 def _q(s: str) -> str:
     return urllib.parse.quote(str(s)[:200])
@@ -1125,8 +1131,8 @@ _APP_JS = r"""
       fetch("/autosync", { method: "POST", headers: { "X-Requested-With": "fetch" } })
         .then(function (r) { return r.text(); })
         .then(function (t) {
-          var n = parseInt(t, 10) || 0;
-          if (n > 0) { toast("새 메일 " + n + "통"); checkFresh(); }
+          /* 백그라운드 잡 시작됨 → 완료를 감시해 '새 메일 N통' 토스트(서버 안 멈춤) */
+          if (t === "started") watchSyncToast();
         }).catch(function () {});
     }, min * 60000);
   }).catch(function () {});
@@ -1170,6 +1176,7 @@ _APP_JS = r"""
     markNav();
     hookReviewPolling(el);
     hookAiPolling(el);
+    hookSyncPolling(el);
     hookMore();
   }
 
@@ -1304,6 +1311,53 @@ _APP_JS = r"""
         })
         .catch(function () { hookAiPolling(left); });
     }, 1500);
+  }
+
+  /* ---- 동기화 백그라운드 잡 폴링 (수동 '메일 동기화' — 우측 대기화면) ----
+     완료되면 결과 화면으로 교체하고 '신규 N · 중복 M' 토스트도 띄운다. */
+  function hookSyncPolling(root) {
+    if (!root.querySelector("[data-sync-running]")) return;
+    setTimeout(function () {
+      var u = new URL("/sync/status", location.origin);
+      u.searchParams.set("frag", "1");
+      fetch(u.toString(), { headers: { "X-Requested-With": "fetch" } })
+        .then(function (r) { return r.text(); })
+        .then(function (html) {
+          if (!right.querySelector("[data-sync-running]")) return; /* 화면 전환됨 */
+          var tmp = document.createElement("div");
+          tmp.innerHTML = html;
+          if (!tmp.querySelector("[data-sync-running]")) {
+            inject("right", html, null);            /* 완료 → 결과 화면 */
+            var m = tmp.querySelector("[data-sync-msg]");
+            if (m && m.getAttribute("data-sync-msg")) {
+              toast(m.getAttribute("data-sync-msg")); checkFresh();
+            }
+            return;
+          }
+          hookSyncPolling(right);
+        })
+        .catch(function () { hookSyncPolling(right); });
+    }, 2000);
+  }
+
+  /* ---- 자동 동기화 완료 감시(무화면) — 잡이 끝나면 '새 메일 N통' 토스트 ---- */
+  function watchSyncToast() {
+    var u = new URL("/sync/status", location.origin);
+    u.searchParams.set("frag", "1");
+    fetch(u.toString(), { headers: { "X-Requested-With": "fetch" } })
+      .then(function (r) { return r.text(); })
+      .then(function (html) {
+        var tmp = document.createElement("div");
+        tmp.innerHTML = html;
+        if (tmp.querySelector("[data-sync-running]")) {
+          setTimeout(watchSyncToast, 3000); return;   /* 아직 진행 중 */
+        }
+        var m = tmp.querySelector("[data-sync-msg]");
+        if (m && m.getAttribute("data-sync-msg")) {
+          toast(m.getAttribute("data-sync-msg")); checkFresh();
+        }
+      })
+      .catch(function () {});
   }
 
   /* ---- fragment 로드 ---- */
@@ -1523,6 +1577,7 @@ _APP_JS = r"""
   markNav();
   hookReviewPolling(right);
   hookAiPolling(left);
+  hookSyncPolling(right);
   hookMore();
 })();
 """
@@ -1573,6 +1628,82 @@ def _start_review(cfg, ai: bool, today: str) -> bool:
         _review_job.update(running=True, msg="준비 중…", step=0)
     threading.Thread(target=_run_review_job, args=(cfg, ai, today), daemon=True).start()
     return True
+
+
+# ─────────────────────────────────────────────────── 메일 동기화(백그라운드)
+
+def _do_sync(store, cfg) -> tuple:
+    """동기화 1회(수집 + 이미지 프룬). (완료 msg, 신규 통수) 반환.
+    수집 실패(Outlook 꺼짐 등)에도 프룬(COM 불필요)은 반드시 실행 — 기존 보장 유지.
+    잡 래퍼와 테스트가 공유하는 순수 동작(소켓·스레드 무관)."""
+    from .sources import get_source
+    src = get_source(cfg.source)                 # outlook 이면 Windows COM
+    retain = int(cfg.opt("web", "image_retain_days", default=60) or 0)
+    cutoff = image_cutoff_for(retain)
+    try:
+        stats = store.ingest(src.fetch(store.last_sync(), image_cutoff=cutoff),
+                             image_cutoff=cutoff)
+    finally:
+        store.maybe_prune_html(retain)
+    return (f"동기화({src.name}): 신규 {stats.inserted} · 중복 {stats.skipped}",
+            stats.inserted)
+
+
+def _run_sync_job(cfg) -> None:
+    """백그라운드 동기화 잡. COM 은 스레드마다 초기화 필요 → 여기서 CoInitialize."""
+    com = False
+    try:
+        import pythoncom      # Windows(pywin32)에서만
+        pythoncom.CoInitialize()
+        com = True
+    except Exception:
+        com = False
+    msg, n = "", 0
+    try:
+        store = Store(cfg.db_path, cfg.my_addresses)
+        try:
+            msg, n = _do_sync(store, cfg)
+        finally:
+            store.close()
+    except Exception as e:      # 수집 실패는 조용히 기록(다음 주기 재시도)
+        msg = f"동기화 실패: {e!r}"[:160]
+    finally:
+        if com:
+            try:
+                import pythoncom
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+    with _sync_lock:
+        _sync_job.update(running=False, msg=msg, n=n)
+
+
+def _start_sync(cfg) -> bool:
+    """동기화 잡 시작(단일 슬롯). 이미 실행 중이면 False(로컬 단일 사용자)."""
+    with _sync_lock:
+        if _sync_job["running"]:
+            return False
+        _sync_job.update(running=True, msg="", n=0)
+    threading.Thread(target=_run_sync_job, args=(cfg,), daemon=True).start()
+    return True
+
+
+def render_sync_status(store=None) -> tuple:
+    """(inner, running) — 동기화 진행/완료. 완료 msg 는 data-sync-msg 로 실어
+    app.js 폴링이 토스트로도 띄운다(수동·자동 공통)."""
+    with _sync_lock:
+        running, msg = _sync_job["running"], _sync_job["msg"]
+    if running:
+        return ("<div data-sync-running='1' hidden></div>"
+                "<h1>메일 동기화 중…</h1>"
+                "<div class='aiwait'><span class='spin'></span><div class='aiwaitbody'>"
+                "<div class='aiwaitmsg'>Outlook 에서 새 메일을 가져오는 중</div>"
+                "<div class='aiwaitsub'>받은편지함·보낸편지함을 훑고 색인합니다. "
+                "완료되면 자동으로 알려드려요.</div></div></div>", True)
+    marker = f"<div data-sync-msg='{esc(msg)}' hidden></div>" if msg else ""
+    body = f"<div class='flash'>{esc(msg or '동기화 완료')}</div>" if msg else ""
+    return (marker + "<h1>메일 동기화</h1>" + body +
+            "<p><a href='/'>→ 홈</a> · <a href='/mail'>메일함 보기</a></p>", False)
 
 
 # 대기 화면 애니메이션 — 사서가 메일을 한 통씩 장부(장기기억 초안)로 옮겨 적는 루프.
@@ -2913,18 +3044,8 @@ def perform_action(store, cfg, path: str, form: dict) -> str:
     """
     parts = path.strip("/").split("/")
 
-    if path == "/sync":
-        from .sources import get_source
-        src = get_source(cfg.source)                 # outlook 이면 Windows COM
-        retain = int(cfg.opt("web", "image_retain_days", default=60) or 0)
-        cutoff = image_cutoff_for(retain)
-        try:
-            stats = store.ingest(src.fetch(store.last_sync(), image_cutoff=cutoff),
-                                 image_cutoff=cutoff)
-        finally:
-            # 프룬은 COM 불필요 — 수집이 실패(Outlook 꺼짐 등)해도 실행
-            store.maybe_prune_html(retain)
-        return "/?msg=" + _q(f"동기화({src.name}): 신규 {stats.inserted} · 중복 {stats.skipped}")
+    # /sync 는 백그라운드 잡으로 이관(do_POST 에서 _start_sync → /sync/status).
+    # UI 프리즈 방지. 실제 동작은 _do_sync(수집+프룬) — 잡·테스트 공용.
 
     if path == "/settings/unblock":
         addr = (form.get("addr") or [""])[0].strip()
@@ -3067,6 +3188,9 @@ def route(store, cfg, path, qs, today):
     if path == "/aisearch/status":
         inner, running = render_aisearch_status(store, cfg, today)
         return "AI 검색", inner, 200, "left"
+    if path == "/sync/status":
+        inner, running = render_sync_status(store)
+        return "동기화", inner, 200, "right"
     if path.startswith("/thread/"):
         try:
             tid = int(path.split("/")[2])
@@ -3160,13 +3284,15 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         if path == "/latest":             # 표시 최신화 토큰 — DB 변경(새 메일) 감지용(가벼움)
+            # MAX(rowid) 만으로 충분 — messages 는 삭제 없이 append-only 라 새 메일이면
+            # 반드시 증가. COUNT(*) 는 대형 DB 에서 매 폴링(60s)마다 전수 스캔이라 제거.
             st = Store(self.cfg.db_path, self.cfg.my_addresses)
             try:
                 row = st.db.execute(
-                    "SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM messages").fetchone()
+                    "SELECT COALESCE(MAX(rowid), 0) FROM messages").fetchone()
             finally:
                 st.close()
-            body = f"{row[0]}:{row[1]}".encode("ascii")
+            body = str(row[0]).encode("ascii")
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -3188,7 +3314,8 @@ class _Handler(BaseHTTPRequestHandler):
             # 전체 페이지 모드의 진행 화면(리뷰·AI검색)은 meta refresh 로 자동 새로고침
             # (JS 꺼짐 폴백). AI 검색 대기는 /search?ai=1 자체가 이 마커를 실어 온다.
             refresh = 2 if (not frag and (
-                "data-review-running" in inner or "data-aisearch-running" in inner)) else None
+                "data-review-running" in inner or "data-aisearch-running" in inner
+                or "data-sync-running" in inner)) else None
             msg = (qs.get("msg") or [""])[0]
             if msg and not frag:
                 # fragment 모드는 JS 토스트가 msg 를 표시 — flash 중복 방지
@@ -3247,27 +3374,11 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        if path == "/autosync":           # app.js 백그라운드 주기 동기화 → 신규 통수만 반환
-            n = 0
-            store = Store(self.cfg.db_path, self.cfg.my_addresses)
-            retain = int(self.cfg.opt("web", "image_retain_days",
-                                      default=60) or 0)
-            try:
-                from .sources import get_source
-                src = get_source(self.cfg.source)
-                cutoff = image_cutoff_for(retain)
-                n = store.ingest(src.fetch(store.last_sync(),
-                                           image_cutoff=cutoff),
-                                 image_cutoff=cutoff).inserted
-            except Exception:             # 자동 동기화 실패는 조용히(다음 주기 재시도)
-                n = 0
-            try:
-                store.maybe_prune_html(retain)   # 프룬은 COM 불필요 — 항상 시도
-            except Exception:
-                pass
-            finally:
-                store.close()
-            body = str(n).encode("ascii")
+        if path == "/autosync":           # app.js 주기 동기화 → 백그라운드 잡 시작(논블로킹)
+            # 서빙 스레드를 막지 않게 잡만 띄우고 즉시 응답. 완료·신규 통수는 app.js 가
+            # /sync/status 폴링으로 받아 '새 메일 N통' 토스트를 띄운다(수집+프룬은 잡 안).
+            started = _start_sync(self.cfg)
+            body = b"started" if started else b"busy"
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -3292,6 +3403,9 @@ class _Handler(BaseHTTPRequestHandler):
                 ai = bool((form.get("ai") or [""])[0])
                 _start_review(self.cfg, ai, today)
                 location = "/review/status"
+            elif path == "/sync":                     # 메일 동기화(백그라운드)
+                _start_sync(self.cfg)
+                location = "/sync/status"
             elif path == "/settings/update":
                 location = _git_update()          # git pull — 적용은 창 닫았다 재실행
             elif path in ("/settings/save", "/settings/noise"):
@@ -3389,6 +3503,14 @@ def serve(cfg, port: int = 8765,
     except Exception:
         _com = False
     httpd = HTTPServer((host, port), _Handler)
+    # keep-alive 연결: 요청마다 Store 를 열고 닫는데, 그 연결이 '마지막 연결'이면
+    # close 시 WAL 체크포인트가 돈다(측정상 요청당 ~1ms 추가·대형 DB 에서 증가).
+    # 서버 수명 동안 idle 읽기 연결 하나를 상시 열어두면 요청 close 가 마지막이
+    # 아니게 되어 체크포인트 폭주를 막는다(결과 불변 — 그냥 유휴 연결).
+    try:
+        _keepalive = Store(cfg.db_path, cfg.my_addresses)
+    except Exception:
+        _keepalive = None
     import os
     pidfile = cfg.home / "minerva.pid"          # 런처가 재시작 때 옛 서버를 찾아 종료
     try:
@@ -3405,6 +3527,11 @@ def serve(cfg, port: int = 8765,
         print("\n종료")
     finally:
         httpd.server_close()
+        if _keepalive is not None:
+            try:
+                _keepalive.close()
+            except Exception:
+                pass
         if pidfile is not None:
             try:
                 if pidfile.read_text(encoding="utf-8").strip() == str(os.getpid()):

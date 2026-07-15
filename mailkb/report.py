@@ -77,23 +77,23 @@ def load(db, max_weeks: int, extra_me=frozenset()) -> dict | None:
 
     메일이 없으면 None (웹은 빈 상태 페이지로 렌더).
     """
-    all_msgs = [dict(r) for r in db.execute(
-        """SELECT id, thread_id, sender_addr, sender_name, to_addrs, subject,
-                  sent_on, is_sent, new_content
-           FROM messages WHERE sent_on != '' ORDER BY sent_on, id"""
-    )]
-    if not all_msgs:
+    # 전 이력은 (1) 별칭 판정용 발신 주소 집합, (2) 기간 축(min/max sent_on)만
+    # 필요하다. 이 둘은 메타 컬럼만으로 충분하므로 큰 new_content 는 읽지 않는다
+    # — 대형 DB 에서 매 통계 로드마다 전 이력 본문을 훑던 비용을 없앤다.
+    # 본문까지 필요한 것은 검토 창 안 메일뿐이라 아래에서 따로 로드한다(결과 동일).
+    meta = db.execute(
+        "SELECT sender_addr, is_sent, sent_on FROM messages "
+        "WHERE sent_on != '' ORDER BY sent_on, id"
+    ).fetchall()
+    if not meta:
         return None
 
     # 내 주소 집합: is_sent=1 발신자 + 설정 주소(별칭 포함). 별칭 발신 메일이
     # is_sent=0 으로 들어와 있으면 발신으로 재분류 (§2~§5 오염 방지).
     # 창 밖 메일까지 포함해 파악 — 별칭 지식은 기간과 무관하게 온전해야 함.
-    my_addrs = {(m["sender_addr"] or "").lower() for m in all_msgs if m["is_sent"]}
+    my_addrs = {(m["sender_addr"] or "").lower() for m in meta if m["is_sent"]}
     my_addrs |= {a.lower() for a in extra_me if a}
     my_addrs.discard("")
-    for m in all_msgs:
-        if not m["is_sent"] and (m["sender_addr"] or "").lower() in my_addrs:
-            m["is_sent"] = 1
     # 숨긴 스레드는 §1(증발한 요청)에서 제외 — 사용자가 신호를 끈 건.
     # (구 추적제외 폐지로 기준을 dismissed → hidden 으로 교체, 2026-07-12)
     hidden_ids = {r["id"] for r in
@@ -101,8 +101,8 @@ def load(db, max_weeks: int, extra_me=frozenset()) -> dict | None:
     names = {r["addr"].lower(): r["name"] for r in
              db.execute("SELECT addr, name FROM people") if r["name"]}
 
-    asof = _dt(all_msgs[-1]["sent_on"])
-    data_first = _dt(all_msgs[0]["sent_on"])
+    asof = _dt(meta[-1]["sent_on"])
+    data_first = _dt(meta[0]["sent_on"])
     # 주 축: 데이터 시작 주 ~ asof 주, 최대 max_weeks — 검토 기간은 항상 제한됨
     last_ws = _week_start(asof.date())
     n_weeks = min(max_weeks,
@@ -111,10 +111,17 @@ def load(db, max_weeks: int, extra_me=frozenset()) -> dict | None:
     widx = {w: i for i, w in enumerate(weeks)}
     window_start = weeks[0]      # 검토 기간 시작 주(월요일)
 
-    # ★ 검토 기간 제한: 선택한 창(window_start~asof) 밖의 메일은 분석 대상에서
-    #   제외한다. "모든 mail 이 아니라 제한된 기간" — 이게 빠지면 기간을 눌러도
-    #   §1(증발) 등 창 무관 섹션이 그대로라 기간 전환이 데이터에 안 먹힌다.
-    msgs = [m for m in all_msgs if _dt(m["sent_on"]).date() >= window_start]
+    # ★ 검토 기간 제한: 창(window_start~asof) 안 메일만 본문까지 로드한다. 문자열
+    #   비교 sent_on >= 'YYYY-MM-DD' 는 _dt(sent_on).date() >= window_start 과 등가.
+    msgs = [dict(r) for r in db.execute(
+        """SELECT id, thread_id, sender_addr, sender_name, to_addrs, subject,
+                  sent_on, is_sent, new_content
+           FROM messages WHERE sent_on >= ? ORDER BY sent_on, id""",
+        (window_start.isoformat(),)
+    )]
+    for m in msgs:      # 별칭 발신 재분류 — 창 안 메일에 적용(원래도 창 밖은 버려짐)
+        if not m["is_sent"] and (m["sender_addr"] or "").lower() in my_addrs:
+            m["is_sent"] = 1
     first = _dt(msgs[0]["sent_on"]) if msgs else asof
 
     def wk(dt: datetime) -> int | None:

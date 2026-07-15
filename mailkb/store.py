@@ -182,6 +182,14 @@ class Store:
         self.db.execute("PRAGMA auto_vacuum=INCREMENTAL")
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=5000")  # 웹 백그라운드 쓰기 경합 대비
+        # 성능 PRAGMA(결과 불변, 속도만) — synchronous=NORMAL: WAL 에서 표준 권장.
+        # 앱 크래시엔 안전, OS 크래시/정전 시에만 마지막 트랜잭션 유실 가능한데
+        # 이 DB 는 Outlook 에서 재수집 가능한 캐시(message_id UNIQUE 로 멱등)라
+        # 안전하다. 커밋마다 fsync 제거 → sync·열람 쓰기 대폭 가속.
+        self.db.execute("PRAGMA synchronous=NORMAL")
+        self.db.execute("PRAGMA cache_size=-16384")   # 16MB 페이지 캐시(기본 2MB)
+        self.db.execute("PRAGMA temp_store=MEMORY")    # 정렬·임시 결과 RAM
+        self.db.execute("PRAGMA mmap_size=268435456")  # 256MB 메모리맵 읽기
         self.db.executescript(_SCHEMA)
         # (구 _migrate 는 2026-07-12 제거 — 스키마 개편은 clean start 로,
         #  기존 DB 는 삭제 후 sync --full 재수집)
@@ -618,18 +626,24 @@ class Store:
             """
         ).fetchall()
 
+    # date(sent_on)=? 는 컬럼을 함수로 감싸 idx_messages_sent_on 을 못 써 전수
+    # 스캔한다. sent_on 은 'YYYY-MM-DDTHH:MM:SS' ISO 라 date 비교는 [일, 다음날)
+    # 범위와 문자열상 등가 — 결과 동일하되 인덱스 범위 스캔으로 바뀐다.
+    # 상한 date(?, '+1 day') 는 상수(바인드값)라 행마다가 아니라 1회 평가.
     def sent_on_date(self, date_iso: str) -> list[sqlite3.Row]:
         return self.db.execute(
-            """SELECT * FROM messages WHERE is_sent=1 AND date(sent_on)=?
+            """SELECT * FROM messages WHERE is_sent=1
+               AND sent_on >= ? AND sent_on < date(?, '+1 day')
                ORDER BY sent_on""",
-            (date_iso,),
+            (date_iso, date_iso),
         ).fetchall()
 
     def received_on_date(self, date_iso: str) -> list[sqlite3.Row]:
         return self.db.execute(
-            """SELECT * FROM messages WHERE is_sent=0 AND date(sent_on)=?
+            """SELECT * FROM messages WHERE is_sent=0
+               AND sent_on >= ? AND sent_on < date(?, '+1 day')
                ORDER BY sent_on""",
-            (date_iso,),
+            (date_iso, date_iso),
         ).fetchall()
 
     def thread_messages(self, thread_id: int) -> list[sqlite3.Row]:
@@ -661,16 +675,18 @@ class Store:
 
     def threads_active_on(self, date_iso: str) -> list[int]:
         rows = self.db.execute(
-            "SELECT DISTINCT thread_id FROM messages WHERE date(sent_on)=?",
-            (date_iso,),
+            "SELECT DISTINCT thread_id FROM messages "
+            "WHERE sent_on >= ? AND sent_on < date(?, '+1 day')",
+            (date_iso, date_iso),
         ).fetchall()
         return [r["thread_id"] for r in rows]
 
     def threads_active_between(self, start_iso: str, end_iso: str) -> list[int]:
-        """[start, end] (양끝 포함) 활동 스레드 — 요약 '마지막 실행 이후' 창용."""
+        """[start, end] (양끝 포함) 활동 스레드 — 요약 '마지막 실행 이후' 창용.
+        date(sent_on)<=end 은 sent_on < (end+1일) 과 등가(인덱스 범위 스캔)."""
         rows = self.db.execute(
             "SELECT DISTINCT thread_id FROM messages "
-            "WHERE date(sent_on) >= ? AND date(sent_on) <= ?",
+            "WHERE sent_on >= ? AND sent_on < date(?, '+1 day')",
             (start_iso, end_iso),
         ).fetchall()
         return [r["thread_id"] for r in rows]
@@ -701,7 +717,10 @@ class Store:
         ).fetchone()
 
     def recent(self, limit: int = 30, today_only: bool = False) -> list[sqlite3.Row]:
-        where = "WHERE date(sent_on)=date('now')" if today_only else ""
+        # date(sent_on)=date('now') 와 등가지만 컬럼을 함수로 안 감싸 인덱스 범위 스캔.
+        # 양변 모두 date('now')(UTC) 기준이라 결과 동일.
+        where = ("WHERE sent_on >= date('now') AND sent_on < date('now', '+1 day')"
+                 if today_only else "")
         return self.db.execute(
             f"SELECT * FROM messages {where} ORDER BY sent_on DESC LIMIT ?",
             (limit,),
