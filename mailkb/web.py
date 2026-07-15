@@ -1352,10 +1352,10 @@ _APP_JS = r"""
         if (tmp.querySelector("[data-sync-running]")) {
           setTimeout(watchSyncToast, 3000); return;   /* 아직 진행 중 */
         }
+        /* 자동 주기 동기화는 '신규>0' 일 때만 토스트 — 매 주기 '신규 0' 알림 방지(구 동작). */
         var m = tmp.querySelector("[data-sync-msg]");
-        if (m && m.getAttribute("data-sync-msg")) {
-          toast(m.getAttribute("data-sync-msg")); checkFresh();
-        }
+        var n = m ? (parseInt(m.getAttribute("data-sync-n"), 10) || 0) : 0;
+        if (n > 0) { toast("새 메일 " + n + "통"); checkFresh(); }
       })
       .catch(function () {});
   }
@@ -1692,7 +1692,7 @@ def render_sync_status(store=None) -> tuple:
     """(inner, running) — 동기화 진행/완료. 완료 msg 는 data-sync-msg 로 실어
     app.js 폴링이 토스트로도 띄운다(수동·자동 공통)."""
     with _sync_lock:
-        running, msg = _sync_job["running"], _sync_job["msg"]
+        running, msg, n = _sync_job["running"], _sync_job["msg"], _sync_job["n"]
     if running:
         return ("<div data-sync-running='1' hidden></div>"
                 "<h1>메일 동기화 중…</h1>"
@@ -1700,7 +1700,10 @@ def render_sync_status(store=None) -> tuple:
                 "<div class='aiwaitmsg'>Outlook 에서 새 메일을 가져오는 중</div>"
                 "<div class='aiwaitsub'>받은편지함·보낸편지함을 훑고 색인합니다. "
                 "완료되면 자동으로 알려드려요.</div></div></div>", True)
-    marker = f"<div data-sync-msg='{esc(msg)}' hidden></div>" if msg else ""
+    # data-sync-n: autosync 감시(watchSyncToast)가 신규>0 일 때만 토스트하도록 통수도 실음
+    # (수동 /sync 결과 화면은 전체 msg 표시, 자동 주기 토스트는 신규 있을 때만 — 구 동작 유지).
+    marker = (f"<div data-sync-msg='{esc(msg)}' data-sync-n='{n}' hidden></div>"
+              if msg else "")
     body = f"<div class='flash'>{esc(msg or '동기화 완료')}</div>" if msg else ""
     return (marker + "<h1>메일 동기화</h1>" + body +
             "<p><a href='/'>→ 홈</a> · <a href='/mail'>메일함 보기</a></p>", False)
@@ -2216,9 +2219,14 @@ def render_threads(store, cfg, offset: int = 0, flt: str = "") -> str:
         "JOIN threads t ON t.id=m.thread_id WHERE m.is_sent=0 "
         "AND (m.read_at IS NULL OR m.read_at='') AND (t.hidden IS NULL OR t.hidden=0)" + nx
     ).fetchone()["c"]
+    # 응답대기·기한 뱃지는 리스트와 동일 집합이어야 한다: await/dead ∩ 비노이즈 ∩ 비숨김.
+    # hidden 은 (휘발성이라) 신호 캐시에서 빠져 있으므로 여기서 라이브로 제외 — 리스트
+    # cond 의 (hidden=0) 과 일치. 숨김 스레드로 뱃지가 부풀지 않게.
+    hidden_ids = {row["id"] for row in
+                  store.db.execute("SELECT id FROM threads WHERE hidden=1")}
     counts = {"": agg["total"], "unread": n_unread,
-              "awaiting": len(await_ids - noise_ids),
-              "deadline": len(dead_ids - noise_ids),
+              "awaiting": len(await_ids - noise_ids - hidden_ids),
+              "deadline": len(dead_ids - noise_ids - hidden_ids),
               "flagged": agg["flag"], "hidden": agg["hid"]}
     body = "".join(items) or "<p class='empty'>스레드 없음</p>"
     return ("<h1>스레드</h1>"

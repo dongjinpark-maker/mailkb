@@ -3142,6 +3142,21 @@ class TestWeb(unittest.TestCase):
         self.assertIn("data-sync-running", inner)      # 폴링 훅 마커
         self.assertIn("가져오는 중", inner)
 
+    def test_autosync_toast_only_when_new_mail(self):
+        # 회귀 가드: 자동 주기 동기화는 '신규>0' 일 때만 토스트(구 동작). render 가
+        # 통수(data-sync-n)를 실어 watchSyncToast 가 0 이면 조용하도록.
+        self.web._sync_job.update(running=False, msg="동기화(fake): 신규 0 · 중복 5", n=0)
+        inner, _ = self.web.render_sync_status()
+        self.assertIn("data-sync-n='0'", inner)        # 신규 0 → 통수 0 노출(토스트 안 함)
+        self.web._sync_job.update(running=False, msg="동기화(fake): 신규 3 · 중복 5", n=3)
+        inner, _ = self.web.render_sync_status()
+        self.assertIn("data-sync-n='3'", inner)        # 신규 3 → 통수 3 → '새 메일 3통'
+        self.web._sync_job.update(running=False, msg="", n=0)   # 정리
+        # app.js: watchSyncToast 가 통수 게이트 + 구 문구('새 메일 N통')를 갖는지
+        js = self.web._APP_JS
+        self.assertIn("data-sync-n", js)
+        self.assertIn('"새 메일 "', js)
+
     def test_attach_button_only_with_attachment(self):
         self.store.ingest([MailRecord(
             message_id="<at@t>", subject="첨부건", sender_name="kim",
@@ -3269,10 +3284,20 @@ class TestWeb(unittest.TestCase):
         full = self.web.render_mail(self.store, self.cfg)
         self.assertIn("↩ 내 응답 대기 1", full)
         self.assertIn("⏰ 기한/요청 1", full)
-        # 숨기면 신호 필터에서도 빠짐
+        thr = self.web.render_threads(self.store, self.cfg)   # 스레드 뱃지도 1/1
+        self.assertIn("↩ 내 응답 대기 1", thr)
+        self.assertIn("⏰ 기한/요청 1", thr)
+        # 숨기면 신호 필터에서도 빠짐 — 리스트뿐 아니라 뱃지 카운트에서도(회귀 가드).
+        # 신호 캐시는 hidden 을 제외하지 않으므로 카운트 지점의 라이브 제외가 필요하다.
         self.store.hide_thread(dl_tid, True)
         self.assertNotIn("기한 있는 요청",
                          self.web.render_threads(self.store, self.cfg, flt="awaiting"))
+        thr2 = self.web.render_threads(self.store, self.cfg)
+        self.assertIn("↩ 내 응답 대기 0", thr2)       # 숨김 스레드가 뱃지를 부풀리지 않음
+        self.assertIn("⏰ 기한/요청 0", thr2)
+        full2 = self.web.render_mail(self.store, self.cfg)
+        self.assertIn("↩ 내 응답 대기 0", full2)       # 메일함 뱃지도 0(원래 정상, 확인)
+        self.assertIn("⏰ 기한/요청 0", full2)
 
     # ─────────────────── 숨기기 (기능 2) — 추적·메일함·기본목록에서 제외
     def test_hide_excludes_from_queue_mail_and_threads(self):
