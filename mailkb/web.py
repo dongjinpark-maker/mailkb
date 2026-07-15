@@ -259,7 +259,11 @@ details.catfold { margin: 8px 0 4px; background: var(--fold); border: 1px solid 
 .lensrow a b { color: var(--ink-2); }
 .analysis { background: var(--analysis-bg); border-radius: 8px; padding: 12px 14px; margin: 10px 0; }
 .analysis .sig { color: var(--warn); } .analysis pre { margin: 4px 0; white-space: pre-wrap; }
-.msg { border: 1px solid var(--border); border-radius: 8px; margin: 12px 0; overflow: hidden; }
+.msg { border: 1px solid var(--border); border-radius: 8px; margin: 12px 0; overflow: hidden;
+    scroll-margin-top: 10px; transition: box-shadow .5s ease; }
+/* 검색·목록에서 연 메일을 잠깐 강조(2.8s 후 JS 가 클래스 제거 → 트랜지션으로 페이드) */
+.msg.focusmsg { box-shadow: 0 0 0 2px var(--accent); }
+.msg.focusmsg .mhead { background: var(--sel-bg); }
 .msg .mhead { background: var(--surface-3); padding: 6px 12px; font-size: 13px; color: var(--ink-2);
     display: flex; align-items: baseline; gap: 10px; }
 .msg .mhead.sent { background: var(--ok-bg); }
@@ -895,6 +899,7 @@ def format_detail(store, thread_id: int) -> dict:
         vis_att = _visible_attach(m["attach_names"])
         att = f"  📎{vis_att}" if vis_att else ""
         timeline.append({
+            "id": m["id"],                # 검색·목록에서 이 메일로 스크롤(#msg-{id})
             "sent_on": m["sent_on"][:16],
             "is_sent": bool(m["is_sent"]),
             "sender": m["sender_name"] or m["sender_addr"],
@@ -1180,13 +1185,26 @@ _APP_JS = r"""
     hookMore();
   }
 
+  /* 검색·목록에서 연 메일로 스크롤 + 잠깐 강조. inject 가 방금 scrollTop=0 으로
+     맨 위(역순이라 최신)로 리셋하므로 그 뒤에 부른다. id 는 메시지 id(정수). */
+  function focusMsg(pane, id) {
+    if (!id || !/^[0-9]+$/.test("" + id)) return;
+    var host = paneEl(pane), el = document.getElementById("msg-" + id);
+    if (!el || (host && !host.contains(el))) return;
+    el.classList.add("focusmsg");
+    if (el.scrollIntoView) el.scrollIntoView({ block: "start" });
+    setTimeout(function () { el.classList.remove("focusmsg"); }, 2800);
+  }
+
   function markSelected() {
     var m = (location.pathname.match(/^\/thread\/(\d+)/) || [])[1];
     var links = left.getElementsByTagName("a");
     for (var i = 0; i < links.length; i++) {
       var row = links[i].closest(".item, .digest, .mrow");
       if (!row) continue;
-      if (m && links[i].getAttribute("href") === "/thread/" + m) {
+      /* href 에 ?focus=… 가 붙을 수 있으므로 경로만 비교(쿼리 무시) */
+      var hp = (links[i].getAttribute("href") || "").split("?")[0];
+      if (m && hp === "/thread/" + m) {
         row.classList.add("selected");
         if (row.classList.contains("mrow")) row.classList.add("read");  /* 열람=읽음: 목록 볼드 즉시 해제 */
       } else {
@@ -1369,12 +1387,14 @@ _APP_JS = r"""
         return res.text().then(function (html) {
           var fin = new URL(res.url, location.origin);
           var msg = fin.searchParams.get("msg");
+          var focus = fin.searchParams.get("focus");   /* 검색·목록에서 이 메일로 스크롤 */
           fin.searchParams.delete("frag");
           fin.searchParams.delete("msg");
           var p = pane || paneFor(fin.pathname);
           var clean = fin.pathname + (fin.search || "");
           inject(p, html, push === false ? null : clean);
           if (msg) toast(msg);
+          if (focus) focusMsg(p, focus);
         });
       });
   }
@@ -1579,6 +1599,8 @@ _APP_JS = r"""
   hookAiPolling(left);
   hookSyncPolling(right);
   hookMore();
+  /* 전체 로드로 /thread/…?focus=N 을 열었을 때(새로고침·직접 URL)도 그 메일로 스크롤 */
+  focusMsg("right", new URLSearchParams(location.search).get("focus"));
 })();
 """
 
@@ -2093,7 +2115,7 @@ def render_mail(store, cfg, offset: int = 0, flt: str = "") -> str:
         badge = "🚩 " if r["flagged"] else ""
         cls = "mrow read" if r["read_at"] else "mrow"   # 읽음=제목 볼드 해제
         items.append(
-            f"<a class='{cls}' href='/thread/{r['thread_id']}'>"
+            f"<a class='{cls}' href='/thread/{r['thread_id']}?focus={r['id']}'>"
             f"<span class='mtop'><span class='mfrom'>{esc(badge)}{esc(r['subject'])}</span>"
             f"<span class='mdate'>{esc(_fmt_when(r['sent_on']))}</span></span>"
             f"<span class='msubj'>{esc(r['sender_name'] or r['sender_addr'])}</span></a>")
@@ -2319,7 +2341,7 @@ def render_thread(store, tid: int) -> str:
                    f"title='이 사람과 주고받은 메일'>{esc(blk['sender'])}</a>")
         else:
             who = esc(blk["sender"])
-        out.append("<div class='msg'>")
+        out.append(f"<div class='msg' id='msg-{blk['id']}'>")
         out.append(
             f"<div class='mhead{sent}'>"
             f"<span class='mh-who'>{arrow} {who}{att}</span>"
@@ -2625,7 +2647,7 @@ def render_person(store, cfg, addr: str) -> str:
             sub_who = r["sender_name"] or r["sender_addr"]
             subj = r["subject"] or "(제목 없음)"
         items.append(
-            f"<a class='{cls}' href='/thread/{r['thread_id']}'>"
+            f"<a class='{cls}' href='/thread/{r['thread_id']}?focus={r['id']}'>"
             f"<span class='mtop'><span class='mfrom'>{esc(subj)}</span>"
             f"<span class='mdate'>{esc(_fmt_when(r['sent_on']))}</span></span>"
             f"<span class='msubj'>{esc(sub_who)}</span></a>")
@@ -2713,7 +2735,7 @@ def _ai_card(it: dict) -> str:
     reason = (it.get("reason") or "").strip()
     rhtml = f"<p class='aireason'>{esc(reason)}</p>" if reason else ""
     return (
-        f"<li class='aicard'><a class='aititle' href='/thread/{it['thread_id']}'>"
+        f"<li class='aicard'><a class='aititle' href='/thread/{it['thread_id']}?focus={it['id']}'>"
         f"{esc(it['subject'] or '(제목 없음)')}</a>"
         f"<div class='aimeta'>{arrow}{esc(it.get('sender') or '')} · "
         f"{esc(it.get('date') or '')}</div>{rhtml}</li>")
@@ -2943,7 +2965,7 @@ def render_search(store, cfg, qs, today: str) -> str:
             snip = (f"<div class='snip'>{_snip_html(r['snippet'])}</div>"
                     if r["snippet"] else "")
             out.append(
-                f"<div class='item'><a href='/thread/{r['thread_id']}'>"
+                f"<div class='item'><a href='/thread/{r['thread_id']}?focus={r['id']}'>"
                 f"{esc(r['subject'])}</a> <span class='who'>· {arrow} "
                 f"{esc(r['sender_name'])}</span> "
                 f"<span class='day'>{esc(r['sent_on'][:16])}</span>{snip}</div>")

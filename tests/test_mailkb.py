@@ -2532,6 +2532,42 @@ class TestWeb(unittest.TestCase):
         self.assertIn("data-blocked-src", out)         # 원격 이미지 차단
         self.assertIn("일부 이미지를 표시할 수 없습니다", out)   # 안내 배너
 
+    def test_search_focuses_matched_message_not_first(self):
+        # 여러 메일 스레드에서 검색어가 '뒷' 메일에만 있으면, 결과 링크가 그 메일로
+        # focus 돼야 한다(스레드 첫 메일이 아니라). ?focus={message_id} + #msg-{id} 앵커.
+        self.store.ingest([
+            MailRecord(message_id="<fa@t>", subject="분기 계획",
+                       sender_name="kim", sender_addr="kim@corp.example",
+                       to=[ME], sent_on="2026-07-06T09:00:00",
+                       body_text="분기 계획 회의 일정 공유합니다."),
+            MailRecord(message_id="<fb@t>", subject="RE: 분기 계획",
+                       sender_name="kim", sender_addr="kim@corp.example",
+                       to=[ME], sent_on="2026-07-06T15:00:00",
+                       body_text="추가로 예산초과분 검토가 필요합니다.",
+                       in_reply_to="<fa@t>", references=["<fa@t>"]),
+        ])
+        first = self.store.db.execute(
+            "SELECT id, thread_id FROM messages WHERE message_id='<fa@t>'").fetchone()
+        second = self.store.db.execute(
+            "SELECT id, thread_id FROM messages WHERE message_id='<fb@t>'").fetchone()
+        self.assertEqual(first["thread_id"], second["thread_id"])   # 같은 스레드
+        # 스레드 상세: 두 메일 모두 앵커 id 를 가진다
+        detail = self.web.render_thread(self.store, first["thread_id"])
+        self.assertIn(f"id='msg-{first['id']}'", detail)
+        self.assertIn(f"id='msg-{second['id']}'", detail)
+        # '예산초과분' 은 둘째 메일에만 → 링크가 둘째 메일로 focus
+        res = self.web.render_search(self.store, self.cfg, {"q": ["예산초과분"]}, "2026-07-13")
+        self.assertIn(f"/thread/{second['thread_id']}?focus={second['id']}", res)
+        self.assertNotIn(f"?focus={first['id']}", res)     # 첫 메일로 가지 않음
+        # app.js: focusMsg 정의 + load/부트스트랩 배선
+        js = self.web._APP_JS
+        self.assertIn("function focusMsg", js)
+        self.assertIn("if (focus) focusMsg(p, focus);", js)      # SPA 이동
+        self.assertIn('focusMsg("right", new URLSearchParams', js)  # 전체 로드
+        # markSelected 는 href 에 ?focus=… 가 붙어도 경로만 비교해야 목록 '선택'
+        # 강조가 유지된다(정확 비교면 focus 링크가 안 맞아 강조가 사라짐).
+        self.assertIn('.split("?")[0]', js)
+
     def test_thread_markdown_toggle_for_text_mail(self):
         # HTML 없는 메일이 마크다운으로 보이면 서식(md-rich) 기본 +
         # '텍스트 보기' 토글(md-raw — 저장 텍스트 검증용)
