@@ -1478,71 +1478,14 @@ def _cand(r) -> dict:
     }
 
 
-AISEARCH_RANK = """당신은 메일 검색 결과 심사관이다. 사용자가 찾는 메일이 아래 후보 중 어느 것인지,
-제목·발신·날짜·발췌(스니펫)만 보고 판단한다.
+AISEARCH_CONFIRM = """당신은 메일 검색 심사관이다. 아래는 엔진이 1차로 추린 후보들의 **본문**이다.
+사용자가 찾는 바로 그 메일이 이 중 어느 것인지 본문까지 읽고 순위를 매겨 확정한다.
 
 [규칙]
-- '찾는 메일일 가능성'이 높은 순으로 정렬.
-- 명백히 무관한 후보는 제외(relevant=false 로 두거나 목록에서 빼라).
-- 근거 없는 확신 금지. 발췌에 단서가 약하면 relevant 를 신중히.
-- reason 은 한국어 한 줄(왜 이게 맞을 것 같은지).
-
-[출력] JSON 객체 하나만. 코드펜스·다른 말 금지:
-{{"ranked": [{{"id": 정수, "reason": "...", "relevant": true}}], "note": "전반 판단 한 줄"}}
-
-[사용자가 찾는 것]
-{query}
-
-[후보 목록]
-{candidates}
-"""
-
-
-def ai_rank_candidates(cfg: Config, query: str, candidates: list,
-                       backend: str | None = None, meter: dict | None = None) -> dict:
-    """후보를 스니펫 수준으로 재순위. {ranked:[{id,reason,relevant}], note} 반환."""
-    if not candidates:
-        return {"ranked": [], "note": ""}
-    lines = [
-        f'- id={c["id"]} | {c["date"]} | {c["sender"]} | 제목: {c["subject"]} '
-        f'| 발췌: {c["snippet"] or "(없음)"}'
-        for c in candidates
-    ]
-    prompt = AISEARCH_RANK.format(query=query.strip(), candidates="\n".join(lines))
-    out = _ai_search_run(cfg, prompt, backend or cfg.ai_search_backend, 150, meter)
-    return _clean_ranked(_parse_json_obj(out) or {}, {c["id"] for c in candidates})
-
-
-def _clean_ranked(data: dict, valid_ids: set) -> dict:
-    """모델 랭킹 출력 정화 — 유효 id·필드만, 순서 보존."""
-    ranked = data.get("ranked") if isinstance(data.get("ranked"), list) else []
-    clean = []
-    seen = set()
-    for r in ranked:
-        if not isinstance(r, dict):
-            continue
-        try:
-            rid = int(r.get("id"))
-        except (TypeError, ValueError):
-            continue
-        if rid not in valid_ids or rid in seen:
-            continue
-        seen.add(rid)
-        clean.append({
-            "id": rid,
-            "reason": str(r.get("reason") or "").strip(),
-            "relevant": bool(r.get("relevant", True)),
-        })
-    return {"ranked": clean, "note": str(data.get("note") or "").strip()}
-
-
-AISEARCH_CONFIRM = """당신은 메일 검색 최종 확정자다. 아래는 유력 후보들의 **본문 전체**다.
-사용자가 찾는 바로 그 메일인지 본문까지 읽고 확정한다.
-
-[규칙]
-- 실제로 찾는 메일에 부합하는 것만 남기고(match=true), 본문을 보니 무관하면 match=false.
+- 여러 후보 중 실제로 찾는 메일에 부합하는 것만 남긴다(match=true). 본문을 보니
+  무관하면 match=false(=목록에서 뺀다).
 - 부합 정도가 높은 순으로 정렬.
-- reason 은 한국어 한 줄 — 본문의 어떤 대목이 근거인지.
+- reason 은 한국어 한 줄 — 본문의 어떤 대목이 근거인지 구체적으로.
 - 답을 지어내지 말 것. 본문에 근거가 없으면 match=false.
 
 [출력] JSON 객체 하나만. 코드펜스·다른 말 금지:
@@ -1592,18 +1535,56 @@ def _normalize_q(q: str) -> str:
     return " ".join((q or "").lower().split())
 
 
-# 심층읽기(iv-lite) 대상 상위 건수 — 비용 여유로 5건 (사용자 확정 2026-07-15)
-AISEARCH_DEEP_TOP = 5
+# 본문까지 읽어 심사할 엔진 상위 후보 수. 재순위(스니펫)와 확정(본문)을 한 콜로
+# 합치면서(방법 1) 심층읽기 대상을 5→12로 넓혔다 — 정독 범위가 늘어 품질은 강화,
+# AI 호출은 3→2회로 감소. reason 은 이 최종 심사에서만 생성한다(방법 4).
+AISEARCH_JUDGE_POOL = 12
+
+
+def _judge_bodies(store: Store, cfg: Config, query: str, rows: list,
+                  bk: str, meter: dict) -> tuple:
+    """엔진 상위 후보의 본문을 한 번에 읽어 순위+확정. (ordered[], pool_size) 반환.
+
+    ordered = 부합 판정된 후보만, 심사 순서대로. 각 원소 = _cand + reason.
+    """
+    pool = [_cand(r) for r in rows[:AISEARCH_JUDGE_POOL]]
+    if not pool:
+        return [], 0
+    bodies = {m["id"]: m for m in store.messages_by_ids([c["id"] for c in pool])}
+    judge_in = []
+    for c in pool:
+        m = bodies.get(c["id"])
+        body = strip_preserved(m["new_content"] or "")[:1100] if m else ""
+        judge_in.append({**c, "body": body})
+    conf = ai_confirm_top(cfg, query, judge_in, bk, meter)
+    by_id = {c["id"]: c for c in pool}
+    ordered = [dict(by_id[r["id"]], reason=r["reason"])
+               for r in conf["ranked"] if r["id"] in by_id and r["match"]]
+    return ordered, len(pool)
 
 
 def ai_search(store: Store, cfg: Config, query: str, today: str,
               backend: str | None = None, top: int = 8,
-              use_cache: bool = True) -> dict:
-    """AI 검색 오케스트레이터 — 번역→검색→재순위(+자기교정)→심층읽기(iv-lite).
+              use_cache: bool = True, progress=None) -> dict:
+    """AI 검색 오케스트레이터 — 번역→검색→본문심사(+자기교정). AI 호출 보통 2회.
+
+    번역으로 DSL 을 얻고 엔진으로 후보를 좁힌 뒤, 상위 후보를 **본문까지** 한 콜에
+    읽어 순위·확정·이유를 한 번에 낸다(재순위+확정 통합, 방법 1·4).
+
+    progress(stage, payload) — 선택 콜백. stage: 'translate' | 'search' | 'prelim'
+    (payload=엔진 잠정 결과) | 'judge' | 'done'(payload=최종 결과). 백그라운드
+    실행 시 단계 스트리밍·점진 결과(방법 7·8)에 쓴다. 예외는 삼켜 파이프라인 보호.
 
     반환(렌더·캐시용): {query, dsl, note, expansions, items[], others[],
-    candidate_count, backend, from_cache}. items 각 원소는 _cand + reason.
+    candidate_count, backend, cost, from_cache}. items 각 원소는 _cand + reason.
     """
+    def _emit(stage, payload=None):
+        if progress:
+            try:
+                progress(stage, payload)
+            except Exception:
+                pass
+
     norm = _normalize_q(query)
     if use_cache:
         cached = store.ai_search_get(norm)
@@ -1611,6 +1592,7 @@ def ai_search(store: Store, cfg: Config, query: str, today: str,
             try:
                 res = json.loads(cached["result_json"])
                 res["from_cache"] = True
+                _emit("done", res)
                 return res
             except ValueError:
                 pass
@@ -1618,58 +1600,50 @@ def ai_search(store: Store, cfg: Config, query: str, today: str,
     bk = backend or cfg.ai_search_backend
     meter = {"usd": 0.0, "in": 0, "out": 0, "calls": 0}      # 실제 비용·토큰 누적
     t0 = time.time()
+    _emit("translate")
     tr = ai_translate_query(cfg, query, today, bk, meter)
     dsl = tr["dsl"]
+    _emit("search")
     rows = store.search(dsl, limit=30)
     if len(rows) < 3 and tr["fallback_dsl"]:                 # 엔진만 완화(AI 추가호출 없음)
         seen = {r["id"] for r in rows}
         rows += [r for r in store.search(tr["fallback_dsl"], limit=30)
                  if r["id"] not in seen]
-    cands = [_cand(r) for r in rows[:30]]
-    rank = ai_rank_candidates(cfg, query, cands, bk, meter)
-    relevant = [r for r in rank["ranked"] if r["relevant"]]
 
-    # 자기교정(iii): 관련 후보가 하나도 없으면 재번역·재검색 1회
-    if not relevant:
+    # 점진 결과(방법 8): 본문 심사 전, 엔진 스니펫 순위를 잠정 결과로 먼저 흘린다.
+    prelim = [dict(_cand(r), reason="") for r in rows[:top]]
+    _emit("prelim", {
+        "query": query, "dsl": dsl, "note": tr.get("note", ""),
+        "expansions": tr.get("expansions", []), "items": prelim, "others": [],
+        "candidate_count": min(len(rows), AISEARCH_JUDGE_POOL),
+        "backend": bk, "preliminary": True,
+    })
+
+    _emit("judge")
+    ordered, ncand = _judge_bodies(store, cfg, query, rows, bk, meter)
+
+    # 자기교정: 확정 결과가 하나도 없으면 재번역·재검색·재심사 1회
+    if not ordered:
         hint = query + "  (직전 검색 결과가 부실했다. 다른 핵심어·유의어로 더 넓게)"
         tr2 = ai_translate_query(cfg, hint, today, bk, meter)
         if tr2["dsl"] and tr2["dsl"] != dsl:
             rows2 = store.search(tr2["dsl"], limit=30)
             if rows2:
                 dsl, tr = tr2["dsl"], {**tr, "note": tr2["note"] or tr["note"]}
-                cands = [_cand(r) for r in rows2[:30]]
-                rank = ai_rank_candidates(cfg, query, cands, bk, meter)
-
-    by_id = {c["id"]: c for c in cands}
-    ordered = [dict(by_id[r["id"]], reason=r["reason"])
-               for r in rank["ranked"] if r["id"] in by_id]
-
-    # 심층읽기(iv-lite): 상위 N건 본문까지 읽어 확정·재정렬
-    head = ordered[:AISEARCH_DEEP_TOP]
-    if head:
-        bodies = {m["id"]: m for m in store.messages_by_ids([c["id"] for c in head])}
-        deep_in = []
-        for c in head:
-            m = bodies.get(c["id"])
-            body = strip_preserved(m["new_content"] or "")[:1500] if m else ""
-            deep_in.append({**c, "body": body})
-        conf = ai_confirm_top(cfg, query, deep_in, bk, meter)
-        if conf["ranked"]:
-            cmap = {c["id"]: c for c in head}
-            confirmed = [dict(cmap[r["id"]], reason=r["reason"] or cmap[r["id"]].get("reason", ""))
-                         for r in conf["ranked"] if r["id"] in cmap and r["match"]]
-            ordered = confirmed + ordered[AISEARCH_DEEP_TOP:]
+                _emit("judge")
+                ordered, ncand = _judge_bodies(store, cfg, query, rows2, bk, meter)
 
     meter["seconds"] = round(time.time() - t0, 1)           # 실제 소요 시간
     result = {
         "query": query, "dsl": dsl, "note": tr.get("note", ""),
         "expansions": tr.get("expansions", []),
         "items": ordered[:top], "others": ordered[top:top + 10],
-        "candidate_count": len(cands), "backend": bk, "cost": meter,
+        "candidate_count": ncand, "backend": bk, "cost": meter,
         "from_cache": False,
     }
     # 캐시는 항상 갱신 — '새로 찾기'(use_cache=False)로 재실행한 결과도 저장해
     # 다음 조회부터 최신 결과가 나오게 한다(읽기만 use_cache 로 우회).
     store.ai_search_put(norm, query, dsl,
                         json.dumps(result, ensure_ascii=False), bk)
+    _emit("done", result)
     return result

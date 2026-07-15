@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import html as _html
+import json
 import re
 import threading
 import urllib.parse
@@ -29,6 +30,13 @@ from .store import Store, image_cutoff_for
 # step: 진행 단계(1~total, 0=미상/비-AI) — 대기 화면 프로그레스 바 재료
 _review_job = {"running": False, "msg": "", "step": 0, "total": 5}
 _review_lock = threading.Lock()
+
+# AI 검색 백그라운드 잡(단일) — 번역·본문심사에 수십 초 걸려 요청 스레드에서 돌리면
+# 서버(단일 스레드)가 그동안 멈춘다. 별 스레드로 돌리고 /aisearch/status 폴링으로
+# 단계(방법 7)·잠정 결과(방법 8)를 흘린다. prelim=엔진 1차 후보, result=최종.
+_aisearch_job = {"running": False, "stage": "", "query": "", "fresh": False,
+                 "result": None, "error": "", "prelim": None}
+_aisearch_lock = threading.Lock()
 
 
 def _q(s: str) -> str:
@@ -393,7 +401,13 @@ details.adv input[type=text], details.adv select { padding: 4px 7px; font-size: 
     line-height: 1.55; max-width: 460px; }
 .aiwaittime { font-size: 12.5px; color: var(--muted); margin-top: 9px;
     font-variant-numeric: tabular-nums; }
+.aibar { max-width: 460px; height: 7px; background: var(--surface-3);
+    border-radius: 999px; overflow: hidden; margin: 9px 0 2px; }
+.aifill { height: 100%; background: var(--accent); border-radius: 999px;
+    transition: width .5s ease; }
 @keyframes aispin { to { transform: rotate(360deg); } }
+.aiprelim { margin: 14px 0 6px; font-size: 12.5px; }
+.aicards.prelim { opacity: .62; }        /* 잠정 결과 — 본문 확정 전이라 흐리게 */
 .empty { color: var(--ink-3); padding: 20px 0; }
 .digest { padding: 4px 10px; margin: 3px 0; border-left: 2px solid var(--border);
     background: var(--surface); font-size: 14px; }
@@ -1155,6 +1169,7 @@ _APP_JS = r"""
     markSelected();
     markNav();
     hookReviewPolling(el);
+    hookAiPolling(el);
     hookMore();
   }
 
@@ -1260,6 +1275,37 @@ _APP_JS = r"""
     }, 2000);
   }
 
+  /* ---- AI 검색 백그라운드 잡 폴링 (좌측 패널) ----
+     진행 중엔 단계 바(.aifill·#ai-stage)와 잠정 결과(#ai-prelim)만 패치해
+     스피너·경과 카운터가 끊기지 않게 하고, 완료/에러 응답이 오면 전체 교체한다.
+     경과 카운터(#aielapsed)는 aibtn 클릭 핸들러가 건 타이머가 id 조회로 계속 갱신. */
+  function hookAiPolling(root) {
+    if (!root.querySelector("[data-aisearch-running]")) return;
+    setTimeout(function () {
+      var u = new URL("/aisearch/status", location.origin);
+      u.searchParams.set("frag", "1");
+      fetch(u.toString(), { headers: { "X-Requested-With": "fetch" } })
+        .then(function (r) { return r.text(); })
+        .then(function (html) {
+          if (!left.querySelector("[data-aisearch-running]")) return; /* 화면 전환됨 */
+          var tmp = document.createElement("div");
+          tmp.innerHTML = html;
+          if (!tmp.querySelector("[data-aisearch-running]")) {
+            inject("left", html, null);             /* 완료·에러 → 결과로 교체 */
+            return;
+          }
+          var nf = tmp.querySelector(".aifill"), of = left.querySelector(".aifill");
+          if (nf && of) { of.className = nf.className; of.style.width = nf.style.width; }
+          var ns = tmp.querySelector("#ai-stage"), os = left.querySelector("#ai-stage");
+          if (ns && os) os.textContent = ns.textContent;
+          var np = tmp.querySelector("#ai-prelim"), op = left.querySelector("#ai-prelim");
+          if (np && op && np.innerHTML !== op.innerHTML) op.innerHTML = np.innerHTML;
+          hookAiPolling(left);                        /* 다음 폴링 예약 */
+        })
+        .catch(function () { hookAiPolling(left); });
+    }, 1500);
+  }
+
   /* ---- fragment 로드 ---- */
   function load(url, pane, push) {
     var u = new URL(url, location.origin);
@@ -1292,15 +1338,17 @@ _APP_JS = r"""
     e.preventDefault();
     if (a.classList && a.classList.contains("mrow")) a.classList.add("read");  /* 낙관적: 클릭 즉시 볼드 해제 */
     if (a.classList && (a.classList.contains("aibtn")
-        || a.classList.contains("airefresh"))) {          /* AI 검색은 1~3분 — 진행 표시 */
+        || a.classList.contains("airefresh"))) {   /* AI 검색 — 즉시 진행 표시(서버 대기화면이 곧 대체) */
       var li = left.querySelector(".inner") || left;
       li.innerHTML =
-        "<div class='aiwait'><span class='spin'></span><div class='aiwaitbody'>"
+        "<div data-aisearch-running='1' hidden></div>"
+        + "<div class='aiwait'><span class='spin'></span><div class='aiwaitbody'>"
         + "<div class='aiwaitmsg'>AI가 찾고 있어요</div>"
-        + "<div class='aiwaitsub'>번역 → 검색 → 본문 확인을 차례로 거칩니다. "
-        + "정확도를 위해 <b>보통 1~3분</b> 걸려요. 창을 닫지 말고 기다려 주세요.</div>"
-        + "<div class='aiwaittime'><span id='aielapsed'>0</span>초 경과</div>"
+        + "<div class='aiwaitsub' id='ai-stage'>질문을 검색식으로 번역하는 중 · 단계 1/3</div>"
+        + "<div class='aiwaittime'><span id='aielapsed'>0</span>초 경과 · "
+        + "정확도를 위해 보통 수십 초~1분 걸려요</div>"
         + "</div></div>";
+      /* setInterval 은 매 틱 id 로 조회 — 서버 대기화면으로 DOM 이 바뀌어도 계속 갱신 */
       var t0 = Date.now(), tick = setInterval(function () {
         var el = document.getElementById("aielapsed");
         if (!el) { clearInterval(tick); return; }   /* 결과 주입되면 사라짐 → 정리 */
@@ -1474,6 +1522,7 @@ _APP_JS = r"""
   markSelected();
   markNav();
   hookReviewPolling(right);
+  hookAiPolling(left);
   hookMore();
 })();
 """
@@ -2480,6 +2529,107 @@ def _ai_card(it: dict) -> str:
         f"{esc(it.get('date') or '')}</div>{rhtml}</li>")
 
 
+# ─────────────────────────────────────────────────── AI 검색(백그라운드)
+
+# 단계 → (표시문구, 프로그레스 단계). prelim 은 검색 직후 잠정 결과를 흘리는
+# 신호라 단계는 search 와 같은 2로 둔다(본문심사에서 3으로 오른다).
+_AISEARCH_STAGE = {
+    "translate": ("질문을 검색식으로 번역하는 중", 1),
+    "search":    ("검색식으로 메일을 훑는 중", 2),
+    "prelim":    ("1차 후보를 추리는 중 — 아래 잠정 결과", 2),
+    "judge":     ("후보 본문을 읽고 확정하는 중", 3),
+}
+_AISEARCH_TOTAL = 3
+
+
+def _aisearch_progress(stage: str, payload=None) -> None:
+    """review.ai_search 의 진행 콜백 — 잡 상태에 단계·잠정 결과를 실어 폴링에 노출."""
+    with _aisearch_lock:
+        if not _aisearch_job["running"]:
+            return
+        _aisearch_job["stage"] = stage
+        if stage == "prelim" and payload:
+            _aisearch_job["prelim"] = payload
+
+
+def _run_aisearch_job(cfg, query: str, today: str, use_cache: bool) -> None:
+    try:
+        store = Store(cfg.db_path, cfg.my_addresses)
+        try:
+            res = review.ai_search(store, cfg, query, today,
+                                   use_cache=use_cache, progress=_aisearch_progress)
+        finally:
+            store.close()
+        with _aisearch_lock:
+            _aisearch_job.update(running=False, stage="done", result=res)
+    except review.AIError as e:                  # CLI 부재·타임아웃 → 일반검색 폴백
+        with _aisearch_lock:
+            _aisearch_job.update(running=False, stage="error", error=str(e)[:120])
+    except Exception as e:                        # 방어적 — 잡이 조용히 죽지 않게
+        with _aisearch_lock:
+            _aisearch_job.update(running=False, stage="error", error=repr(e)[:120])
+
+
+def _start_aisearch(cfg, query: str, today: str, use_cache: bool) -> None:
+    """AI 검색 잡 시작(단일 슬롯). 이미 실행 중이면 그대로 둔다(로컬 단일 사용자)."""
+    with _aisearch_lock:
+        if _aisearch_job["running"]:
+            return
+        _aisearch_job.update(running=True, stage="translate", query=query,
+                             fresh=not use_cache, result=None, error="", prelim=None)
+    threading.Thread(target=_run_aisearch_job,
+                     args=(cfg, query, today, use_cache), daemon=True).start()
+
+
+def _aisearch_wait_html(st: dict) -> str:
+    """진행 중 대기 화면 — 단계 바(#ai-stage·.aifill)·경과 카운터·잠정 결과(#ai-prelim).
+    app.js 폴링이 이 세 부분만 패치해 스피너·경과가 끊기지 않는다."""
+    stage = st.get("stage") or "translate"
+    label, step = _AISEARCH_STAGE.get(stage, ("준비 중", 1))
+    pct = max(8, min(100, round(step * 100 / _AISEARCH_TOTAL)))
+    q = esc(st.get("query", ""))
+    out = [
+        "<div data-aisearch-running='1' hidden></div>",
+        f"<h1>AI 검색 <span class='aiq'>· {q}</span></h1>",
+        "<div class='aiwait'><span class='spin'></span><div class='aiwaitbody'>"
+        "<div class='aiwaitmsg'>AI가 찾고 있어요</div>"
+        f"<div class='aibar'><div class='aifill' style='width:{pct}%'></div></div>"
+        f"<div class='aiwaitsub' id='ai-stage'>{esc(label)} · 단계 {step}/{_AISEARCH_TOTAL}</div>"
+        "<div class='aiwaittime'><span id='aielapsed'>0</span>초 경과 · "
+        "정확도를 위해 보통 수십 초~1분 걸려요</div>"
+        "</div></div>",
+    ]
+    prelim = st.get("prelim") or {}
+    pit = prelim.get("items") or []
+    out.append("<div id='ai-prelim'>")
+    if pit:
+        out.append("<p class='dim aiprelim'>잠정 결과 — 본문 확인 전, 검색기가 먼저 "
+                   "추린 후보입니다. 확정되면 자동으로 정리됩니다.</p>")
+        out.append("<ol class='aicards prelim'>"
+                   + "".join(_ai_card(it) for it in pit) + "</ol>")
+    out.append("</div>")
+    return "\n".join(out)
+
+
+def render_aisearch_status(store, cfg, today: str) -> tuple:
+    """(inner, running) — 폴링·전체페이지 공용. 완료면 결과, 에러면 일반검색 폴백."""
+    with _aisearch_lock:
+        st = dict(_aisearch_job)
+    if st["running"]:
+        return _aisearch_wait_html(st), True
+    if st["stage"] == "error":
+        q = st.get("query", "")
+        retry = "/search?ai=1&fresh=1&q=" + urllib.parse.quote(q)
+        banner = ("<div class='aifail'>AI 검색을 쓸 수 없습니다 — "
+                  f"{esc(st.get('error', ''))}. 일반 검색 결과를 보여드립니다. "
+                  f"<a class='airefresh' href='{esc(retry)}'>다시 시도</a></div>")
+        return banner + render_search(store, cfg, {"q": [q]}, today), False
+    if st["result"]:
+        return render_aisearch(st["result"]), False
+    return ("<h1>AI 검색</h1><p class='empty'>진행 중인 AI 검색이 없습니다. "
+            "검색 화면에서 <b>🤖 AI로 다시 찾기</b>를 눌러 주세요.</p>", False)
+
+
 def render_aisearch(result: dict) -> str:
     """AI 검색 결과 화면 — 해석 DSL(편집)·추천 카드·그 외 후보·근거 표시."""
     raw = result.get("query", "")
@@ -2533,17 +2683,30 @@ def render_aisearch(result: dict) -> str:
 
 def render_search(store, cfg, qs, today: str) -> str:
     raw, effective = _search_effective(qs, today)
-    # AI 검색 모드(?ai=1) — 흐릿한 자연어를 번역·재순위·심층읽기로. 명시적 클릭에서만.
-    ai_banner = ""
+    # AI 검색 모드(?ai=1) — 흐릿한 자연어를 번역·본문심사로. 명시적 클릭에서만.
+    # 캐시 히트는 즉시(무과금·무대기), 미스는 백그라운드 잡+폴링(서버 안 멈춤, 방법 7·8).
     if (qs.get("ai") or [""])[0] == "1" and raw:
         fresh = (qs.get("fresh") or [""])[0] == "1"   # 캐시 우회 재실행('새로 찾기')
-        try:
-            return render_aisearch(
-                review.ai_search(store, cfg, raw, today, use_cache=not fresh))
-        except review.AIError as e:
-            # AI CLI 부재·타임아웃 등 → 일반 검색으로 폴백(막다른 길 방지)
-            ai_banner = ("<div class='aifail'>AI 검색을 쓸 수 없습니다 — "
-                         f"{esc(str(e)[:90])}. 일반 검색 결과를 보여드립니다.</div>")
+        if not fresh:
+            cached = store.ai_search_get(review._normalize_q(raw))
+            if cached and cached["result_json"]:
+                try:
+                    res = json.loads(cached["result_json"])
+                    res["from_cache"] = True
+                    return render_aisearch(res)
+                except ValueError:
+                    pass
+        # 같은 질의로 방금 실패한(에러) 잡이 있으면 폴백을 그대로 보여준다 — JS-off
+        # meta refresh 가 실패한 CLI 를 2초마다 재시도하는 무한 루프를 막는다.
+        # ('다르게 다시 찾기'(fresh=1)로는 언제든 재시도 가능.)
+        if not fresh:
+            with _aisearch_lock:
+                j = dict(_aisearch_job)
+            if (not j["running"] and j["stage"] == "error"
+                    and review._normalize_q(j.get("query", "")) == review._normalize_q(raw)):
+                return render_aisearch_status(store, cfg, today)[0]
+        _start_aisearch(cfg, raw, today, use_cache=not fresh)
+        return render_aisearch_status(store, cfg, today)[0]
     # /search 페이지는 편집 가능한 검색창 + 상세 빌더를 직접 둔다(질의 다듬기용).
     # 헤더 검색창은 '새 검색' 런처(입력하면 새로 시작). 결과가 없을 땐 상세를 펼쳐
     # 필터 옵션이 처음부터 보이게 한다.
@@ -2573,8 +2736,6 @@ def render_search(store, cfg, qs, today: str) -> str:
         "<button>적용</button></form>"
         f"<datalist id='ppl'>{opts}</datalist></details>")
     out = ["<h1>검색</h1>", box, _SEARCH_HINT, adv]
-    if ai_banner:
-        out.append(ai_banner)
     if effective:
         # 흐릿한 기억이면 AI로 — 명시적 클릭에서만(과금). 일반 결과 위에 노출.
         if raw:
@@ -2903,6 +3064,9 @@ def route(store, cfg, path, qs, today):
     if path == "/review/status":
         inner, running = render_review_status(store)
         return "정리", inner, 200, "right"
+    if path == "/aisearch/status":
+        inner, running = render_aisearch_status(store, cfg, today)
+        return "AI 검색", inner, 200, "left"
     if path.startswith("/thread/"):
         try:
             tid = int(path.split("/")[2])
@@ -3021,9 +3185,10 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_html(render_stats_page(store, self.cfg, weeks))
                 return
             title, inner, code, pane = route(store, self.cfg, path, qs, today)
-            # 전체 페이지 모드의 리뷰 상태는 meta refresh 로 자동 새로고침 (JS 꺼짐 폴백)
-            refresh = 2 if (path == "/review/status"
-                            and "data-review-running" in inner and not frag) else None
+            # 전체 페이지 모드의 진행 화면(리뷰·AI검색)은 meta refresh 로 자동 새로고침
+            # (JS 꺼짐 폴백). AI 검색 대기는 /search?ai=1 자체가 이 마커를 실어 온다.
+            refresh = 2 if (not frag and (
+                "data-review-running" in inner or "data-aisearch-running" in inner)) else None
             msg = (qs.get("msg") or [""])[0]
             if msg and not frag:
                 # fragment 모드는 JS 토스트가 msg 를 표시 — flash 중복 방지

@@ -4159,28 +4159,20 @@ class TestAISearchPipeline(unittest.TestCase):
         self.assertEqual(meter["calls"], 1)
         self.assertEqual(meter["in"] + meter["out"], 120)
 
-    def test_rank_cleans_invalid_ids(self):
-        cands = [{"id": 1, "subject": "s", "sender": "a", "date": "d", "snippet": ""}]
-        out = ('{"ranked":[{"id":1,"reason":"맞음","relevant":true},'
-               '{"id":999,"reason":"무효 id"},{"id":"x"}],"note":"n"}')
-        with mock.patch.object(review, "ai_run", return_value=out):
-            r = review.ai_rank_candidates(self.cfg, "q", cands)
-        self.assertEqual([x["id"] for x in r["ranked"]], [1])   # 유효 id 만
-
     def test_orchestrator_happy_path_and_cache(self):
         rid = self.rid
+        # 번역 → 본문심사(재순위+확정 통합) = 2콜
         side = [
             f'{{"dsl": "리포트", "fallback_dsl": "", "expansions": ["report"], "note": "키워드"}}',
-            f'{{"ranked": [{{"id": {rid}, "reason": "제목에 리포트", "relevant": true}}]}}',
             f'{{"ranked": [{{"id": {rid}, "reason": "본문도 리포트", "match": true}}]}}',
         ]
         with mock.patch.object(review, "ai_run", side_effect=side) as run:
             res = review.ai_search(self.store, self.cfg, "리포트 찾아줘", "2026-07-13")
         self.assertEqual(res["dsl"], "리포트")
         self.assertEqual(res["items"][0]["id"], rid)
-        self.assertEqual(res["items"][0]["reason"], "본문도 리포트")   # 심층읽기 이유가 최종
+        self.assertEqual(res["items"][0]["reason"], "본문도 리포트")   # 본문심사 이유가 최종
         self.assertFalse(res["from_cache"])
-        self.assertEqual(run.call_count, 3)                          # 번역+재순위+확정
+        self.assertEqual(run.call_count, 2)                          # 번역+본문심사
         # 두 번째 동일 질의 → 캐시 히트, AI 미호출
         with mock.patch.object(review, "ai_run",
                                side_effect=AssertionError("AI 재호출 금지")) as run2:
@@ -4190,42 +4182,59 @@ class TestAISearchPipeline(unittest.TestCase):
 
     def test_self_correct_retries_when_nothing_relevant(self):
         rid = self.rid
-        # 1차 DSL '회의'는 후보(r2)를 잡지만 재순위가 '관련 0' 판정 → 자기교정 재검색
+        # 1차 DSL '회의'는 후보(r2)를 잡지만 본문심사가 '부합 0' 판정 → 자기교정 재검색
         side = [
             '{"dsl": "회의", "fallback_dsl": "", "note": "1차"}',
-            '{"ranked": []}',                                         # 관련 0 → 자기교정
+            '{"ranked": []}',                                         # 부합 0 → 자기교정
             '{"dsl": "리포트", "fallback_dsl": "", "note": "2차 넓힘"}',
-            f'{{"ranked": [{{"id": {rid}, "reason": "재검색 적중", "relevant": true}}]}}',
             f'{{"ranked": [{{"id": {rid}, "reason": "본문 확인", "match": true}}]}}',
         ]
         with mock.patch.object(review, "ai_run", side_effect=side) as run:
             res = review.ai_search(self.store, self.cfg, "리포트", "2026-07-13")
         self.assertEqual(res["dsl"], "리포트")                        # 자기교정 후 DSL
         self.assertEqual(res["items"][0]["id"], rid)
-        self.assertEqual(run.call_count, 5)   # 번역·재순위·재번역·재순위·확정
+        self.assertEqual(run.call_count, 4)   # 번역·본문심사·재번역·본문심사
 
     def test_write_cache_even_when_bypassing_read(self):
         # '새로 찾기'(use_cache=False)도 결과를 캐시에 저장해 다음 조회에 반영
         rid = self.rid
         side = [
             '{"dsl": "리포트", "note": "k"}',
-            f'{{"ranked": [{{"id": {rid}, "reason": "맞음", "relevant": true}}]}}',
             f'{{"ranked": [{{"id": {rid}, "reason": "본문 확인", "match": true}}]}}',
         ]
         with mock.patch.object(review, "ai_run", side_effect=side):
             review.ai_search(self.store, self.cfg, "리포트", "2026-07-13", use_cache=False)
         self.assertIsNotNone(self.store.ai_search_get("리포트"))
 
-    def test_deep_read_drops_nonmatch(self):
+    def test_body_judge_drops_nonmatch(self):
         rid = self.rid
+        # 본문심사가 match=false → 탈락. 자기교정 재번역이 같은 DSL 이면 재검색 없이 끝.
         side = [
             '{"dsl": "리포트", "note": "k"}',
-            f'{{"ranked": [{{"id": {rid}, "reason": "스니펫상 맞음", "relevant": true}}]}}',
             f'{{"ranked": [{{"id": {rid}, "reason": "본문 보니 무관", "match": false}}]}}',
+            '{"dsl": "리포트", "note": "재번역도 동일"}',
         ]
         with mock.patch.object(review, "ai_run", side_effect=side):
             res = review.ai_search(self.store, self.cfg, "리포트", "2026-07-13")
         self.assertEqual(res["items"], [])    # 본문 확인서 탈락
+
+    def test_progress_callback_streams_stages(self):
+        # 방법 7·8 훅: 단계 콜백이 순서대로 오고, prelim 에 엔진 잠정 결과가 실린다.
+        rid = self.rid
+        side = [
+            '{"dsl": "리포트", "note": "k"}',
+            f'{{"ranked": [{{"id": {rid}, "reason": "본문 확인", "match": true}}]}}',
+        ]
+        seen = []
+        with mock.patch.object(review, "ai_run", side_effect=side):
+            review.ai_search(self.store, self.cfg, "리포트", "2026-07-13",
+                             progress=lambda s, p: seen.append((s, p)))
+        stages = [s for s, _ in seen]
+        self.assertEqual(stages[:3], ["translate", "search", "prelim"])
+        self.assertEqual(stages[-1], "done")
+        prelim = [p for s, p in seen if s == "prelim"][0]
+        self.assertTrue(prelim["preliminary"])
+        self.assertEqual(prelim["items"][0]["id"], rid)     # 본문 읽기 전 잠정 후보
 
 
 class TestAISearchWeb(unittest.TestCase):
@@ -4239,6 +4248,9 @@ class TestAISearchWeb(unittest.TestCase):
             _recx("r1", "kang@corp.example", "주간 리포트", "2026-07-01T09:00:00",
                   body="가동률 리포트", sender_name="강미래 선임"),
         ])
+        # 백그라운드 잡은 모듈 전역 — 테스트 간 오염 방지로 매번 초기화
+        web._aisearch_job.update(running=False, stage="", query="", fresh=False,
+                                 result=None, error="", prelim=None)
 
     def tearDown(self):
         self.store.close()
@@ -4281,13 +4293,31 @@ class TestAISearchWeb(unittest.TestCase):
         self.assertIn("4,500토큰", html)
         self.assertIn("3회", html)
 
-    def test_render_search_ai_branch(self):
-        with mock.patch.object(review, "ai_search", return_value=self._RESULT) as m:
+    def test_render_search_ai_cache_hit_immediate(self):
+        # 캐시 히트면 잡 없이 즉시 결과(무과금·무대기)
+        import json as _json
+        norm = review._normalize_q("지난달 강미래 리포트")
+        self.store.ai_search_put(norm, "지난달 강미래 리포트", "리포트",
+                                 _json.dumps(self._RESULT), "sonnet")
+        with mock.patch.object(web, "_start_aisearch",
+                               side_effect=AssertionError("잡 시작 금지")):
             html = web.render_search(self.store, self.cfg,
                                      {"q": ["지난달 강미래 리포트"], "ai": ["1"]},
                                      "2026-07-13")
+        self.assertIn("class='aicards'", html)                  # AI 결과 화면
+        self.assertIn("제목·발신 일치", html)
+
+    def test_render_search_ai_miss_starts_job(self):
+        # 캐시 미스 → 백그라운드 잡 시작 + 대기 화면(서버 안 멈춤)
+        def fake_start(*a, **k):   # 실제 잡처럼 running 플래그만 세운다(스레드 없이)
+            web._aisearch_job.update(running=True, stage="translate", query="없는질의999")
+        with mock.patch.object(web, "_start_aisearch", side_effect=fake_start) as m:
+            html = web.render_search(self.store, self.cfg,
+                                     {"q": ["없는질의999"], "ai": ["1"]}, "2026-07-13")
         m.assert_called_once()
-        self.assertIn("class='aicards'", html)                  # AI 화면
+        self.assertEqual(m.call_args.kwargs.get("use_cache"), True)
+        self.assertIn("data-aisearch-running", html)            # 폴링 마커
+        self.assertIn("AI가 찾고 있어요", html)
         self.assertNotIn("<datalist", html)                     # 일반 검색 화면 아님
 
     def test_render_aisearch_shows_expansions(self):
@@ -4300,18 +4330,49 @@ class TestAISearchWeb(unittest.TestCase):
         self.assertIn("fresh=1", html)
 
     def test_ai_fresh_bypasses_cache_read(self):
-        with mock.patch.object(review, "ai_search", return_value=self._RESULT) as m:
-            web.render_search(self.store, self.cfg,
-                              {"q": ["리포트"], "ai": ["1"], "fresh": ["1"]}, "2026-07-13")
-        self.assertFalse(m.call_args.kwargs.get("use_cache", True))
-
-    def test_render_search_ai_fallback_on_error(self):
-        with mock.patch.object(review, "ai_search",
-                               side_effect=review.AIError("CLI 없음")):
+        # '새로 찾기'(fresh=1)는 캐시가 있어도 읽지 않고 use_cache=False 로 잡 시작
+        import json as _json
+        norm = review._normalize_q("리포트")
+        self.store.ai_search_put(norm, "리포트", "리포트",
+                                 _json.dumps(self._RESULT), "sonnet")
+        def fake_start(*a, **k):
+            web._aisearch_job.update(running=True, stage="translate", query="리포트")
+        with mock.patch.object(web, "_start_aisearch", side_effect=fake_start) as m:
             html = web.render_search(self.store, self.cfg,
-                                     {"q": ["리포트"], "ai": ["1"]}, "2026-07-13")
-        self.assertIn("aifail", html)                           # 폴백 배너
-        self.assertIn("class='item'", html)                     # 일반 결과로 폴백
+                                     {"q": ["리포트"], "ai": ["1"], "fresh": ["1"]},
+                                     "2026-07-13")
+        m.assert_called_once()
+        self.assertFalse(m.call_args.kwargs.get("use_cache", True))
+        self.assertIn("data-aisearch-running", html)            # 캐시 무시하고 대기 화면
+
+    def test_aisearch_status_running_shows_stage_and_prelim(self):
+        # 진행 중 상태 → 단계 바·잠정 결과(방법 7·8)
+        web._aisearch_job.update(
+            running=True, stage="prelim", query="강미래 리포트",
+            prelim={"items": self._RESULT["items"]})
+        inner, running = web.render_aisearch_status(self.store, self.cfg, "2026-07-13")
+        self.assertTrue(running)
+        self.assertIn("data-aisearch-running", inner)
+        self.assertIn("id='ai-stage'", inner)
+        self.assertIn("id='ai-prelim'", inner)
+        self.assertIn("잠정", inner)
+        self.assertIn("주간 리포트", inner)                     # 잠정 후보 카드
+
+    def test_aisearch_status_done_shows_result(self):
+        web._aisearch_job.update(running=False, stage="done", result=self._RESULT)
+        inner, running = web.render_aisearch_status(self.store, self.cfg, "2026-07-13")
+        self.assertFalse(running)
+        self.assertNotIn("data-aisearch-running", inner)        # 완료 → 마커 없음
+        self.assertIn("class='aicards'", inner)
+        self.assertIn("제목·발신 일치", inner)
+
+    def test_aisearch_status_error_falls_back_to_normal(self):
+        web._aisearch_job.update(running=False, stage="error",
+                                 query="리포트", error="CLI 없음")
+        inner, running = web.render_aisearch_status(self.store, self.cfg, "2026-07-13")
+        self.assertFalse(running)
+        self.assertIn("aifail", inner)                          # 폴백 배너
+        self.assertIn("class='item'", inner)                    # 일반 결과로 폴백
 
     def test_ai_button_present_in_normal_search(self):
         html = web.render_search(self.store, self.cfg, {"q": ["리포트"]}, "2026-07-13")
@@ -4323,6 +4384,13 @@ class TestAISearchWeb(unittest.TestCase):
         self.assertIn("aielapsed", web._APP_JS)                 # 경과 시간 카운터
         self.assertNotIn("수 초 걸립니다", web._APP_JS)          # 비현실적 문구 제거됨
         self.assertIn(".aicards", web._CSS)                     # 카드 스타일
+
+    def test_app_js_has_ai_polling(self):
+        # 방법 7·8: 백그라운드 잡 폴링 훅 + 마커
+        self.assertIn("hookAiPolling", web._APP_JS)
+        self.assertIn("/aisearch/status", web._APP_JS)
+        self.assertIn("data-aisearch-running", web._APP_JS)
+        self.assertIn(".aifill", web._CSS)                      # 진행 바 스타일
 
     def test_render_aisearch_shows_time(self):
         r = dict(self._RESULT, cost={"usd": 0.21, "in": 72000, "out": 900,
