@@ -14,6 +14,7 @@ import subprocess
 import time
 from datetime import date, timedelta
 
+from . import search as search_mod
 from .clean import strip_preserved
 from .config import Config
 from .store import Store
@@ -1356,3 +1357,289 @@ def render(det: dict, ai_text: str | None = None) -> str:
         lines += ["", "---", "", "# AI 회고 분석", "", ai_text]
 
     return "\n".join(lines) + "\n"
+
+
+# ════════════════════════════════════════════════════════ AI 검색 (Phase 2)
+# 흐릿한 자연어 한 줄 → (1)DSL 번역 → (2)엔진 검색 → (3)스니펫 재순위+자기교정
+# → (4)상위 5건 본문 심층읽기 확정. 목표는 '찾던 그 메일'을 상위로 올려 알아보게
+# 하는 것 — 답 합성(지식검색)은 범위 밖. AI 는 DSL 만 출력하고 파서가 정화한다.
+# docs/PROPOSAL-search.md 참고. Stage 1: 번역만.
+
+def _parse_json_obj(text: str) -> dict | None:
+    """모델 출력에서 첫 JSON 객체를 관대하게 추출(코드펜스·앞뒤 잡음 허용)."""
+    if not text:
+        return None
+    s = text.strip()
+    if s.startswith("```"):                      # ```json … ``` 펜스 제거
+        s = s.strip("`")
+        nl = s.find("\n")
+        if nl != -1:
+            s = s[nl + 1:]
+    a, b = s.find("{"), s.rfind("}")
+    if a == -1 or b == -1 or b < a:
+        return None
+    try:
+        obj = json.loads(s[a:b + 1])
+    except (ValueError, TypeError):
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+AISEARCH_TRANSLATE = """당신은 사내 업무 메일 검색기의 '질의 번역기'다. 사용자의 흐릿한 자연어 요청을 검색 DSL 로 바꾼다.
+
+[검색 DSL 문법]
+- 사람:   from:이름|주소   to:이름|주소   cc:이름|주소
+- 기간:   after:YYYY[-MM[-DD]]   before:…   on:…   (after=이후 포함, before=이전 배타)
+- 상태:   is:unread  is:read  is:sent  is:received  is:flagged
+- 첨부:   has:attachment   file:파일명일부
+- 스레드: thread:번호
+- 내용:   맨 키워드(공백 구분)  ·  "정확한 구"
+- 한국어 trigram 검색은 3글자 미만 단어를 잘 못 잡는다. 되도록 3글자 이상 핵심어를 쓰고
+  한↔영·유의어를 함께 확장하라 (예: 마감 → 마감 일정 deadline).
+
+[규칙]
+- 오늘 날짜: {today}. '지난달'·'최근' 같은 상대표현은 이 기준으로 계산.
+- 사람 언급 → from:/to:,  시점 → after:/before:,  첨부 언급 → has:attachment.
+- dsl: 가장 정확할 것으로 보이는 1차 질의.
+- fallback_dsl: 1차가 너무 좁아 결과가 없을 때 쓸 더 느슨한 질의(키워드 줄이거나 기간 넓힘). 없으면 "".
+- 확신 없는 제약은 넣지 말 것(억지 추측 금지). 원시 SQL 금지 — 위 DSL 만.
+
+[출력] JSON 객체 하나만. 코드펜스·다른 말 금지:
+{{"dsl": "...", "fallback_dsl": "...", "expansions": ["..."], "note": "한 줄 해석 근거"}}
+
+[사용자 요청]
+{query}
+"""
+
+
+def ai_translate_query(cfg: Config, query: str, today: str,
+                       backend: str | None = None) -> dict:
+    """자연어 → 검색 DSL. {dsl, fallback_dsl, expansions, note} 반환.
+
+    AI 출력이 JSON 이 아니거나 dsl 이 비면 원문을 키워드로 쓰는 안전 폴백.
+    반환 dsl 은 search.parse_query 로 파싱 가능한 문자열이며, 실제 정화는
+    store.search 의 파서가 한다(AI 가 낸 문자열을 SQL 로 직접 쓰지 않는다).
+    """
+    cmd = cfg.ai_cmd(backend or cfg.ai_search_backend)
+    prompt = AISEARCH_TRANSLATE.format(today=today, query=query.strip())
+    out = ai_run(cmd, prompt, timeout=60, retries=1)
+    data = _parse_json_obj(out) or {}
+    dsl = (data.get("dsl") or "").strip()
+    # dsl 이 비었거나 파싱해도 아무 의미(텍스트·필터)도 없으면 원문 키워드로 폴백
+    parsed = search_mod.parse_query(dsl) if dsl else None
+    if parsed is None or not (parsed.has_text() or parsed.has_filters()):
+        dsl = query.strip()
+    fallback = (data.get("fallback_dsl") or "").strip()
+    exps = data.get("expansions")
+    return {
+        "dsl": dsl,
+        "fallback_dsl": fallback,
+        "expansions": [str(e) for e in exps] if isinstance(exps, list) else [],
+        "note": (data.get("note") or "").strip(),
+    }
+
+
+def _cand(r) -> dict:
+    """검색 결과 행 → 랭킹·표시용 후보 dict (본문 제외 — 스니펫만)."""
+    return {
+        "id": r["id"], "thread_id": r["thread_id"],
+        "subject": r["subject"] or "",
+        "sender": r["sender_name"] or r["sender_addr"] or "",
+        "date": (r["sent_on"] or "")[:16], "is_sent": bool(r["is_sent"]),
+        "snippet": (r["snippet"] or "").replace("\n", " ").strip()[:160],
+        "tier": r["tier"],
+    }
+
+
+AISEARCH_RANK = """당신은 메일 검색 결과 심사관이다. 사용자가 찾는 메일이 아래 후보 중 어느 것인지,
+제목·발신·날짜·발췌(스니펫)만 보고 판단한다.
+
+[규칙]
+- '찾는 메일일 가능성'이 높은 순으로 정렬.
+- 명백히 무관한 후보는 제외(relevant=false 로 두거나 목록에서 빼라).
+- 근거 없는 확신 금지. 발췌에 단서가 약하면 relevant 를 신중히.
+- reason 은 한국어 한 줄(왜 이게 맞을 것 같은지).
+
+[출력] JSON 객체 하나만. 코드펜스·다른 말 금지:
+{{"ranked": [{{"id": 정수, "reason": "...", "relevant": true}}], "note": "전반 판단 한 줄"}}
+
+[사용자가 찾는 것]
+{query}
+
+[후보 목록]
+{candidates}
+"""
+
+
+def ai_rank_candidates(cfg: Config, query: str, candidates: list,
+                       backend: str | None = None) -> dict:
+    """후보를 스니펫 수준으로 재순위. {ranked:[{id,reason,relevant}], note} 반환."""
+    if not candidates:
+        return {"ranked": [], "note": ""}
+    lines = [
+        f'- id={c["id"]} | {c["date"]} | {c["sender"]} | 제목: {c["subject"]} '
+        f'| 발췌: {c["snippet"] or "(없음)"}'
+        for c in candidates
+    ]
+    cmd = cfg.ai_cmd(backend or cfg.ai_search_backend)
+    prompt = AISEARCH_RANK.format(query=query.strip(), candidates="\n".join(lines))
+    out = ai_run(cmd, prompt, timeout=90, retries=1)
+    return _clean_ranked(_parse_json_obj(out) or {}, {c["id"] for c in candidates})
+
+
+def _clean_ranked(data: dict, valid_ids: set) -> dict:
+    """모델 랭킹 출력 정화 — 유효 id·필드만, 순서 보존."""
+    ranked = data.get("ranked") if isinstance(data.get("ranked"), list) else []
+    clean = []
+    seen = set()
+    for r in ranked:
+        if not isinstance(r, dict):
+            continue
+        try:
+            rid = int(r.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if rid not in valid_ids or rid in seen:
+            continue
+        seen.add(rid)
+        clean.append({
+            "id": rid,
+            "reason": str(r.get("reason") or "").strip(),
+            "relevant": bool(r.get("relevant", True)),
+        })
+    return {"ranked": clean, "note": str(data.get("note") or "").strip()}
+
+
+AISEARCH_CONFIRM = """당신은 메일 검색 최종 확정자다. 아래는 유력 후보들의 **본문 전체**다.
+사용자가 찾는 바로 그 메일인지 본문까지 읽고 확정한다.
+
+[규칙]
+- 실제로 찾는 메일에 부합하는 것만 남기고(match=true), 본문을 보니 무관하면 match=false.
+- 부합 정도가 높은 순으로 정렬.
+- reason 은 한국어 한 줄 — 본문의 어떤 대목이 근거인지.
+- 답을 지어내지 말 것. 본문에 근거가 없으면 match=false.
+
+[출력] JSON 객체 하나만. 코드펜스·다른 말 금지:
+{{"ranked": [{{"id": 정수, "reason": "...", "match": true}}]}}
+
+[사용자가 찾는 것]
+{query}
+
+[후보 본문]
+{bodies}
+"""
+
+
+def ai_confirm_top(cfg: Config, query: str, items: list,
+                   backend: str | None = None) -> dict:
+    """상위 후보의 본문까지 읽어 확정·재정렬(iv-lite). items=[{id,...,body}]."""
+    if not items:
+        return {"ranked": []}
+    blocks = [
+        f'### id={it["id"]} · {it["date"]} · {it["sender"]}\n제목: {it["subject"]}\n'
+        f'본문:\n{it.get("body") or "(본문 없음)"}'
+        for it in items
+    ]
+    cmd = cfg.ai_cmd(backend or cfg.ai_search_backend)
+    prompt = AISEARCH_CONFIRM.format(query=query.strip(), bodies="\n\n".join(blocks))
+    out = ai_run(cmd, prompt, timeout=120, retries=1)
+    data = _parse_json_obj(out) or {}
+    ids = {it["id"] for it in items}
+    ranked = data.get("ranked") if isinstance(data.get("ranked"), list) else []
+    clean, seen = [], set()
+    for r in ranked:
+        if not isinstance(r, dict):
+            continue
+        try:
+            rid = int(r.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if rid not in ids or rid in seen:
+            continue
+        seen.add(rid)
+        clean.append({"id": rid, "reason": str(r.get("reason") or "").strip(),
+                      "match": bool(r.get("match", True))})
+    return {"ranked": clean}
+
+
+def _normalize_q(q: str) -> str:
+    """캐시 키 — 소문자·공백 정리."""
+    return " ".join((q or "").lower().split())
+
+
+# 심층읽기(iv-lite) 대상 상위 건수 — 비용 여유로 5건 (사용자 확정 2026-07-15)
+AISEARCH_DEEP_TOP = 5
+
+
+def ai_search(store: Store, cfg: Config, query: str, today: str,
+              backend: str | None = None, top: int = 8,
+              use_cache: bool = True) -> dict:
+    """AI 검색 오케스트레이터 — 번역→검색→재순위(+자기교정)→심층읽기(iv-lite).
+
+    반환(렌더·캐시용): {query, dsl, note, expansions, items[], others[],
+    candidate_count, backend, from_cache}. items 각 원소는 _cand + reason.
+    """
+    norm = _normalize_q(query)
+    if use_cache:
+        cached = store.ai_search_get(norm)
+        if cached and cached["result_json"]:
+            try:
+                res = json.loads(cached["result_json"])
+                res["from_cache"] = True
+                return res
+            except ValueError:
+                pass
+
+    bk = backend or cfg.ai_search_backend
+    tr = ai_translate_query(cfg, query, today, bk)
+    dsl = tr["dsl"]
+    rows = store.search(dsl, limit=30)
+    if len(rows) < 3 and tr["fallback_dsl"]:                 # 엔진만 완화(AI 추가호출 없음)
+        seen = {r["id"] for r in rows}
+        rows += [r for r in store.search(tr["fallback_dsl"], limit=30)
+                 if r["id"] not in seen]
+    cands = [_cand(r) for r in rows[:30]]
+    rank = ai_rank_candidates(cfg, query, cands, bk)
+    relevant = [r for r in rank["ranked"] if r["relevant"]]
+
+    # 자기교정(iii): 관련 후보가 하나도 없으면 재번역·재검색 1회
+    if not relevant:
+        hint = query + "  (직전 검색 결과가 부실했다. 다른 핵심어·유의어로 더 넓게)"
+        tr2 = ai_translate_query(cfg, hint, today, bk)
+        if tr2["dsl"] and tr2["dsl"] != dsl:
+            rows2 = store.search(tr2["dsl"], limit=30)
+            if rows2:
+                dsl, tr = tr2["dsl"], {**tr, "note": tr2["note"] or tr["note"]}
+                cands = [_cand(r) for r in rows2[:30]]
+                rank = ai_rank_candidates(cfg, query, cands, bk)
+
+    by_id = {c["id"]: c for c in cands}
+    ordered = [dict(by_id[r["id"]], reason=r["reason"])
+               for r in rank["ranked"] if r["id"] in by_id]
+
+    # 심층읽기(iv-lite): 상위 N건 본문까지 읽어 확정·재정렬
+    head = ordered[:AISEARCH_DEEP_TOP]
+    if head:
+        bodies = {m["id"]: m for m in store.messages_by_ids([c["id"] for c in head])}
+        deep_in = []
+        for c in head:
+            m = bodies.get(c["id"])
+            body = strip_preserved(m["new_content"] or "")[:1500] if m else ""
+            deep_in.append({**c, "body": body})
+        conf = ai_confirm_top(cfg, query, deep_in, bk)
+        if conf["ranked"]:
+            cmap = {c["id"]: c for c in head}
+            confirmed = [dict(cmap[r["id"]], reason=r["reason"] or cmap[r["id"]].get("reason", ""))
+                         for r in conf["ranked"] if r["id"] in cmap and r["match"]]
+            ordered = confirmed + ordered[AISEARCH_DEEP_TOP:]
+
+    result = {
+        "query": query, "dsl": dsl, "note": tr.get("note", ""),
+        "expansions": tr.get("expansions", []),
+        "items": ordered[:top], "others": ordered[top:top + 10],
+        "candidate_count": len(cands), "backend": bk, "from_cache": False,
+    }
+    if use_cache:
+        store.ai_search_put(norm, query, dsl,
+                            json.dumps(result, ensure_ascii=False), bk)
+    return result

@@ -142,6 +142,7 @@ class Config:
     ai_default: str = "internal"
     ai_summary_backend: str = "sonnet"   # 요약/회고/디제스트 전용 (품질 우선)
     ai_classify_backend: str = "haiku"   # 개입 분류 전용 (비용 우선)
+    ai_search_backend: str = "sonnet"    # AI 검색(번역·재순위·심층읽기) 전용 (정확도 우선)
     ai_backends: dict = field(default_factory=dict)
     stall_workdays: int = 2
     stale_workdays: int = 3
@@ -363,6 +364,7 @@ def load(cli_home: str | None) -> Config:
         ai_default=data.get("ai", {}).get("default", "internal"),
         ai_summary_backend=data.get("ai", {}).get("summary", "sonnet"),
         ai_classify_backend=data.get("ai", {}).get("classify", "haiku"),
+        ai_search_backend=data.get("ai", {}).get("search", "sonnet"),
         ai_backends=data.get("ai", {}).get("backends", {}),
         stall_workdays=review.get("stall_workdays", 2),
         stale_workdays=review.get("stale_workdays", 3),

@@ -213,6 +213,28 @@ def cmd_ls(args) -> None:
 def cmd_search(args) -> None:
     cfg = config_mod.load(args.home)
     store = _store(cfg)
+    if getattr(args, "ai", False):
+        try:
+            res = review.ai_search(store, cfg, args.query, date.today().isoformat())
+        except review.AIError as e:
+            raise SystemExit(f"AI 검색 불가: {e}")
+        if getattr(args, "json", False):
+            import json
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+            return
+        print(f"AI 해석: {res['dsl']}")
+        if res.get("note"):
+            print(f"  ({res['note']})")
+        if not res["items"]:
+            print("정확히 맞는 메일을 찾지 못했습니다.")
+            return
+        for i, it in enumerate(res["items"], 1):
+            arrow = "→" if it.get("is_sent") else " "
+            print(f"{i}. [{it['thread_id']:>4}] {it['date']} {arrow} "
+                  f"{it['sender']}: {it['subject']}")
+            if it.get("reason"):
+                print(f"       └ {it['reason']}")
+        return
     rows = store.search(args.query, args.limit)
     if getattr(args, "json", False):
         import json
@@ -572,6 +594,8 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("query", help='예: from:강미래 after:2026-06 리포트  ·  "정확한 구"')
     sp.add_argument("--limit", type=int, default=30)
     sp.add_argument("--json", action="store_true", help="구조화 JSON 출력(도구·skill용)")
+    sp.add_argument("--ai", action="store_true",
+                    help="흐릿한 기억 AI 검색(번역·재순위·심층읽기; AI CLI 필요)")
     sp.set_defaults(fn=cmd_search)
 
     sp = sub.add_parser("show", help="메일 본문 (인용 제거본)")

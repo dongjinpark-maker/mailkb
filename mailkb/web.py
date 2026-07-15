@@ -346,6 +346,46 @@ details.adv input[type=text], details.adv select { padding: 4px 7px; font-size: 
     padding: 0 1px; border-radius: 2px; }
 .lowrel { color: var(--ink-3); font-size: 12px; margin: 14px 0 4px;
     border-top: 1px dashed var(--border); padding-top: 8px; }
+/* AI 검색 */
+.aibtn { display: inline-flex; align-items: center; gap: 6px; margin: 4px 0 10px;
+    padding: 7px 14px; font-size: 13.5px; font-weight: 600; text-decoration: none;
+    color: #fff; background: var(--accent); border-radius: 999px; }
+.aibtn:hover { filter: brightness(1.06); }
+.aiq { color: var(--ink-3); font-weight: 400; font-size: 16px; }
+.aidsl { margin: 6px 0; font-size: 13px; color: var(--ink-2); display: flex;
+    flex-wrap: wrap; align-items: center; gap: 8px; }
+.aidsl code { background: var(--surface); padding: 2px 8px; border-radius: 6px;
+    border: 1px solid var(--border); color: var(--ink); }
+.aiedit { font-size: 12.5px; color: var(--accent); text-decoration: none; }
+.ainote { color: var(--ink-3); font-size: 13px; margin: 2px 0 10px; }
+.aihead { margin: 12px 0 6px; font-weight: 600; }
+.aicards { list-style: none; margin: 0; padding: 0; counter-reset: ai; }
+.aicards .aicard { counter-increment: ai; position: relative; padding: 10px 12px 10px 40px;
+    margin: 6px 0; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; }
+.aicards .aicard::before { content: counter(ai); position: absolute; left: 12px; top: 11px;
+    width: 20px; height: 20px; border-radius: 50%; background: var(--accent); color: #fff;
+    font-size: 12px; font-weight: 700; display: flex; align-items: center;
+    justify-content: center; }
+.aicard .aititle { font-weight: 600; text-decoration: none; color: var(--accent); }
+.aicard .aimeta { color: var(--ink-3); font-size: 12.5px; margin-top: 2px; }
+.aicard .aireason { color: var(--ink-2); font-size: 13px; margin: 5px 0 0;
+    line-height: 1.5; }
+.aiothers { margin: 12px 0; }
+.aiothers summary { cursor: pointer; color: var(--ink-2); font-size: 13px;
+    width: max-content; }
+.aiothers .aicard::before { background: var(--muted); }
+.aifoot { color: var(--ink-3); font-size: 12px; margin-top: 16px;
+    border-top: 1px solid var(--border); padding-top: 8px; }
+.aifoot a, .aiothers a { color: var(--accent); }
+.aifail { background: rgba(232,151,90,.14); border: 1px solid var(--border);
+    color: var(--ink-2); font-size: 13px; padding: 8px 12px; border-radius: 8px;
+    margin: 6px 0 12px; }
+.aiwait { display: flex; align-items: center; gap: 12px; padding: 40px 10px;
+    color: var(--ink-2); font-size: 14px; }
+.aiwait .spin { width: 20px; height: 20px; border: 3px solid var(--border);
+    border-top-color: var(--accent); border-radius: 50%; animation: aispin .8s linear infinite; }
+@keyframes aispin { to { transform: rotate(360deg); } }
 .empty { color: var(--ink-3); padding: 20px 0; }
 .digest { padding: 4px 10px; margin: 3px 0; border-left: 2px solid var(--border);
     background: var(--surface); font-size: 14px; }
@@ -1245,6 +1285,11 @@ _APP_JS = r"""
     if (a.closest(".more")) return; /* '더 보기'는 관찰자/전체 페이지 폴백이 처리 */
     e.preventDefault();
     if (a.classList && a.classList.contains("mrow")) a.classList.add("read");  /* 낙관적: 클릭 즉시 볼드 해제 */
+    if (a.classList && a.classList.contains("aibtn")) {   /* AI 검색은 수 초 걸림 — 대기 표시 */
+      var li = left.querySelector(".inner") || left;
+      li.innerHTML = "<div class='aiwait'><span class='spin'></span>"
+        + "AI가 찾는 중… 잠시만요 (수 초 걸립니다)</div>";
+    }
     load(href).catch(function () { location.href = href; });
   });
 
@@ -2133,6 +2178,8 @@ def render_settings(store, cfg) -> str:
                + "<td class='dim'>요약/회고/디제스트</td></tr>"
                + "<tr><th>분류 백엔드</th>" + _sel("classify_backend", cfg.ai_classify_backend)
                + "<td class='dim'>개입 큐 '액션 필요?' 분류</td></tr>"
+               + "<tr><th>AI 검색 백엔드</th>" + _sel("search_backend", cfg.ai_search_backend)
+               + "<td class='dim'>흐릿한 기억 검색 — 번역·재순위·심층읽기(정확도 우선)</td></tr>"
                + "</table><button>저장</button></form>")
 
     # ── 표시 설정 ──
@@ -2253,7 +2300,8 @@ def _save_settings(home, form: dict) -> str:
             n += 1
         except ValueError:
             pass
-    for field_, key in [("summary_backend", "summary"), ("classify_backend", "classify")]:
+    for field_, key in [("summary_backend", "summary"), ("classify_backend", "classify"),
+                        ("search_backend", "search")]:
         v = (form.get(field_) or [""])[0].strip()
         if v:
             cfgmod.set_override(home, "ai", key, v)
@@ -2403,8 +2451,64 @@ def _search_facets(rows, effective: str) -> str:
     return "<div class='facets'>" + "".join(chips) + "</div>"
 
 
+def _ai_card(it: dict) -> str:
+    """AI 추천 결과 한 건 — 제목(링크)·발신·날짜·한 줄 이유."""
+    arrow = "→ " if it.get("is_sent") else ""
+    reason = (it.get("reason") or "").strip()
+    rhtml = f"<p class='aireason'>{esc(reason)}</p>" if reason else ""
+    return (
+        f"<li class='aicard'><a class='aititle' href='/thread/{it['thread_id']}'>"
+        f"{esc(it['subject'] or '(제목 없음)')}</a>"
+        f"<div class='aimeta'>{arrow}{esc(it.get('sender') or '')} · "
+        f"{esc(it.get('date') or '')}</div>{rhtml}</li>")
+
+
+def render_aisearch(result: dict) -> str:
+    """AI 검색 결과 화면 — 해석 DSL(편집)·추천 카드·그 외 후보·근거 표시."""
+    raw = result.get("query", "")
+    dsl = result.get("dsl", "")
+    items = result.get("items", [])
+    others = result.get("others", [])
+    dsl_href = "/search?q=" + urllib.parse.quote(dsl or raw)
+    out = [f"<h1>AI 검색 <span class='aiq'>· {esc(raw)}</span></h1>"]
+    if dsl:
+        out.append(
+            "<div class='aidsl'>AI 해석 <code>" + esc(dsl) + "</code>"
+            f"<a class='aiedit' href='{esc(dsl_href)}'>편집·일반검색</a></div>")
+    if result.get("note"):
+        out.append(f"<p class='ainote'>{esc(result['note'])}</p>")
+    if items:
+        out.append("<p class='dim aihead'>이게 찾으시는 것 같아요</p>")
+        out.append("<ol class='aicards'>"
+                   + "".join(_ai_card(it) for it in items) + "</ol>")
+    else:
+        out.append(
+            "<p class='empty'>정확히 맞는 메일을 찾지 못했습니다. "
+            f"<a href='{esc(dsl_href)}'>일반 검색으로 보기</a></p>")
+    if others:
+        out.append(
+            f"<details class='aiothers'><summary>그 외 후보 {len(others)}건</summary>"
+            "<ol class='aicards'>" + "".join(_ai_card(it) for it in others)
+            + "</ol></details>")
+    cache = " · 캐시됨" if result.get("from_cache") else ""
+    out.append(
+        "<p class='aifoot'>후보 " + str(result.get("candidate_count", 0))
+        + f"개 검토 · {esc(result.get('backend', ''))}{cache} · "
+        f"<a href='{esc(dsl_href)}'>일반 검색 결과 보기</a></p>")
+    return "\n".join(out)
+
+
 def render_search(store, cfg, qs, today: str) -> str:
     raw, effective = _search_effective(qs, today)
+    # AI 검색 모드(?ai=1) — 흐릿한 자연어를 번역·재순위·심층읽기로. 명시적 클릭에서만.
+    ai_banner = ""
+    if (qs.get("ai") or [""])[0] == "1" and raw:
+        try:
+            return render_aisearch(review.ai_search(store, cfg, raw, today))
+        except review.AIError as e:
+            # AI CLI 부재·타임아웃 등 → 일반 검색으로 폴백(막다른 길 방지)
+            ai_banner = ("<div class='aifail'>AI 검색을 쓸 수 없습니다 — "
+                         f"{esc(str(e)[:90])}. 일반 검색 결과를 보여드립니다.</div>")
     # 검색 입력은 헤더 상시 검색창(_NAV navsearch)이 담당 — 여기선 중복 박스 없이
     # 힌트·상세(빌더)·패싯·결과만. 헤더 박스 값은 app.js 가 URL 의 q 로 채운다.
     # 상세: 검색식을 만들어 검색창(q)에 병합. datalist 로 사람 이름 자동완성.
@@ -2428,8 +2532,15 @@ def render_search(store, cfg, qs, today: str) -> str:
         "<button>적용</button></form>"
         f"<datalist id='ppl'>{opts}</datalist></details>")
     out = ["<h1>검색</h1>", _SEARCH_HINT, adv]
+    if ai_banner:
+        out.append(ai_banner)
     if effective:
         rows = store.search(effective, limit=50)
+        # 흐릿한 기억이면 AI로 — 명시적 클릭에서만(과금). 일반 결과 위에 노출.
+        if raw:
+            out.append(
+                "<a class='aibtn' href='/search?ai=1&q="
+                + urllib.parse.quote(raw) + "'>🤖 AI로 다시 찾기</a>")
         out.append(f"<p class='dim'>{len(rows)}건</p>")
         out.append(_search_facets(rows, effective))
         low = False

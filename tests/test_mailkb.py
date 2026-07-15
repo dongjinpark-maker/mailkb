@@ -4049,5 +4049,236 @@ class TestSearchWeb(unittest.TestCase):
         self.assertNotIn("관련 낮음", html)
 
 
+class TestAISearchStage1(unittest.TestCase):
+    """Phase 2 Stage 1 — 번역 + 캐시 뼈대."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "t.sqlite", [ME])
+        self.cfg = Config(home=Path(self.tmp.name), my_addresses=[ME])
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_parse_json_obj_variants(self):
+        self.assertEqual(review._parse_json_obj('{"a": 1}'), {"a": 1})
+        self.assertEqual(review._parse_json_obj('```json\n{"a": 2}\n```'), {"a": 2})
+        self.assertEqual(review._parse_json_obj('결과: {"a": 3} 끝'), {"a": 3})
+        self.assertIsNone(review._parse_json_obj("no json here"))
+        self.assertIsNone(review._parse_json_obj('[1,2,3]'))   # 객체 아님
+
+    def test_translate_parses_ai_dsl(self):
+        payload = ('{"dsl": "from:강미래 after:2026-06 리포트", '
+                   '"fallback_dsl": "리포트", "expansions": ["리포트","report"], '
+                   '"note": "발신자·기간·키워드"}')
+        with mock.patch.object(review, "ai_run", return_value=payload):
+            r = review.ai_translate_query(self.cfg, "지난달 강미래 리포트 찾아줘", "2026-07-13")
+        self.assertEqual(r["dsl"], "from:강미래 after:2026-06 리포트")
+        self.assertEqual(r["fallback_dsl"], "리포트")
+        self.assertIn("report", r["expansions"])
+
+    def test_translate_falls_back_on_junk(self):
+        with mock.patch.object(review, "ai_run", return_value="죄송하지만 모르겠어요"):
+            r = review.ai_translate_query(self.cfg, "원래 질의 키워드", "2026-07-13")
+        self.assertEqual(r["dsl"], "원래 질의 키워드")   # 원문 폴백
+
+    def test_translate_falls_back_on_empty_dsl(self):
+        with mock.patch.object(review, "ai_run", return_value='{"dsl": ""}'):
+            r = review.ai_translate_query(self.cfg, "백업 키워드", "2026-07-13")
+        self.assertEqual(r["dsl"], "백업 키워드")
+
+    def test_translate_uses_search_backend(self):
+        # 기본 백엔드가 ai_search_backend(sonnet)로 라우팅되는지
+        with mock.patch.object(review, "ai_run", return_value='{"dsl":"x"}'), \
+                mock.patch.object(self.cfg, "ai_cmd", return_value=["echo"]) as cmd:
+            review.ai_translate_query(self.cfg, "q", "2026-07-13")
+        cmd.assert_called_with("sonnet")
+
+    def test_cache_put_get_recent(self):
+        self.store.ai_search_put("지난달 리포트", "지난달 리포트",
+                                 "from:강미래 리포트", '{"top":[1]}', "sonnet")
+        row = self.store.ai_search_get("지난달 리포트")
+        self.assertIsNotNone(row)
+        self.assertEqual(row["dsl"], "from:강미래 리포트")
+        self.assertEqual(row["result_json"], '{"top":[1]}')
+        # 덮어쓰기(UPSERT)
+        self.store.ai_search_put("지난달 리포트", "지난달 리포트",
+                                 "리포트", '{"top":[2]}', "sonnet")
+        self.assertEqual(self.store.ai_search_get("지난달 리포트")["result_json"],
+                         '{"top":[2]}')
+        self.assertEqual(len(self.store.ai_search_recent()), 1)   # 같은 키 = 1건
+        self.assertIsNone(self.store.ai_search_get("없는 질의"))
+
+    def test_messages_by_ids(self):
+        self.store.ingest([
+            _recx("a1", "kang@corp.example", "제목1", "2026-07-01T09:00:00", body="본문1"),
+            _recx("a2", "lee@corp.example", "제목2", "2026-07-02T09:00:00", body="본문2"),
+        ])
+        rows = self.store.messages_by_ids([1, 2])
+        self.assertEqual({r["id"] for r in rows}, {1, 2})
+        self.assertEqual(self.store.messages_by_ids([]), [])
+
+
+class TestAISearchPipeline(unittest.TestCase):
+    """Phase 2 Stage 2·3 — 재순위·자기교정·심층읽기·오케스트레이터 (ai_run 목)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "t.sqlite", [ME])
+        self.cfg = Config(home=Path(self.tmp.name), my_addresses=[ME])
+        self.store.ingest([
+            _recx("r1", "kang@corp.example", "주간 리포트 W25", "2026-07-01T09:00:00",
+                  body="가동률 리포트 본문입니다", sender_name="강미래 선임"),
+            _recx("r2", "lee@corp.example", "회의 안건", "2026-07-02T09:00:00",
+                  body="다음 주 회의 안건 정리", sender_name="이서연"),
+        ])
+        self.rid = self.store.search("리포트")[0]["id"]
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_rank_cleans_invalid_ids(self):
+        cands = [{"id": 1, "subject": "s", "sender": "a", "date": "d", "snippet": ""}]
+        out = ('{"ranked":[{"id":1,"reason":"맞음","relevant":true},'
+               '{"id":999,"reason":"무효 id"},{"id":"x"}],"note":"n"}')
+        with mock.patch.object(review, "ai_run", return_value=out):
+            r = review.ai_rank_candidates(self.cfg, "q", cands)
+        self.assertEqual([x["id"] for x in r["ranked"]], [1])   # 유효 id 만
+
+    def test_orchestrator_happy_path_and_cache(self):
+        rid = self.rid
+        side = [
+            f'{{"dsl": "리포트", "fallback_dsl": "", "expansions": ["report"], "note": "키워드"}}',
+            f'{{"ranked": [{{"id": {rid}, "reason": "제목에 리포트", "relevant": true}}]}}',
+            f'{{"ranked": [{{"id": {rid}, "reason": "본문도 리포트", "match": true}}]}}',
+        ]
+        with mock.patch.object(review, "ai_run", side_effect=side) as run:
+            res = review.ai_search(self.store, self.cfg, "리포트 찾아줘", "2026-07-13")
+        self.assertEqual(res["dsl"], "리포트")
+        self.assertEqual(res["items"][0]["id"], rid)
+        self.assertEqual(res["items"][0]["reason"], "본문도 리포트")   # 심층읽기 이유가 최종
+        self.assertFalse(res["from_cache"])
+        self.assertEqual(run.call_count, 3)                          # 번역+재순위+확정
+        # 두 번째 동일 질의 → 캐시 히트, AI 미호출
+        with mock.patch.object(review, "ai_run",
+                               side_effect=AssertionError("AI 재호출 금지")) as run2:
+            res2 = review.ai_search(self.store, self.cfg, "리포트 찾아줘", "2026-07-13")
+        self.assertTrue(res2["from_cache"])
+        run2.assert_not_called()
+
+    def test_self_correct_retries_when_nothing_relevant(self):
+        rid = self.rid
+        # 1차 DSL '회의'는 후보(r2)를 잡지만 재순위가 '관련 0' 판정 → 자기교정 재검색
+        side = [
+            '{"dsl": "회의", "fallback_dsl": "", "note": "1차"}',
+            '{"ranked": []}',                                         # 관련 0 → 자기교정
+            '{"dsl": "리포트", "fallback_dsl": "", "note": "2차 넓힘"}',
+            f'{{"ranked": [{{"id": {rid}, "reason": "재검색 적중", "relevant": true}}]}}',
+            f'{{"ranked": [{{"id": {rid}, "reason": "본문 확인", "match": true}}]}}',
+        ]
+        with mock.patch.object(review, "ai_run", side_effect=side) as run:
+            res = review.ai_search(self.store, self.cfg, "리포트", "2026-07-13")
+        self.assertEqual(res["dsl"], "리포트")                        # 자기교정 후 DSL
+        self.assertEqual(res["items"][0]["id"], rid)
+        self.assertEqual(run.call_count, 5)   # 번역·재순위·재번역·재순위·확정
+
+    def test_deep_read_drops_nonmatch(self):
+        rid = self.rid
+        side = [
+            '{"dsl": "리포트", "note": "k"}',
+            f'{{"ranked": [{{"id": {rid}, "reason": "스니펫상 맞음", "relevant": true}}]}}',
+            f'{{"ranked": [{{"id": {rid}, "reason": "본문 보니 무관", "match": false}}]}}',
+        ]
+        with mock.patch.object(review, "ai_run", side_effect=side):
+            res = review.ai_search(self.store, self.cfg, "리포트", "2026-07-13")
+        self.assertEqual(res["items"], [])    # 본문 확인서 탈락
+
+
+class TestAISearchWeb(unittest.TestCase):
+    """Phase 2 Stage 4 — 웹 UI (render_aisearch·render_search AI 분기·버튼)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "t.sqlite", [ME])
+        self.cfg = Config(home=Path(self.tmp.name), my_addresses=[ME])
+        self.store.ingest([
+            _recx("r1", "kang@corp.example", "주간 리포트", "2026-07-01T09:00:00",
+                  body="가동률 리포트", sender_name="강미래 선임"),
+        ])
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    _RESULT = {
+        "query": "지난달 강미래 리포트", "dsl": "from:강미래 after:2026-06 리포트",
+        "note": "발신자·기간·키워드 일치", "expansions": ["리포트"],
+        "items": [{"id": 1, "thread_id": 1, "subject": "주간 리포트",
+                   "sender": "강미래 선임", "date": "2026-07-01T09:00",
+                   "is_sent": False, "reason": "제목·발신 일치"}],
+        "others": [{"id": 2, "thread_id": 2, "subject": "기타",
+                    "sender": "이서연", "date": "2026-06-30T10:00",
+                    "is_sent": False, "reason": "약한 관련"}],
+        "candidate_count": 12, "backend": "sonnet", "from_cache": False,
+    }
+
+    def test_render_aisearch_markup(self):
+        html = web.render_aisearch(self._RESULT)
+        self.assertIn("AI 해석", html)
+        self.assertIn("from:강미래 after:2026-06 리포트", html)   # 해석 DSL 노출
+        self.assertIn("aiedit", html)                           # 편집 링크
+        self.assertIn("class='aicards'", html)
+        self.assertIn("제목·발신 일치", html)                    # 이유
+        self.assertIn("/thread/1", html)                        # 카드 링크
+        self.assertIn("그 외 후보", html)                        # others 접힘
+        self.assertIn("후보 12개 검토", html)                    # 근거 푸터
+        self.assertIn("sonnet", html)
+
+    def test_render_aisearch_empty(self):
+        r = dict(self._RESULT, items=[], others=[])
+        html = web.render_aisearch(r)
+        self.assertIn("찾지 못했습니다", html)
+        self.assertIn("일반 검색으로 보기", html)
+
+    def test_render_search_ai_branch(self):
+        with mock.patch.object(review, "ai_search", return_value=self._RESULT) as m:
+            html = web.render_search(self.store, self.cfg,
+                                     {"q": ["지난달 강미래 리포트"], "ai": ["1"]},
+                                     "2026-07-13")
+        m.assert_called_once()
+        self.assertIn("class='aicards'", html)                  # AI 화면
+        self.assertNotIn("<datalist", html)                     # 일반 검색 화면 아님
+
+    def test_render_search_ai_fallback_on_error(self):
+        with mock.patch.object(review, "ai_search",
+                               side_effect=review.AIError("CLI 없음")):
+            html = web.render_search(self.store, self.cfg,
+                                     {"q": ["리포트"], "ai": ["1"]}, "2026-07-13")
+        self.assertIn("aifail", html)                           # 폴백 배너
+        self.assertIn("class='item'", html)                     # 일반 결과로 폴백
+
+    def test_ai_button_present_in_normal_search(self):
+        html = web.render_search(self.store, self.cfg, {"q": ["리포트"]}, "2026-07-13")
+        self.assertIn("class='aibtn'", html)
+        self.assertIn("ai=1", html)
+
+    def test_app_js_has_ai_wait_and_css(self):
+        self.assertIn("aiwait", web._APP_JS)                    # 대기 표시 핸들러
+        self.assertIn(".aicards", web._CSS)                     # 카드 스타일
+
+    def test_settings_has_ai_search_backend(self):
+        html = web.render_settings(self.store, self.cfg)
+        self.assertIn("AI 검색 백엔드", html)
+        self.assertIn("search_backend", html)
+
+    def test_save_settings_persists_search_backend(self):
+        from mailkb import config as cfgmod
+        cfgmod.init_home(self.cfg.home)
+        web._save_settings(self.cfg.home, {"search_backend": ["haiku"]})
+        self.assertEqual(cfgmod.load(self.cfg.home).ai_search_backend, "haiku")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

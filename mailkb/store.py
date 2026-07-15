@@ -115,6 +115,17 @@ CREATE TABLE IF NOT EXISTS distill_signals (
     consumed  INTEGER DEFAULT 0,      -- 주간 증류가 소화하면 1
     created   TEXT DEFAULT ''
 );
+
+-- AI 검색 결과 캐시 (Phase 2) — 질의별 지속 저장. 뒤로가기·반복 질의 재과금 방지 +
+-- '최근 AI 검색' 목록. q = 정규화된 자연어 질의(소문자·공백 정리).
+CREATE TABLE IF NOT EXISTS ai_search (
+    q           TEXT PRIMARY KEY,     -- 정규화 질의(캐시 키)
+    raw_q       TEXT DEFAULT '',      -- 원문 질의(표시용)
+    dsl         TEXT DEFAULT '',      -- AI 가 해석한 DSL(투명성·편집용)
+    result_json TEXT DEFAULT '',      -- 렌더용 최종 결과(순위·이유·id)
+    backend     TEXT DEFAULT '',      -- 사용 모델
+    created     TEXT DEFAULT ''
+);
 """
 
 _FTS_TRIGRAM = """
@@ -500,6 +511,41 @@ class Store:
             "SELECT name, addr FROM people WHERE name != '' "
             "ORDER BY (from_count + to_count) DESC, last_seen DESC LIMIT ?",
             (limit,),
+        ).fetchall()
+
+    def messages_by_ids(self, ids: list[int]) -> list[sqlite3.Row]:
+        """id 목록으로 메일 조회(순서 무관) — AI 검색 심층읽기(iv-lite)용."""
+        ids = [int(i) for i in ids]
+        if not ids:
+            return []
+        ph = ",".join("?" * len(ids))
+        return self.db.execute(
+            f"SELECT * FROM messages WHERE id IN ({ph})", ids
+        ).fetchall()
+
+    # ---------------------------------------------------- AI 검색 캐시 (Phase 2)
+
+    def ai_search_get(self, q: str) -> sqlite3.Row | None:
+        return self.db.execute(
+            "SELECT * FROM ai_search WHERE q=?", (q,)
+        ).fetchone()
+
+    def ai_search_put(self, q: str, raw_q: str, dsl: str,
+                      result_json: str, backend: str) -> None:
+        self.db.execute(
+            "INSERT INTO ai_search(q, raw_q, dsl, result_json, backend, created) "
+            "VALUES(?,?,?,?,?,?) ON CONFLICT(q) DO UPDATE SET "
+            "raw_q=excluded.raw_q, dsl=excluded.dsl, result_json=excluded.result_json, "
+            "backend=excluded.backend, created=excluded.created",
+            (q, raw_q, dsl, result_json, backend, datetime.now().isoformat(timespec="seconds")),
+        )
+        self.db.commit()
+
+    def ai_search_recent(self, limit: int = 10) -> list[sqlite3.Row]:
+        """최근 AI 검색 목록 — 재방문·재사용용."""
+        return self.db.execute(
+            "SELECT q, raw_q, dsl, created FROM ai_search "
+            "ORDER BY created DESC LIMIT ?", (limit,),
         ).fetchall()
 
     def unanswered(self, days: int = 14, max_recipients: int = 50) -> list[sqlite3.Row]:
