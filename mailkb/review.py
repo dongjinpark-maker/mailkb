@@ -1668,7 +1668,8 @@ def ai_search(store: Store, cfg: Config, query: str, today: str,
         "candidate_count": len(cands), "backend": bk, "cost": meter,
         "from_cache": False,
     }
-    if use_cache:
-        store.ai_search_put(norm, query, dsl,
-                            json.dumps(result, ensure_ascii=False), bk)
+    # 캐시는 항상 갱신 — '새로 찾기'(use_cache=False)로 재실행한 결과도 저장해
+    # 다음 조회부터 최신 결과가 나오게 한다(읽기만 use_cache 로 우회).
+    store.ai_search_put(norm, query, dsl,
+                        json.dumps(result, ensure_ascii=False), bk)
     return result

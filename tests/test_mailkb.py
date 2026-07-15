@@ -4204,6 +4204,18 @@ class TestAISearchPipeline(unittest.TestCase):
         self.assertEqual(res["items"][0]["id"], rid)
         self.assertEqual(run.call_count, 5)   # 번역·재순위·재번역·재순위·확정
 
+    def test_write_cache_even_when_bypassing_read(self):
+        # '새로 찾기'(use_cache=False)도 결과를 캐시에 저장해 다음 조회에 반영
+        rid = self.rid
+        side = [
+            '{"dsl": "리포트", "note": "k"}',
+            f'{{"ranked": [{{"id": {rid}, "reason": "맞음", "relevant": true}}]}}',
+            f'{{"ranked": [{{"id": {rid}, "reason": "본문 확인", "match": true}}]}}',
+        ]
+        with mock.patch.object(review, "ai_run", side_effect=side):
+            review.ai_search(self.store, self.cfg, "리포트", "2026-07-13", use_cache=False)
+        self.assertIsNotNone(self.store.ai_search_get("리포트"))
+
     def test_deep_read_drops_nonmatch(self):
         rid = self.rid
         side = [
@@ -4277,6 +4289,21 @@ class TestAISearchWeb(unittest.TestCase):
         m.assert_called_once()
         self.assertIn("class='aicards'", html)                  # AI 화면
         self.assertNotIn("<datalist", html)                     # 일반 검색 화면 아님
+
+    def test_render_aisearch_shows_expansions(self):
+        html = web.render_aisearch(self._RESULT)      # expansions=["리포트"]
+        self.assertIn("확장 검색어", html)
+
+    def test_render_aisearch_refresh_link_when_cached(self):
+        html = web.render_aisearch(dict(self._RESULT, from_cache=True))
+        self.assertIn("새로 찾기", html)
+        self.assertIn("fresh=1", html)
+
+    def test_ai_fresh_bypasses_cache_read(self):
+        with mock.patch.object(review, "ai_search", return_value=self._RESULT) as m:
+            web.render_search(self.store, self.cfg,
+                              {"q": ["리포트"], "ai": ["1"], "fresh": ["1"]}, "2026-07-13")
+        self.assertFalse(m.call_args.kwargs.get("use_cache", True))
 
     def test_render_search_ai_fallback_on_error(self):
         with mock.patch.object(review, "ai_search",

@@ -357,7 +357,9 @@ details.adv input[type=text], details.adv select { padding: 4px 7px; font-size: 
 .aidsl code { background: var(--surface); padding: 2px 8px; border-radius: 6px;
     border: 1px solid var(--border); color: var(--ink); }
 .aiedit { font-size: 12.5px; color: var(--accent); text-decoration: none; }
+.aiexp { color: var(--ink-3); font-size: 12.5px; margin: 4px 0; }
 .ainote { color: var(--ink-3); font-size: 13px; margin: 2px 0 10px; }
+.airefresh { color: var(--accent); text-decoration: none; }
 .aihead { margin: 12px 0 6px; font-weight: 600; }
 .aicards { list-style: none; margin: 0; padding: 0; counter-reset: ai; }
 .aicards .aicard { counter-increment: ai; position: relative; padding: 10px 12px 10px 40px;
@@ -1289,7 +1291,8 @@ _APP_JS = r"""
     if (a.closest(".more")) return; /* '더 보기'는 관찰자/전체 페이지 폴백이 처리 */
     e.preventDefault();
     if (a.classList && a.classList.contains("mrow")) a.classList.add("read");  /* 낙관적: 클릭 즉시 볼드 해제 */
-    if (a.classList && a.classList.contains("aibtn")) {   /* AI 검색은 1~3분 — 진행 표시 */
+    if (a.classList && (a.classList.contains("aibtn")
+        || a.classList.contains("airefresh"))) {          /* AI 검색은 1~3분 — 진행 표시 */
       var li = left.querySelector(".inner") || left;
       li.innerHTML =
         "<div class='aiwait'><span class='spin'></span><div class='aiwaitbody'>"
@@ -2484,11 +2487,15 @@ def render_aisearch(result: dict) -> str:
     items = result.get("items", [])
     others = result.get("others", [])
     dsl_href = "/search?q=" + urllib.parse.quote(dsl or raw)
+    fresh_href = "/search?ai=1&fresh=1&q=" + urllib.parse.quote(raw)
     out = [f"<h1>AI 검색 <span class='aiq'>· {esc(raw)}</span></h1>"]
     if dsl:
         out.append(
             "<div class='aidsl'>AI 해석 <code>" + esc(dsl) + "</code>"
             f"<a class='aiedit' href='{esc(dsl_href)}'>편집·일반검색</a></div>")
+    exps = result.get("expansions") or []
+    if exps:
+        out.append("<p class='aiexp'>확장 검색어: " + esc(", ".join(exps[:8])) + "</p>")
     if result.get("note"):
         out.append(f"<p class='ainote'>{esc(result['note'])}</p>")
     if items:
@@ -2498,7 +2505,8 @@ def render_aisearch(result: dict) -> str:
     else:
         out.append(
             "<p class='empty'>정확히 맞는 메일을 찾지 못했습니다. "
-            f"<a href='{esc(dsl_href)}'>일반 검색으로 보기</a></p>")
+            f"<a href='{esc(dsl_href)}'>일반 검색으로 보기</a> · "
+            f"<a class='airefresh' href='{esc(fresh_href)}'>다르게 다시 찾기</a></p>")
     if others:
         out.append(
             f"<details class='aiothers'><summary>그 외 후보 {len(others)}건</summary>"
@@ -2518,7 +2526,8 @@ def render_aisearch(result: dict) -> str:
     out.append(
         "<p class='aifoot'>후보 " + str(result.get("candidate_count", 0))
         + f"개 검토 · {esc(result.get('backend', ''))}{extra}{cache} · "
-        f"<a href='{esc(dsl_href)}'>일반 검색 결과 보기</a></p>")
+        f"<a href='{esc(dsl_href)}'>일반 검색 결과 보기</a> · "
+        f"<a class='airefresh' href='{esc(fresh_href)}'>새로 찾기</a></p>")
     return "\n".join(out)
 
 
@@ -2527,8 +2536,10 @@ def render_search(store, cfg, qs, today: str) -> str:
     # AI 검색 모드(?ai=1) — 흐릿한 자연어를 번역·재순위·심층읽기로. 명시적 클릭에서만.
     ai_banner = ""
     if (qs.get("ai") or [""])[0] == "1" and raw:
+        fresh = (qs.get("fresh") or [""])[0] == "1"   # 캐시 우회 재실행('새로 찾기')
         try:
-            return render_aisearch(review.ai_search(store, cfg, raw, today))
+            return render_aisearch(
+                review.ai_search(store, cfg, raw, today, use_cache=not fresh))
         except review.AIError as e:
             # AI CLI 부재·타임아웃 등 → 일반 검색으로 폴백(막다른 길 방지)
             ai_banner = ("<div class='aifail'>AI 검색을 쓸 수 없습니다 — "
