@@ -1919,40 +1919,57 @@ def _list_flt(qs) -> str:
     return ""
 
 
-def _awaiting_thread_ids(store) -> set:
-    """'↩ 내 응답 대기' 스레드 — 마지막 메일이 수신이고 To(3인 미만)에 내가 포함.
+# 목록 신호 캐시(응답대기·기한/요청) — 매 렌더마다 스레드 전수(기한은 본문+정규식까지)
+# 훑던 것을 데이터 지문(MAX(rowid))으로 게이트해 재사용. 신호는 메시지 데이터의 순수
+# 함수라 새 수집 때만 재계산. **hidden 필터는 넣지 않는다** — 호출부가 쿼리에서 라이브로
+# 제외하므로(숨김/해제 즉시 반영) 여기서 빼면 캐시가 hidden 변경에 무효화될 필요가 없다.
+_signal_cache = {"key": None, "await": frozenset(), "deadline": frozenset()}
+_signal_cache_lock = threading.Lock()
 
-    스레드 상세의 ↩ 신호와 동일 판정. 숨김 스레드는 제외."""
+
+def _signal_sets(store) -> tuple:
+    """(응답대기 스레드, 기한/요청 스레드) — 데이터 지문 게이트 캐시. hidden 무관."""
+    data_tok = store.db.execute(
+        "SELECT COALESCE(MAX(rowid), 0) FROM messages").fetchone()[0]
+    key = (str(store.db_path), tuple(sorted(store.my_addresses)), data_tok)
+    with _signal_cache_lock:
+        if _signal_cache["key"] == key:
+            return _signal_cache["await"], _signal_cache["deadline"]
     me = store.my_addresses
-    out: set = set()
+    aw: set = set()
     for r in store.db.execute(
             """SELECT t.id, m.is_sent, m.to_addrs FROM threads t
                JOIN messages m ON m.id = (
                  SELECT id FROM messages WHERE thread_id=t.id
-                 ORDER BY sent_on DESC, id DESC LIMIT 1)
-               WHERE (t.hidden IS NULL OR t.hidden=0)"""):
+                 ORDER BY sent_on DESC, id DESC LIMIT 1)"""):
         if r["is_sent"]:
             continue
         tos = [a for a in (r["to_addrs"] or "").split(";") if a]
         if len(tos) < 3 and set(tos) & me:
-            out.add(r["id"])
-    return out
-
-
-def _deadline_thread_ids(store) -> set:
-    """'⏰ 기한/요청' 스레드 — 수신 메일 본문에 기한/요청 신호(DEADLINE_RX).
-
-    스레드 상세의 ⏰ 신호와 동일 판정. 숨김 스레드는 제외."""
-    out: set = set()
+            aw.add(r["id"])
+    dl: set = set()
     for r in store.db.execute(
-            "SELECT m.thread_id, m.new_content FROM messages m "
-            "JOIN threads t ON t.id=m.thread_id "
-            "WHERE m.is_sent=0 AND (t.hidden IS NULL OR t.hidden=0)"):
-        if r["thread_id"] in out:
+            "SELECT thread_id, new_content FROM messages WHERE is_sent=0"):
+        if r["thread_id"] in dl:
             continue
         if review.DEADLINE_RX.search(strip_preserved(r["new_content"] or "")):
-            out.add(r["thread_id"])
-    return out
+            dl.add(r["thread_id"])
+    aw, dl = frozenset(aw), frozenset(dl)
+    with _signal_cache_lock:
+        _signal_cache.update({"key": key, "await": aw, "deadline": dl})
+    return aw, dl
+
+
+def _awaiting_thread_ids(store) -> frozenset:
+    """'↩ 내 응답 대기' 스레드 — 마지막 메일이 수신이고 To(3인 미만)에 내가 포함.
+    스레드 상세의 ↩ 신호와 동일. hidden 제외는 호출부 쿼리가 담당(캐시는 `_signal_sets`)."""
+    return _signal_sets(store)[0]
+
+
+def _deadline_thread_ids(store) -> frozenset:
+    """'⏰ 기한/요청' 스레드 — 수신 메일 본문에 기한/요청 신호(DEADLINE_RX).
+    스레드 상세의 ⏰ 신호와 동일. hidden 제외는 호출부 쿼리가 담당(캐시는 `_signal_sets`)."""
+    return _signal_sets(store)[1]
 
 
 def _ids_cond(ids: set, col: str) -> str:
@@ -1979,22 +1996,57 @@ def _list_filter_bar(base: str, active: str, counts: dict) -> str:
             + "</span></div>")
 
 
-def _noise_thread_ids(store, cfg) -> set:
-    """'노이즈 스레드' = 비노이즈 수신 메일이 하나도 없는 스레드(수신 전부 노이즈).
+# 노이즈 스캔 캐시 — 매 목록 렌더(/threads·/mail)마다 수신 전수를 훑어 cfg.is_noise
+# 하던 것을 (설정+데이터) 지문으로 게이트해 재사용한다. 지문이 같으면 스캔 건너뛰고,
+# ① 노이즈 설정(아래 4개 리스트) 변경 ② 새 메일 수집(MAX(rowid) 증가) 일 때만 1회
+# 재계산. 결과는 라이브 계산과 동일 — 노이즈 판정 입력(sender/subject/is_sent/thread)은
+# 수집 후 불변이고, 스레드 병합도 수집 시 일어나 max_rowid 로 잡힌다. 단일 사용자·단일
+# 스레드 서버라 락은 가벼운 방어용(백그라운드 수집이 max_rowid 를 올리면 다음 렌더가
+# 재계산). 두 세트를 한 스캔으로: thread_ids(스레드 전부 노이즈 — /threads 제외용),
+# msg_ids(노이즈 수신 메시지 — /mail 메시지 단위 제외용).
+_noise_cache = {"key": None, "thread_ids": frozenset(), "msg_ids": frozenset()}
+_noise_cache_lock = threading.Lock()
 
-    스레드 목록의 일반 탭에서 제외한다 — 메일함이 개별 노이즈 메시지를 빼는 것과
-    같은 스코프. 숨김 탭에서는 제외하지 않아 숨긴 노이즈도 여기서 찾아 복구할 수 있다.
-    발신만 있는 스레드(수신 0건)는 노이즈로 보지 않는다(내가 시작한 대화).
-    """
+
+def _noise_config_version(cfg) -> tuple:
+    """is_noise / is_noise_subject_strong 이 의존하는 설정 표면 전체(지문 재료).
+    새 노이즈 입력을 추가하면 여기에도 넣어야 캐시가 stale 되지 않는다."""
+    return (tuple(cfg.ignore_senders), tuple(cfg.blocked_senders),
+            tuple(cfg.internal_domains), tuple(cfg.subject_noise_strong))
+
+
+def _noise_sets(store, cfg) -> tuple:
+    """(noise_thread_ids, noise_msg_ids) — (db·설정·데이터) 지문 게이트 캐시."""
+    data_tok = store.db.execute(
+        "SELECT COALESCE(MAX(rowid), 0) FROM messages").fetchone()[0]
+    key = (str(store.db_path), _noise_config_version(cfg), data_tok)
+    with _noise_cache_lock:
+        if _noise_cache["key"] == key:
+            return _noise_cache["thread_ids"], _noise_cache["msg_ids"]
     recv: set = set()       # 수신 메일이 있는 스레드
     real: set = set()       # 비노이즈 수신 메일이 하나라도 있는 스레드
+    nmsg: set = set()       # 노이즈 수신 메시지 id
     for r in store.db.execute(
-            "SELECT thread_id, sender_addr, subject FROM messages WHERE is_sent=0"):
+            "SELECT id, thread_id, sender_addr, subject FROM messages "
+            "WHERE is_sent=0"):
         recv.add(r["thread_id"])
-        if not (cfg.is_noise(r["sender_addr"])
-                or cfg.is_noise_subject_strong(r["subject"])):
+        if cfg.is_noise(r["sender_addr"]) or cfg.is_noise_subject_strong(r["subject"]):
+            nmsg.add(r["id"])
+        else:
             real.add(r["thread_id"])
-    return recv - real
+    tset, mset = frozenset(recv - real), frozenset(nmsg)
+    with _noise_cache_lock:
+        _noise_cache.update(key=key, thread_ids=tset, msg_ids=mset)
+    return tset, mset
+
+
+def _noise_thread_ids(store, cfg) -> frozenset:
+    """'노이즈 스레드' = 비노이즈 수신 메일이 하나도 없는 스레드(수신 전부 노이즈).
+
+    스레드 목록의 일반 탭에서 제외 — 숨김 탭에선 유지(복구). 발신만 있는 스레드
+    (수신 0건)는 노이즈로 보지 않는다(내가 시작한 대화). 캐시는 `_noise_sets` 참고.
+    """
+    return _noise_sets(store, cfg)[0]
 
 
 def render_mail(store, cfg, offset: int = 0, flt: str = "") -> str:
@@ -2007,6 +2059,7 @@ def render_mail(store, cfg, offset: int = 0, flt: str = "") -> str:
     # 신호 필터(응답 대기·기한/요청)는 스레드 단위 판정 — 소속 메일을 보여준다
     await_ids = _awaiting_thread_ids(store)
     dead_ids = _deadline_thread_ids(store)
+    _, noise_msg = _noise_sets(store, cfg)   # 메시지 단위 노이즈(캐시) — is_noise 재계산 제거
     if flt == "hidden":
         tcond = "t.hidden=1"
     else:
@@ -2032,8 +2085,7 @@ def render_mail(store, cfg, offset: int = 0, flt: str = "") -> str:
     for r in raw:
         consumed += 1
         # 숨김 탭은 복구용 — 노이즈여도 보여준다(전체/미개봉/플래그 탭만 노이즈 제외).
-        if flt != "hidden" and (cfg.is_noise(r["sender_addr"])
-                                or cfg.is_noise_subject_strong(r["subject"])):
+        if flt != "hidden" and r["id"] in noise_msg:
             continue
         badge = "🚩 " if r["flagged"] else ""
         cls = "mrow read" if r["read_at"] else "mrow"   # 읽음=제목 볼드 해제
@@ -2052,14 +2104,13 @@ def render_mail(store, cfg, offset: int = 0, flt: str = "") -> str:
     # 카운트 — 한 번의 스캔(노이즈 필터 반영). 숨김은 total 에서 빠지고 따로 센다.
     total = n_unread = n_await = n_dead = n_flag = n_hidden = 0
     for r in store.db.execute(
-            "SELECT m.thread_id, m.sender_addr, m.subject, m.read_at, "
-            "t.flagged, t.hidden "
+            "SELECT m.id, m.thread_id, m.read_at, t.flagged, t.hidden "
             "FROM messages m JOIN threads t ON t.id=m.thread_id WHERE m.is_sent=0"):
         # 숨김은 노이즈 포함해 센다(복구용). 전체/미개봉/… 는 노이즈 제외.
         if r["hidden"]:
             n_hidden += 1
             continue
-        if cfg.is_noise(r["sender_addr"]) or cfg.is_noise_subject_strong(r["subject"]):
+        if r["id"] in noise_msg:      # 메시지 단위 노이즈(캐시) — is_noise 재계산 없음
             continue
         total += 1
         if not r["read_at"]:

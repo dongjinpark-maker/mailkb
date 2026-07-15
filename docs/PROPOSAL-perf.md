@@ -34,6 +34,23 @@
 - **keep-alive 연결** (`serve()`): idle 읽기 연결 하나를 상시 열어 요청 close 가
   '마지막 연결'이 아니게 함 → 요청당 WAL 체크포인트 폭주 제거(~2x).
 
+## 2-b. 목록 신호 캐시 — 매 렌더 전수 스캔 제거 (구현됨, 결과 불변)
+
+`/mail`·`/threads` 렌더가 매번 수신 전수를 훑던 3개 신호를 (설정·데이터) 지문으로
+게이트해 캐시. **측정(30k통): render_mail 364→31ms, render_threads 345→19ms.**
+- **noise**(스레드 단위 + 메시지 단위 한 스캔): 키 = (db·`ignore/blocked/internal/subject_strong`
+  해시·`MAX(rowid)`). 설정 변경(차단·규칙)·새 수집일 때만 재계산. 값 자체를 해시하므로
+  경로(웹 차단·파일 편집·git pull) 무관하게 감지 → **staleness 없음**(라이브와 동일).
+  `_noise_sets`/`_noise_thread_ids`; render_mail 은 메시지 단위 세트로 `cfg.is_noise`
+  재계산 제거(74→~17ms).
+- **응답대기·기한/요청**(`_signal_sets`): 지문 = (db·my_addr·`MAX(rowid)`). 기한은 수신
+  본문 전수+정규식(측정 **317ms**)이라 이득이 가장 큼. **hidden 필터는 캐시에서 빼고
+  호출부 쿼리가 라이브 제외** → 숨김/해제가 캐시 무효화 없이 즉시 반영(신호는 메시지
+  데이터의 순수 함수). `test_signal_cache_hide_unhide_correct` 가 이 경계를 가드.
+- 스레드 안전: 백그라운드 잡(수집)은 캐시를 만지지 않고 `MAX(rowid)`만 올림 → 다음
+  렌더가 감지·재계산. 락은 dict 갱신 방어용. 잔여 비용: 새 수집 직후 **1회 렌더**만
+  재계산(그 외 렌더는 히트). 테스트 4종(설정·데이터 무효화·히트·hide/unhide).
+
 ## 3. Batch 2 — sync 백그라운드화 (구현됨)
 
 `/sync`(수동)·`/autosync`(주기)가 서빙 스레드에서 COM 수집을 돌려 **UI 전체를

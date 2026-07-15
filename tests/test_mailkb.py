@@ -4459,5 +4459,75 @@ class TestAISearchWeb(unittest.TestCase):
         self.assertEqual(cfgmod.load(self.cfg.home).ai_search_backend, "haiku")
 
 
+class TestNoiseCache(unittest.TestCase):
+    """노이즈 스캔 캐시 — (설정+데이터) 지문 게이트: 결과 라이브와 동일, 스캔은 변경 시만."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "t.sqlite", [ME])
+        self.cfg = Config(home=Path(self.tmp.name), my_addresses=[ME],
+                          ignore_senders=["noreply"])   # 직접 구성 Config 는 기본 비어있음
+        self.store.ingest([
+            _recx("a1", "kim@corp.example", "실제 업무", "2026-07-01T09:00:00",
+                  body="검토 요청드립니다"),
+        ])
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_config_change_invalidates(self):
+        # 정상 발신자 → 노이즈 아님. 차단(설정 변경) 후 재조회 → 노이즈로 반영(재계산).
+        from mailkb import config as cfgmod
+        _, msg = web._noise_sets(self.store, self.cfg)
+        self.assertEqual(len(msg), 0)
+        cfgmod.add_blocked(self.cfg, "kim@corp.example")   # 설정 지문 변경
+        thr2, msg2 = web._noise_sets(self.store, self.cfg)
+        self.assertEqual(len(msg2), 1)      # 이제 노이즈 메시지
+        self.assertEqual(len(thr2), 1)      # 스레드도 전부 노이즈
+
+    def test_new_ingest_invalidates(self):
+        # 새 수집(max_rowid 변경) → 재계산으로 새 노이즈 반영
+        _, msg0 = web._noise_sets(self.store, self.cfg)
+        self.store.ingest([_recx("n1", "noreply@x.example", "자동 알림",
+                                 "2026-07-02T09:00:00", body="자동발송")])
+        _, msg1 = web._noise_sets(self.store, self.cfg)
+        self.assertEqual(len(msg1), len(msg0) + 1)   # noreply = ignore_senders 매치
+
+    def test_cache_hit_skips_rescan(self):
+        # 변경 없으면 스캔 안 함 — is_noise 를 폭탄으로 바꿔도 캐시 히트면 호출 안 됨
+        web._noise_sets(self.store, self.cfg)          # 캐시 채움
+        with mock.patch.object(self.cfg, "is_noise",
+                               side_effect=AssertionError("재스캔 금지")):
+            thr, msg = web._noise_sets(self.store, self.cfg)   # 히트 → is_noise 미호출
+        self.assertEqual(len(msg), 0)
+
+    def test_mail_and_threads_agree_with_live(self):
+        # 리팩터가 라이브 판정과 동일한지 — 노이즈 1통 섞어 넣고 필터 확인
+        self.store.ingest([_recx("s1", "noreply@x.example", "자동", "2026-07-03T09:00:00",
+                                 body="자동발송")])
+        html = web.render_mail(self.store, self.cfg)
+        self.assertNotIn("자동", html)                 # 노이즈 메시지 제외됨
+        self.assertIn("실제 업무", html)                # 실제 메일은 표시
+
+    def test_signal_cache_hide_unhide_correct(self):
+        # 신호 캐시는 hidden 무관 — 숨김/해제는 호출부 라이브 필터가 즉시 반영(캐시 무효화 X)
+        self.store.ingest([_recx("w1", "boss@corp.example", "확인 요청",
+                                 "2026-07-05T09:00:00", body="확인 부탁", to=[ME])])
+        tid = self.store.db.execute(
+            "SELECT thread_id FROM messages WHERE sender_addr='boss@corp.example'"
+        ).fetchone()[0]
+        aw, _ = web._signal_sets(self.store)
+        self.assertIn(tid, aw)                         # 응답 대기 신호
+        self.assertIn("확인 요청", web.render_mail(self.store, self.cfg, flt="awaiting"))
+        self.store.hide_thread(tid, True)              # 데이터 불변, hidden 만 변경
+        aw2, _ = web._signal_sets(self.store)
+        self.assertEqual(aw, aw2)                      # 캐시 그대로(무효화 안 됨)
+        self.assertNotIn("확인 요청",                   # 그래도 라이브 필터로 제외
+                         web.render_mail(self.store, self.cfg, flt="awaiting"))
+        self.store.hide_thread(tid, False)             # 해제 → 다시 보임
+        self.assertIn("확인 요청", web.render_mail(self.store, self.cfg, flt="awaiting"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
