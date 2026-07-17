@@ -5,7 +5,7 @@
 브라우저가 한글·HTML 렌더를 담당 → curses(windows-curses)의 CJK 한계를 우회.
 표시용 HTML 은 store 에 이미 정제되어 저장됨(clean.sanitize_html) + 여기 CSP 로 이중 방어.
 
-화면: 홈(개입 큐 흡수) · 메일함 · 스레드 · 검색 · 데일리 · 통계 · 설정.
+화면: 홈(지금 할 일 흡수) · 메일함 · 스레드 · 검색 · 기억 · 통계 · 설정.
 조작(POST): 동기화 · 플래그/숨김/추적 · 노트 · Outlook 열기 · 첨부 · 설정 저장.
 """
 
@@ -231,12 +231,6 @@ button.flag.on { color: var(--danger); }            /* ⚑ 플래그(색 있음)
          background: var(--toast-bg); color: #fff; padding: 10px 16px; border-radius: 8px;
          box-shadow: 0 2px 10px rgba(0,0,0,.25); font-size: 14px; }
 h1 { font-size: 20px; } h2 { font-size: 17px; margin-top: 22px; }
-.lens { display: block; padding: 12px 14px; margin: 8px 0; border: 1px solid var(--border);
-        border-radius: 8px; background: var(--surface); }
-.lens:hover { border-color: var(--accent); text-decoration: none; }
-.lens .q { font-size: 16px; font-weight: 600; color: var(--ink); }
-.lens .cnt { float: right; color: var(--ink-2); font-weight: 600; }
-.badge-urgent { color: var(--danger); }
 .cat { margin: 18px 0 6px; font-weight: 700; }
 .item { padding: 7px 10px; margin: 4px 0; border-left: 3px solid var(--border-strong);
         background: var(--surface); border-radius: 0 6px 6px 0; }

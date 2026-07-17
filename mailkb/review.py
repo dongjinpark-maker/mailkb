@@ -18,12 +18,11 @@ from . import actions, features
 from . import search as search_mod
 from .clean import strip_preserved
 from .config import Config
-from .features import DECISION_RX, DEADLINE_RX, REQUEST_RX, is_trivial_msg
+from .features import DECISION_RX, DEADLINE_RX, is_trivial_msg
 from .store import Store
 
 # Compatibility aliases for callers and tests using review's historical names.
 _DECISION_RX = DECISION_RX
-_REQUEST_RX = REQUEST_RX
 _is_trivial_msg = is_trivial_msg
 
 
