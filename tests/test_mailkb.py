@@ -1755,21 +1755,127 @@ class TestDecisionLedger(unittest.TestCase):
         det["harvest"] = {
             "delta": [f"ECN 확정 #{self.tid}"],
             "decisions": [{"thread_id": self.tid, "title": "B안 채택",
-                           "decider": "김민수", "rationale": "비용"}],
+                           "decider": "김민수", "rationale": "비용"},
+                          {"thread_id": self.tid + 100, "title": "C안 보류",
+                           "decider": "", "rationale": ""}],
             "person": [{"who": "김민수", "signal": "ECN 담당",
                         "thread_id": self.tid}],
             "project": [{"thread_id": self.tid, "signal": "대기 → 완료"}],
             "dropped": 0,
         }
         md = review.render(det)
-        self.assertIn("## 오늘 델타", md)
-        self.assertIn("## 장기기억 제안 (1건", md)
-        self.assertIn(f"[#{self.tid}] B안 채택 (김민수) — 비용", md)
-        self.assertIn("## 인물 신호", md)
-        self.assertIn("## 프로젝트 신호", md)
+        # 델타+제안 병합 — 델타가 이미 언급한 스레드(#tid)의 제안은 별도 줄 없음,
+        # 안 언급된 제안(C안)만 항목으로. 말미에 반영 대기 안내.
+        self.assertIn("## 오늘 확정·변경 (2건)", md)
+        self.assertIn(f"ECN 확정 #{self.tid}", md)
+        self.assertNotIn("B안 채택", md)
+        self.assertIn(f"[#{self.tid + 100}] C안 보류", md)
+        self.assertIn("※ 장기기억 반영 대기 2건", md)
+        # 인물·프로젝트 신호는 '참고'로
+        self.assertIn("- 인물: 김민수 — ECN 담당", md)
+        self.assertIn(f"- 프로젝트: [#{self.tid}] 대기 → 완료", md)
         # 수확 없으면(비-AI 데일리) 섹션 자체가 없음
         det.pop("harvest")
-        self.assertNotIn("오늘 델타", review.render(det))
+        md2 = review.render(det)
+        self.assertNotIn("오늘 확정·변경", md2)
+        self.assertNotIn("장기기억", md2)
+
+
+class TestDailyRender(unittest.TestCase):
+    """데일리 재구성(2026-07-17) — 머리 요약·할 일 평탄화·교차 중복 제거·참고."""
+
+    @staticmethod
+    def _det(**kw):
+        base = {
+            "date": "2026-07-17", "sent": [], "received_count": 3,
+            "unanswered": [], "deadlines": [], "intervention": [],
+            "intervention_candidates": [],
+            "digest": {"work": [], "n_spam": 0, "n_notice": 0},
+            "closed_by_me": [],
+        }
+        base.update(kw)
+        return base
+
+    def test_head_stat_line_without_ai(self):
+        md = review.render(self._det(intervention=[
+            {"category": "respond", "thread_id": 7, "who": "김", "subject": "회신건",
+             "days": 1, "personal": True, "tag": "⏰", "snippet": "부탁드립니다"}]))
+        self.assertEqual(
+            md.splitlines()[2],
+            "수신 3 · 발신 0 · 할 일 1 — 최우선: [#7] 회신건 · ⏰기한")
+
+    def test_head_exec_summary_replaces_stat(self):
+        md = review.render(self._det(exec_summary="오늘은 조용했다 (#3)."))
+        self.assertIn("오늘은 조용했다 (#3).", md)
+        self.assertNotIn("수신 3 · 발신 0", md)
+
+    def test_todo_flat_markers_and_sub_line(self):
+        md = review.render(self._det(intervention=[
+            {"category": "decide", "thread_id": 5, "who": "박", "subject": "결정건",
+             "days": 2, "personal": True, "tag": "", "snippet": "승인 부탁드립니다",
+             "ai_priority": "상", "ai_reason": "품의 대기", "ai_action": "승인 회신",
+             "ai_flag": ""},
+            {"category": "respond", "thread_id": 6, "who": "이", "subject": "회신건",
+             "days": 0, "personal": False, "tag": "⏰", "snippet": "회신 부탁드립니다"},
+            {"category": "stalled_thread", "thread_id": 8, "who": "최",
+             "subject": "정체건", "days": 4, "personal": False, "tag": "",
+             "snippet": "무응답"},
+        ]))
+        self.assertIn("## 지금 할 일 (3건)", md)
+        # 그룹 헤더 없이 항목별 종류 마커 + 긴급도 칩
+        self.assertNotIn("**🔴", md)
+        self.assertIn("- 🔴결정 [상] ★ [#5] 박: 결정건 — D+2", md)
+        self.assertIn("  ↳ 품의 대기 → 승인 회신", md)     # AI 있으면 사유·제안
+        self.assertIn("- 🟠회신 [#6] 이: 회신건 — D+0 · ⏰기한", md)
+        self.assertIn("  「회신 부탁드립니다」", md)         # AI 없으면 근거 인용
+        self.assertIn("- ⚪정체 [#8] 최: 정체건 — 영업 4d", md)
+        self.assertNotIn("「무응답」", md)                   # 정체는 인용 없음
+
+    def test_flow_dedups_todo_changes_and_closed(self):
+        md = review.render(self._det(
+            intervention=[{"category": "respond", "thread_id": 1, "who": "김",
+                           "subject": "A", "days": 0, "personal": False,
+                           "tag": "", "snippet": ""}],
+            harvest={"delta": ["B안 확정 (#2)"], "decisions": [],
+                     "person": [], "project": []},
+            closed_by_me=[{"thread_id": 4, "subject": "D"}],
+            digest={"work": [
+                {"thread_id": 1, "subject": "A", "who": "김", "is_sent": False,
+                 "lead": "a", "ai_core": ""},
+                {"thread_id": 2, "subject": "B", "who": "박", "is_sent": False,
+                 "lead": "b", "ai_core": ""},
+                {"thread_id": 3, "subject": "C", "who": "이", "is_sent": False,
+                 "lead": "c", "ai_core": ""},
+                {"thread_id": 4, "subject": "D", "who": "최", "is_sent": True,
+                 "lead": "d", "ai_core": ""},
+            ], "n_spam": 1, "n_notice": 2}))
+        # 할 일(#1)·확정(#2)·오늘 종결(#4)에 나온 스레드는 흐름에서 제외
+        self.assertIn("## 오늘 흐름 (그 외 1건)", md)
+        self.assertIn("[#3] C (이) — c", md)
+        flow = md.split("## 오늘 흐름")[1].split("## 참고")[0]
+        for ref in ("#1", "#2", "#4"):
+            self.assertNotIn(ref, flow)
+        self.assertIn("- 수신 3건 · 공지 2 · 노이즈 1 처리됨", md)
+
+    def test_reference_deadline_residual_only(self):
+        md = review.render(self._det(
+            intervention=[{"category": "respond", "thread_id": 1, "who": "김",
+                           "subject": "A", "days": 0, "personal": False,
+                           "tag": "⏰", "snippet": ""}],
+            deadlines=[(1, "A", "내일까지 회신"), (9, "공지", "금일 18시까지")]))
+        ref = md.split("## 참고")[1]
+        # 할 일에 이미 ⏰ 로 붙은 스레드의 기한은 참고에 반복하지 않는다
+        self.assertIn("- 기한: [#9] 공지 — 「금일 18시까지」", ref)
+        self.assertNotIn("내일까지 회신", ref)
+
+    def test_reference_sent_and_closed(self):
+        md = review.render(self._det(
+            sent=[{"sent_on": "2026-07-17T09:12:00", "subject": "RE: A",
+                   "to_addrs": "kim@x"}],
+            closed_by_me=[{"thread_id": 4, "subject": "D요청"}]))
+        self.assertIn("- 내가 보낸 것 (1건)", md)
+        self.assertIn("  - 09:12 RE: A → kim@x", md)
+        self.assertIn("- 내 회신으로 종결된 요청 (1건): [#4] D요청", md)
 
 
 class TestDecisionRegex(unittest.TestCase):
@@ -2413,6 +2519,7 @@ class TestAILayer(unittest.TestCase):
         self.assertIn("오늘 메일 핵심 요약 중…", stages)
         self.assertIn("개입 큐 AI 분류 중…", stages)       # 분류(haiku)
         self.assertIn("개입 큐 우선순위 정리 중…", stages)   # 정제(haiku)
+        self.assertIn("하루 요약 작성 중…", stages)         # Executive Summary
 
     def test_run_ai_layer_routes_summary_and_classify_backends(self):
         # 요약/회고 → summary 백엔드(sonnet), 개입 분류/정제 → classify 백엔드(haiku)
@@ -2440,6 +2547,51 @@ class TestAILayer(unittest.TestCase):
         self.assertEqual(classify_cmds, {"H"})   # 분류 = haiku
         self.assertEqual(summary_cmds, {"S"})     # 요약 = sonnet
         self.assertNotIn("I", {c for c, _ in seen})  # default(internal) 미사용
+
+    def test_exec_summary_prompt_facts_and_graceful(self):
+        det = {
+            "date": "2026-07-20", "received_count": 5,
+            "sent": [{"sent_on": "2026-07-20T09:12:00", "subject": "RE: A",
+                      "to_addrs": "kim@x"}],
+            "closed_by_me": [{"thread_id": 4, "subject": "D요청"}],
+            "intervention": [
+                {"category": "respond", "thread_id": 7, "who": "김",
+                 "subject": "회신건", "days": 1, "personal": True, "tag": "⏰",
+                 "snippet": "내일까지 회신 부탁드립니다"}],
+            "harvest": {"delta": ["B안 확정 (#2)"], "decisions": [
+                {"thread_id": 9, "title": "C안 채택", "decider": "박"}]},
+            "digest": {"work": [
+                {"thread_id": 3, "subject": "흐름건", "who": "이",
+                 "is_sent": False, "lead": "리드", "ai_core": ""}]},
+        }
+        prompts = []
+
+        def fake(cmd, prompt, **kw):
+            prompts.append(prompt)
+            return "하루 요약입니다 (#7)."
+
+        with mock.patch.object(review, "ai_run", side_effect=fake):
+            out = review.ai_exec_summary(self.store, self.cfg, det)
+        self.assertEqual(out, "하루 요약입니다 (#7).")
+        p = prompts[0]
+        # 이미 추출된 사실만 — 할 일(카테고리 라벨·기한·근거), 활동(발신·종결), 흐름
+        self.assertIn("[#7] 🟠 회신 필요 · 김: 회신건 (D+1 · ⏰기한)", p)
+        self.assertIn("「내일까지 회신 부탁드립니다」", p)
+        self.assertIn("보낸 메일 1건", p)
+        self.assertIn("- 09:12 RE: A", p)
+        self.assertIn("내 회신으로 요청 종결: [#4] D요청", p)
+        self.assertIn("B안 확정 (#2)", p)
+        self.assertIn("[#9] C안 채택 (박)", p)
+        self.assertIn("[#3] 흐름건 — 리드", p)
+        self.assertIn("수신 5건", p)
+        # 실패·백엔드 미설정 → None (graceful, render 가 결정론 한 줄로 대체)
+        with mock.patch.object(review, "ai_run",
+                               side_effect=review.AIError("x")):
+            self.assertIsNone(review.ai_exec_summary(self.store, self.cfg, det))
+        cfg_none = Config(home=self.home, my_addresses=[ME],
+                          ai_summary_backend="ghost")
+        self.assertIsNone(review.ai_exec_summary(self.store, cfg_none, det,
+                                                 backend="ghost"))
 
     def test_ai_rules_text_strips_comments(self):
         self.assertEqual(self.cfg.ai_rules_text(), "")  # 파일 없음 → 빈 문자열
@@ -3667,7 +3819,9 @@ class TestWeb(unittest.TestCase):
         self.assertIn("완료", self.web._review_job["msg"])
         p = self.cfg.vault / "daily" / "2026-07-04.md"
         self.assertTrue(p.exists())
-        self.assertIn("오늘 메일 핵심", p.read_text(encoding="utf-8"))
+        body = p.read_text(encoding="utf-8")
+        self.assertIn("## 지금 할 일", body)          # 재구성 레이아웃(2026-07-17)
+        self.assertIn("## 참고", body)
 
     def test_start_review_guard_when_running(self):
         self.web._review_job.update(running=True, msg="")
@@ -3698,16 +3852,16 @@ class TestWeb(unittest.TestCase):
         self.assertIn("libscene", inner)                  # 사서 애니메이션 씬
         self.assertIn("rvfill indet", inner)
         self.assertNotIn("단계", inner)
-        # 단계 진행(_job_progress): step 증가 → 채워지는 바 + '단계 2/5'
+        # 단계 진행(_job_progress): step 증가 → 채워지는 바 + '단계 2/6'
         w._job_progress("누적 요약 갱신 중…")
         w._job_progress("결정·신호 수확 중…")
         inner2, _ = w.render_review_status(self.store)
-        self.assertIn("단계 2/5", inner2)
-        self.assertIn("width:40%", inner2)                # 2/5 = 40%
+        self.assertIn("단계 2/6", inner2)
+        self.assertIn("width:33%", inner2)                # 2/6 = 33%
         self.assertIn("결정·신호 수확 중…", inner2)
         self.assertIn("id='rv-stage'", inner2)            # app.js 패치 타깃
         w._job_progress("완료")
-        self.assertEqual(w._review_job["step"], 5)
+        self.assertEqual(w._review_job["step"], 6)
         w._review_job.update(running=False, msg="", step=0)
 
     def test_appjs_polls_patch_not_replace(self):
@@ -4023,6 +4177,35 @@ class TestDailyMarkdown(unittest.TestCase):
     def test_script_escaped(self):
         html = self._html("- <script>alert(1)</script>")
         self.assertNotIn("<script>", html)
+
+    # ─────────────── 재구성 레이아웃(2026-07-17) 장식·구조
+
+    def test_lead_paragraphs_become_summary_card(self):
+        html = self._html("# 2026-07-17 데일리 리뷰\n\n요약 문장 하나 (#3).\n\n"
+                          "## 지금 할 일 (0건)\n- 없음\n")
+        self.assertIn("<div class='dsum'><p>요약 문장 하나", html)
+        self.assertIn('<a href="/thread/3">#3</a>', html)
+        # 옛 형식(머리 문단 없음) → 카드 없음, 기존 렌더 그대로
+        self.assertNotIn("dsum", self._html("# d\n\n## 오늘 델타\n- x\n"))
+
+    def test_reference_section_folds_as_details(self):
+        html = self._html("## 지금 할 일 (0건)\n- 없음\n\n"
+                          "## 참고\n- 수신 3건 처리됨\n")
+        self.assertIn("<details class='dref'><summary>참고</summary>", html)
+        self.assertNotIn("<h2>참고</h2>", html)
+        self.assertTrue(html.rstrip().endswith("</details></div>"))
+
+    def test_priority_chip_star_and_continuation(self):
+        html = self._html("## 지금 할 일 (1건)\n"
+                          "- 🔴결정 [상] ★ [#5] 박: 결정건 — D+2 · ⏰기한\n"
+                          "  ↳ 품의 대기 → 승인 회신\n")
+        self.assertIn("<span class='pri hi'>상</span>", html)
+        self.assertIn("<span class='star'>★</span>", html)
+        self.assertIn("<span class='ddl'>⏰기한</span>", html)
+        # 들여쓴 부연(↳)은 항목의 연속 줄 — 목록을 끊지 않는다
+        self.assertIn("<br><span class='cont'>↳ 품의 대기 → 승인 회신</span>", html)
+        import re as _re
+        self.assertEqual(len(_re.findall(r"<ul[ >]", html)), 1)
 
 
 class TestWindowsCompat(unittest.TestCase):
@@ -5004,6 +5187,41 @@ class TestActionFold(unittest.TestCase):
         self.assertEqual(self.store.db.execute(
             "SELECT mentions_me FROM message_features WHERE message_id=?",
             (mid,)).fetchone()[0], 1)
+
+    def test_action_closed_by_me_on_replay(self):
+        # 데일리 '내 활동' 팩트 — 오늘 내 실질 회신이 열린 슬롯을 종결시킨 스레드
+        st = self.store
+        st.ingest([self._r("cb1", "kim@corp.example", [ME], "자료건",
+                           "2026-07-01T09:00:00", "자료 검토 부탁드립니다.")])
+        tid = self._tid("cb1")
+        st.ingest([self._r("cb2", ME, ["kim@corp.example"], "RE: 자료건",
+                           "2026-07-02T10:00:00", "검토 의견 드립니다.",
+                           reply_to="cb1")])
+        got = st.action_closed_by_me_on("2026-07-02")
+        self.assertEqual([(r["thread_id"], r["subject"]) for r in got],
+                         [(tid, "자료건")])
+        self.assertEqual(st.action_closed_by_me_on("2026-07-01"), [])
+        # 이후 새 요청으로 다시 열려도 '그날 종결' 사실은 유지
+        st.ingest([self._r("cb3", "kim@corp.example", [ME], "RE: 자료건",
+                           "2026-07-03T09:00:00", "추가 검토 부탁드립니다.",
+                           reply_to="cb1")])
+        self.assertEqual([r["thread_id"]
+                          for r in st.action_closed_by_me_on("2026-07-02")], [tid])
+
+    def test_action_closed_by_me_needs_open_slot_and_substance(self):
+        st = self.store
+        # 열린 슬롯이 없던 스레드에 내 회신 → 종결 아님
+        st.ingest([self._r("cu1", "kim@corp.example", [ME], "공유건",
+                           "2026-07-01T09:00:00", "자료 공유드립니다. 참고 바랍니다."),
+                   self._r("cu2", ME, ["kim@corp.example"], "RE: 공유건",
+                           "2026-07-02T10:00:00", "잘 받았습니다.", reply_to="cu1")])
+        self.assertEqual(st.action_closed_by_me_on("2026-07-02"), [])
+        # trivial 발신(++수신인 추가)은 해소가 아님 → 종결 집계 안 됨
+        st.ingest([self._r("cu3", "kim@corp.example", [ME], "요청건2",
+                           "2026-07-03T09:00:00", "검토 부탁드립니다."),
+                   self._r("cu4", ME, ["kim@corp.example"], "RE: 요청건2",
+                           "2026-07-03T10:00:00", "++박수석", reply_to="cu3")])
+        self.assertEqual(st.action_closed_by_me_on("2026-07-03"), [])
 
 
 class TestActionLadder(unittest.TestCase):

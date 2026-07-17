@@ -976,6 +976,44 @@ class Store:
             """
         ).fetchall()
 
+    def action_closed_by_me_on(self, date_iso: str) -> list[dict]:
+        """해당 날짜 내 실질 발신이 '열려 있던 액션 슬롯'을 종결시킨 스레드.
+
+        thread_state 는 현재값만 저장하므로 fold_action 재생으로 판정한다 —
+        대상이 그날 발신이 있는 스레드뿐이라 비용은 해당 스레드 크기 합에 비례.
+        이후 새 요청으로 다시 열렸어도 '그날 종결' 사실은 유지된다(데일리
+        하루 요약의 '내 활동' 근거). 반환: [{"thread_id", "subject"}] 발신순.
+        """
+        tids = [r["thread_id"] for r in self.db.execute(
+            """SELECT DISTINCT thread_id FROM messages WHERE is_sent=1
+               AND sent_on >= ? AND sent_on < date(?, '+1 day')
+               ORDER BY thread_id""", (date_iso, date_iso))]
+        out: list[dict] = []
+        for tid in tids:
+            state = dict(_EMPTY_ACTION)
+            subject = ""
+            closed = False
+            for m in self.db.execute(
+                    """SELECT m.id AS id, m.is_sent, m.sent_on,
+                              m.sender_addr, m.subject, f.*
+                       FROM messages m
+                       JOIN message_features f ON f.message_id=m.id
+                       WHERE m.thread_id=? ORDER BY m.sent_on, m.id""",
+                    (tid,)):
+                if not subject:
+                    subject = m["subject"]
+                if self._is_hard_noise(m["sender_addr"], m["subject"]):
+                    continue
+                was_open = bool(state["action_source_id"])
+                state = fold_action(state, m)
+                if (m["is_sent"] and was_open
+                        and not state["action_source_id"]
+                        and m["sent_on"][:10] == date_iso):
+                    closed = True
+            if closed:
+                out.append({"thread_id": tid, "subject": subject})
+        return out
+
     # date(sent_on)=? 는 컬럼을 함수로 감싸 idx_messages_sent_on 을 못 써 전수
     # 스캔한다. sent_on 은 'YYYY-MM-DDTHH:MM:SS' ISO 라 date 비교는 [일, 다음날)
     # 범위와 문자열상 등가 — 결과 동일하되 인덱스 범위 스캔으로 바뀐다.

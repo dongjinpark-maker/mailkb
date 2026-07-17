@@ -329,10 +329,10 @@ def cmd_review(args) -> None:
         print(f"review --ai · {d} · 요약 {cfg.ai_summary_backend} / 분류 "
               f"{cfg.ai_classify_backend}", file=sys.stderr, flush=True)
         # graceful — AI 가 실패해도 결정론 리뷰는 항상 출력·저장 (#10)
-        # run_ai_layer 은 5개 작업 단계(요약·수확·디제스트·분류·정리) 후 '완료'.
+        # run_ai_layer 은 6개 작업 단계(요약·수확·디제스트·분류·정리·하루요약) 후 '완료'.
         ai_text, note = review.run_ai_layer(
             store, cfg, det, backend=args.backend, persist_date=d,
-            progress=_StageProgress(5),
+            progress=_StageProgress(6),
         )
         if note:
             print(note, file=sys.stderr, flush=True)
@@ -749,7 +749,7 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("thread_id", type=int)
     sp.set_defaults(fn=cmd_attach)
 
-    sp = sub.add_parser("act", help="개입 필요 큐 (결정론; --ai 로 정리)")
+    sp = sub.add_parser("act", help="지금 할 일 큐 (결정론; --ai 로 정리)")
     sp.add_argument("--ai", action="store_true", help="AI 정리 (재분류·우선순위·사유/제안)")
     sp.add_argument("--note", help="AI 에 줄 추가 정보 (예: 'ECN은 처리 중, 납기건 우선')")
     sp.add_argument("--backend", help="AI 백엔드 이름")

@@ -28,7 +28,7 @@ from .store import Store, image_cutoff_for
 
 # 데일리 생성 백그라운드 잡(단일) — 웹은 단일 스레드라 리뷰(수 초~수십 초)는 별 스레드로
 # step: 진행 단계(1~total, 0=미상/비-AI) — 대기 화면 프로그레스 바 재료
-_review_job = {"running": False, "msg": "", "step": 0, "total": 5}
+_review_job = {"running": False, "msg": "", "step": 0, "total": 6}
 _review_lock = threading.Lock()
 
 # AI 검색 백그라운드 잡(단일) — 번역·본문심사에 수십 초 걸려 요청 스레드에서 돌리면
@@ -354,6 +354,27 @@ details.catfold { margin: 8px 0 4px; background: var(--fold); border: 1px solid 
 .daily ul ul { margin: 2px 0; }
 .daily li { margin: 3px 0; line-height: 1.55; }
 .daily p { margin: 6px 0; color: var(--ink-2); }
+/* 데일리 재구성(하루 요약 카드·긴급도 칩·참고 접힘) */
+.daily .dsum { background: var(--sel-bg); border: 1px solid var(--splitter);
+    border-radius: 8px; padding: 10px 14px; margin: 12px 0 4px;
+    font-size: 14.5px; line-height: 1.7; }
+.daily .dsum p { color: var(--ink); margin: 4px 0; }
+.daily .pri { display: inline-block; font-size: 11px; font-weight: 700;
+    border-radius: 4px; padding: 0 5px; line-height: 17px; vertical-align: 1px; }
+.daily .pri.hi { color: #fff; background: #c0392b; }
+.daily .pri.mid { color: var(--warn); background: var(--warn-bg);
+    border: 1px solid var(--warn-border); line-height: 15px; }
+.daily .pri.lo { color: var(--ink-3); background: var(--surface-3); }
+.daily .star { color: var(--accent2); }
+.daily .ddl { color: var(--warn); font-weight: 600; }
+.daily .warnmark { color: var(--warn); }
+.daily .snip { color: var(--ink-3); }
+.daily .cont { color: var(--ink-3); font-size: 13px; }
+.daily details.dref { margin-top: 18px; border-top: 1px solid var(--border);
+    padding-top: 8px; }
+.daily details.dref summary { cursor: pointer; color: var(--ink-3);
+    font-weight: 600; font-size: 14px; }
+.daily details.dref[open] summary { margin-bottom: 4px; }
 form.search { margin: 10px 0; }
 form.search input[type=text] { padding: 7px 10px; width: 60%; font-size: 15px;
     border: 1px solid var(--border-strong); border-radius: 6px; }
@@ -556,11 +577,23 @@ def _linkify_refs(text: str) -> str:
     return _REF_RX.sub(r'<a href="/thread/\1">#\1</a>', text)
 
 
+_PRI_RX = re.compile(r"\[(상|중|하)\]")            # 개입 항목 긴급도 → 색 칩
+_PRI_CLASS = {"상": "hi", "중": "mid", "하": "lo"}
+_SNIP_HL_RX = re.compile(r"「(.+?)」")
+
+
 def _md_inline(text: str) -> str:
-    """인라인 마크다운(굵게·#참조)만 HTML 로. escape 먼저."""
+    """인라인 마크다운(굵게·#참조) + 데일리 장식(긴급도 칩·★·⏰·⚠·「근거」).
+    escape 먼저. 데일리 전용 — 메일 본문은 _mail_md_* 별도 경로."""
     t = esc(text)
     t = _BOLD_RX.sub(r"<strong>\1</strong>", t)
-    return _linkify_refs(t)
+    t = _linkify_refs(t)
+    t = _PRI_RX.sub(
+        lambda m: f"<span class='pri {_PRI_CLASS[m.group(1)]}'>{m.group(1)}</span>", t)
+    t = _SNIP_HL_RX.sub(r"<span class='snip'>「\1」</span>", t)
+    t = t.replace("★", "<span class='star'>★</span>")
+    t = t.replace("⏰기한", "<span class='ddl'>⏰기한</span>")
+    return t.replace("⚠", "<span class='warnmark'>⚠</span>")
 
 
 def _md_to_html(md: str) -> str:
@@ -568,15 +601,27 @@ def _md_to_html(md: str) -> str:
 
     지원: `##` 헤딩, 중첩 불릿(2칸 들여쓰기), `**굵게**`, `#123` 링크.
     맨 위 `#` 한 줄(날짜 제목)은 페이지 h1 과 중복이라 건너뛴다.
+    구조 규칙(2026-07-17 재구성): 첫 `##` 이전의 문단들 = 하루 요약 → 카드
+    (.dsum), `## 참고` = 접힘(details). 옛 형식 데일리는 둘 다 해당 없음 →
+    기존과 동일하게 렌더된다.
     """
     out: list[str] = []
     depth = 0
+    seen_h2 = False
+    in_ref = False          # '참고' details 내부
+    lead: list[str] = []    # 첫 ## 이전 문단(하루 요약)
 
     def close_lists() -> None:
         nonlocal depth
         while depth > 0:
             out.append("</li></ul>")
             depth -= 1
+
+    def flush_lead() -> None:
+        nonlocal lead
+        if lead:
+            out.append("<div class='dsum'>" + "\n".join(lead) + "</div>")
+            lead = []
 
     for raw in (md or "").splitlines():
         line = raw.rstrip()
@@ -586,13 +631,25 @@ def _md_to_html(md: str) -> str:
             continue
         if stripped.startswith("## "):
             close_lists()
-            out.append(f"<h2>{_md_inline(stripped[3:].strip())}</h2>")
+            flush_lead()
+            seen_h2 = True
+            title = stripped[3:].strip()
+            if in_ref:
+                out.append("</details>")
+                in_ref = False
+            if title == "참고":
+                out.append("<details class='dref'><summary>참고</summary>")
+                in_ref = True
+                continue
+            out.append(f"<h2>{_md_inline(title)}</h2>")
             continue
         if stripped.startswith("# "):
             close_lists()
+            flush_lead()
             continue
         m = _BULLET_RX.match(stripped)
         if m:
+            flush_lead()
             indent = len(line) - len(stripped)
             level = indent // 2 + 1
             if level > depth:
@@ -606,9 +663,20 @@ def _md_to_html(md: str) -> str:
                 out.append("</li>")
             out.append(f"<li>{_md_inline(m.group(1))}")
             continue
+        # 들여쓴 비-불릿 줄(↳ 사유·「근거」)은 열린 항목의 연속 줄 — 목록을
+        # 끊지 않는다 (lazy continuation).
+        if depth > 0 and line != stripped:
+            out.append(f"<br><span class='cont'>{_md_inline(stripped)}</span>")
+            continue
         close_lists()
+        if not seen_h2:
+            lead.append(f"<p>{_md_inline(stripped)}</p>")
+            continue
         out.append(f"<p>{_md_inline(stripped)}</p>")
     close_lists()
+    flush_lead()
+    if in_ref:
+        out.append("</details>")
     return "<div class='daily'>" + "\n".join(out) + "</div>"
 
 
