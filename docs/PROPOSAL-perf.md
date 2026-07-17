@@ -78,7 +78,7 @@
 | 후보 | 판정 | 근거 |
 |---|---|---|
 | **sync COM — HTMLBody 조건부** | **reject** | 오래된 메일 저장 텍스트가 마크다운→평문 = **결과 변경**. 헤더 생략도 스레딩 결과 위험 |
-| sync COM — `SetColumns`·SMTP 캐시 | 보류 | 결과 불변이나 HTMLBody 제외 후 이득 작고 Windows 전용 WSL 검증 불가 → 실기 확인 |
+| sync COM — `SetColumns`·SMTP 캐시 | 보류 | 선택적 최적화의 실제 이득·결과 불변성은 별도 벤치마크 필요 |
 | **`new_content` 분리** | **비권장** | 목록 SELECT * 0.19 vs 컬럼선택 0.05ms — LIMIT 쿼리는 오버플로 안 읽어 이득 ~0 |
 | **threads 표시필드 비정규화** | **비권장** | 서브쿼리는 LIMIT 50 한정이라 스케일 무관(3k스레드 2ms). 스케일 부분(정렬)은 §2-c 인덱스로 **무재싱크** 해결 |
 | 전체 연결 재사용 | 보류 | keep-alive 로 안전한 절반 확보, 나머지는 트랜잭션 상태 위험 |
@@ -89,6 +89,6 @@
 
 ## 5. 남은 것 (후속, 실 스케일 도달 시)
 
-- sync COM SetColumns/SMTP 캐시 — 실기(Windows+Outlook)에서 검증 후.
+- sync COM SetColumns/SMTP 캐시 — 적용 전 성능·결과 불변성 벤치마크.
 - 무거운 GET(/통계)도 필요하면 백그라운드+폴링(AI검색 패턴 재사용).
 - keyset 페이지네이션 · `ANALYZE` — 스케일 도달 후.

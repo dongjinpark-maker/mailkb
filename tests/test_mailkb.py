@@ -2868,6 +2868,20 @@ class TestWeb(unittest.TestCase):
         self.assertIn("/latest", self.web._APP_JS)
         self.assertIn("refreshDisplay", self.web._APP_JS)
 
+    def test_refresh_display_uses_left_panel_state(self):
+        # 메일함에서 스레드를 열면 location=/thread/N 이지만 실제 왼쪽 패널은 /mail 이다.
+        # 최신화 대상은 주소창이 아니라 leftCur 로 판정하고, 깊은 스크롤에서 미룬
+        # 변경은 상단 복귀 때 다시 반영해야 한다.
+        js = self.web._APP_JS
+        block = js[js.index("function refreshDisplay"):
+                   js.index("function checkFresh")]
+        self.assertIn('new URL(leftCur || "/", location.origin)', block)
+        self.assertNotIn("location.pathname", block)
+        self.assertIn("listDirty = true", block)
+        self.assertIn('left.addEventListener("scroll"', js)
+        self.assertIn("if (listDirty && left.scrollTop < 150) refreshDisplay()", js)
+        self.assertIn("if (listDirty && left && left.scrollTop < 150) refreshDisplay()", js)
+
     def test_timeline_newest_first(self):
         # 스레드 상세는 최신 메일이 먼저 (메일 클라이언트 관례)
         self.store.ingest([

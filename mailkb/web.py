@@ -1108,25 +1108,41 @@ _APP_JS = r"""
 
   /* ---- 표시 최신화: DB 변경(새 메일)을 토큰으로 감지해 현재 목록/홈을 조용히 다시 그림.
      autosync 든 스케줄러 등 외부 sync 든 DB 만 바뀌면 반영한다(수집 주기와 분리). ---- */
-  var lastTok = null;
+  var lastTok = null, listDirty = false;
   function refreshDisplay() {
-    var p = location.pathname.replace(/\/+$/, "") || "/";
+    /* 우측에서 스레드를 열면 location 은 /thread/N 이지만 왼쪽은 메일함·스레드
+       목록 그대로다. 주소창이 아니라 실제 왼쪽 패널 상태로 갱신 대상을 정한다. */
+    var cur = new URL(leftCur || "/", location.origin);
+    var p = cur.pathname.replace(/\/+$/, "") || "/";
+    var target = cur.pathname + (cur.search || "");
     if (p === "/") {
-      load(location.pathname + location.search, "left", false).catch(function () {});
-    } else if ((p === "/mail" || p === "/threads") && left && left.scrollTop < 150) {
-      var sc = left.scrollTop;                 /* 상단 근처만 — 깊이 스크롤 중이면 방해 안 함 */
-      load(location.pathname + location.search, "left", false)
-        .then(function () { left.scrollTop = sc; }).catch(function () {});
+      listDirty = false;
+      load(target, "left", false).catch(function () { listDirty = true; });
+    } else if (p === "/mail" || p === "/threads") {
+      if (!left || left.scrollTop >= 150) {
+        listDirty = true;                       /* 깊이 읽는 동안은 미루되 변경을 버리지 않음 */
+        return;
+      }
+      var sc = left.scrollTop;
+      listDirty = false;
+      load(target, "left", false)
+        .then(function () { left.scrollTop = sc; })
+        .catch(function () { listDirty = true; });
     }
   }
   function checkFresh() {
     return fetch("/latest").then(function (r) { return r.text(); }).then(function (tok) {
       if (lastTok === null) { lastTok = tok; return; }   /* 첫 호출 = 기준선 */
-      if (tok !== lastTok) { lastTok = tok; refreshDisplay(); }
+      if (tok !== lastTok) { lastTok = tok; refreshDisplay(); return; }
+      /* 직전 목록 fetch 실패 등으로 dirty 가 남았으면 같은 토큰이어도 재시도. */
+      if (listDirty && left && left.scrollTop < 150) refreshDisplay();
     }).catch(function () {});
   }
   checkFresh();                                /* 기준선 */
   setInterval(checkFresh, 60000);              /* 60초마다 표시 최신화(가벼운 DB 조회) */
+  left.addEventListener("scroll", function () {
+    if (listDirty && left.scrollTop < 150) refreshDisplay();
+  });
 
   /* ---- 자동 동기화(Outlook 수집): 주기(분)마다 /autosync. 새 메일이면 토스트 + 즉시 최신화 ---- */
   fetch("/syncmin").then(function (r) { return r.text(); }).then(function (s) {
