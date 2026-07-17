@@ -2364,13 +2364,13 @@ def _signal_chips(tid: int, act) -> str:
     chips = []
     if act.level == actions.REQUIRED:
         chips.append("<div class='chip'>↩ 회신 필요"
-                     + _off("action", "이 요청 건의 신호 끄기") + "</div>")
+                     + _off("action", "신호 전체 끄기") + "</div>")
     elif act.level == actions.MAYBE:
         chips.append("<div class='chip'>☑ 확인 후보"
-                     + _off("action", "이 요청 건의 신호 끄기") + "</div>")
+                     + _off("action", "신호 전체 끄기") + "</div>")
     if act.level != actions.NONE and act.has_deadline:
         chips.append("<div class='chip'>⏰ 기한"
-                     + _off("deadline", "기한 표시만 끄기") + "</div>")
+                     + _off("deadline", "기한만 끄기") + "</div>")
     restore = ""
     if act.level != actions.NONE and act.deadline_dismissed:
         restore = ("<div class='sigoff'>⏰ 해제됨"
