@@ -1608,7 +1608,8 @@ _APP_JS = r"""
   });
 
   leftCur = (paneFor(location.pathname) === "left")
-    ? location.pathname + (location.search || "") : "/";
+    ? location.pathname + (location.search || "")
+    : (/^\/thread\/\d+/.test(location.pathname) ? "/threads" : "/");
   markSelected();
   markNav();
   hookReviewPolling(right);
@@ -1960,56 +1961,33 @@ def _list_flt(qs) -> str:
     return ""
 
 
-# 목록 신호 캐시(응답대기·기한/요청) — 매 렌더마다 스레드 전수(기한은 본문+정규식까지)
-# 훑던 것을 데이터 지문(MAX(rowid))으로 게이트해 재사용. 신호는 메시지 데이터의 순수
-# 함수라 새 수집 때만 재계산. **hidden 필터는 넣지 않는다** — 호출부가 쿼리에서 라이브로
-# 제외하므로(숨김/해제 즉시 반영) 여기서 빼면 캐시가 hidden 변경에 무효화될 필요가 없다.
-_signal_cache = {"key": None, "await": frozenset(), "deadline": frozenset()}
-_signal_cache_lock = threading.Lock()
-
-
 def _signal_sets(store) -> tuple:
-    """(응답대기 스레드, 기한/요청 스레드) — 데이터 지문 게이트 캐시. hidden 무관."""
-    data_tok = store.db.execute(
-        "SELECT COALESCE(MAX(rowid), 0) FROM messages").fetchone()[0]
-    key = (str(store.db_path), tuple(sorted(store.my_addresses)), data_tok)
-    with _signal_cache_lock:
-        if _signal_cache["key"] == key:
-            return _signal_cache["await"], _signal_cache["deadline"]
+    """응답대기·기한 스레드. 본문은 sync 때 계산하므로 여기서는 좁은 상태만 읽는다."""
     me = store.my_addresses
     aw: set = set()
-    for r in store.db.execute(
-            """SELECT t.id, m.is_sent, m.to_addrs FROM threads t
-               JOIN messages m ON m.id = (
-                 SELECT id FROM messages WHERE thread_id=t.id
-                 ORDER BY sent_on DESC, id DESC LIMIT 1)"""):
-        if r["is_sent"]:
-            continue
-        tos = [a for a in (r["to_addrs"] or "").split(";") if a]
-        if len(tos) < 3 and set(tos) & me:
-            aw.add(r["id"])
     dl: set = set()
     for r in store.db.execute(
-            "SELECT thread_id, new_content FROM messages WHERE is_sent=0"):
-        if r["thread_id"] in dl:
-            continue
-        if review.DEADLINE_RX.search(strip_preserved(r["new_content"] or "")):
+            """SELECT s.thread_id, s.deadline_count, m.is_sent, m.to_addrs
+               FROM thread_state s
+               JOIN messages m ON m.id=s.latest_message_id"""):
+        if r["deadline_count"]:
             dl.add(r["thread_id"])
-    aw, dl = frozenset(aw), frozenset(dl)
-    with _signal_cache_lock:
-        _signal_cache.update({"key": key, "await": aw, "deadline": dl})
-    return aw, dl
+        if not r["is_sent"]:
+            tos = [a for a in (r["to_addrs"] or "").split(";") if a]
+            if len(tos) < 3 and set(tos) & me:
+                aw.add(r["thread_id"])
+    return frozenset(aw), frozenset(dl)
 
 
 def _awaiting_thread_ids(store) -> frozenset:
     """'↩ 내 응답 대기' 스레드 — 마지막 메일이 수신이고 To(3인 미만)에 내가 포함.
-    스레드 상세의 ↩ 신호와 동일. hidden 제외는 호출부 쿼리가 담당(캐시는 `_signal_sets`)."""
+    스레드 상세의 ↩ 신호와 동일. hidden 제외는 호출부 쿼리가 담당한다."""
     return _signal_sets(store)[0]
 
 
 def _deadline_thread_ids(store) -> frozenset:
     """'⏰ 기한/요청' 스레드 — 수신 메일 본문에 기한/요청 신호(DEADLINE_RX).
-    스레드 상세의 ⏰ 신호와 동일. hidden 제외는 호출부 쿼리가 담당(캐시는 `_signal_sets`)."""
+    스레드 상세의 ⏰ 신호와 동일. hidden 제외는 호출부 쿼리가 담당한다."""
     return _signal_sets(store)[1]
 
 
@@ -2037,15 +2015,12 @@ def _list_filter_bar(base: str, active: str, counts: dict) -> str:
             + "</span></div>")
 
 
-# 노이즈 스캔 캐시 — 매 목록 렌더(/threads·/mail)마다 수신 전수를 훑어 cfg.is_noise
-# 하던 것을 (설정+데이터) 지문으로 게이트해 재사용한다. 지문이 같으면 스캔 건너뛰고,
-# ① 노이즈 설정(아래 4개 리스트) 변경 ② 새 메일 수집(MAX(rowid) 증가) 일 때만 1회
-# 재계산. 결과는 라이브 계산과 동일 — 노이즈 판정 입력(sender/subject/is_sent/thread)은
-# 수집 후 불변이고, 스레드 병합도 수집 시 일어나 max_rowid 로 잡힌다. 단일 사용자·단일
-# 스레드 서버라 락은 가벼운 방어용(백그라운드 수집이 max_rowid 를 올리면 다음 렌더가
-# 재계산). 두 세트를 한 스캔으로: thread_ids(스레드 전부 노이즈 — /threads 제외용),
-# msg_ids(노이즈 수신 메시지 — /mail 메시지 단위 제외용).
-_noise_cache = {"key": None, "thread_ids": frozenset(), "msg_ids": frozenset()}
+# 노이즈는 설정 의존이라 DB에 고정하지 않는다. 설정이 같으면 새 rowid 이후만 분류하고,
+# 프로세스 시작·설정 변경 때만 좁은 메타데이터를 한 번 전수 스캔한다.
+_noise_cache = {
+    "base": None, "max_id": 0, "received": set(), "real": set(),
+    "thread_ids": frozenset(), "msg_ids": frozenset(),
+}
 _noise_cache_lock = threading.Lock()
 
 
@@ -2057,28 +2032,41 @@ def _noise_config_version(cfg) -> tuple:
 
 
 def _noise_sets(store, cfg) -> tuple:
-    """(noise_thread_ids, noise_msg_ids) — (db·설정·데이터) 지문 게이트 캐시."""
-    data_tok = store.db.execute(
+    """(noise_thread_ids, noise_msg_ids) — append-only high-water 증분 캐시."""
+    max_id = store.db.execute(
         "SELECT COALESCE(MAX(rowid), 0) FROM messages").fetchone()[0]
-    key = (str(store.db_path), _noise_config_version(cfg), data_tok)
+    base = (str(store.db_path), _noise_config_version(cfg))
     with _noise_cache_lock:
-        if _noise_cache["key"] == key:
+        rebuild = (_noise_cache["base"] != base
+                   or max_id < _noise_cache["max_id"])
+        if not rebuild and max_id == _noise_cache["max_id"]:
             return _noise_cache["thread_ids"], _noise_cache["msg_ids"]
-    recv: set = set()       # 수신 메일이 있는 스레드
-    real: set = set()       # 비노이즈 수신 메일이 하나라도 있는 스레드
-    nmsg: set = set()       # 노이즈 수신 메시지 id
-    for r in store.db.execute(
-            "SELECT id, thread_id, sender_addr, subject FROM messages "
-            "WHERE is_sent=0"):
-        recv.add(r["thread_id"])
-        if cfg.is_noise(r["sender_addr"]) or cfg.is_noise_subject_strong(r["subject"]):
-            nmsg.add(r["id"])
+
+        if rebuild:
+            recv, real, nmsg = set(), set(), set()
+            where, params = "", ()
         else:
-            real.add(r["thread_id"])
-    tset, mset = frozenset(recv - real), frozenset(nmsg)
-    with _noise_cache_lock:
-        _noise_cache.update(key=key, thread_ids=tset, msg_ids=mset)
-    return tset, mset
+            recv = set(_noise_cache["received"])
+            real = set(_noise_cache["real"])
+            nmsg = set(_noise_cache["msg_ids"])
+            where, params = " AND id>?", (_noise_cache["max_id"],)
+
+        for r in store.db.execute(
+                "SELECT id, thread_id, sender_addr, subject FROM messages "
+                "WHERE is_sent=0" + where, params):
+            recv.add(r["thread_id"])
+            if (cfg.is_noise(r["sender_addr"])
+                    or cfg.is_noise_subject_strong(r["subject"])):
+                nmsg.add(r["id"])
+            else:
+                real.add(r["thread_id"])
+        tset = frozenset(recv - real)
+        mset = frozenset(nmsg)
+        _noise_cache.update(
+            base=base, max_id=max_id, received=recv, real=real,
+            thread_ids=tset, msg_ids=mset,
+        )
+        return tset, mset
 
 
 def _noise_thread_ids(store, cfg) -> frozenset:
@@ -2098,8 +2086,7 @@ def render_mail(store, cfg, offset: int = 0, flt: str = "") -> str:
     탭에서만. offset>0 이면 조각만 반환.
     """
     # 신호 필터(응답 대기·기한/요청)는 스레드 단위 판정 — 소속 메일을 보여준다
-    await_ids = _awaiting_thread_ids(store)
-    dead_ids = _deadline_thread_ids(store)
+    await_ids, dead_ids = _signal_sets(store)
     _, noise_msg = _noise_sets(store, cfg)   # 메시지 단위 노이즈(캐시) — is_noise 재계산 제거
     if flt == "hidden":
         tcond = "t.hidden=1"
@@ -2142,28 +2129,34 @@ def render_mail(store, cfg, offset: int = 0, flt: str = "") -> str:
     more = _more_html(base, offset + consumed) if has_more else ""
     if offset:
         return "".join(items) + more
-    # 카운트 — 한 번의 스캔(노이즈 필터 반영). 숨김은 total 에서 빠지고 따로 센다.
-    total = n_unread = n_await = n_dead = n_flag = n_hidden = 0
-    for r in store.db.execute(
-            "SELECT m.id, m.thread_id, m.read_at, t.flagged, t.hidden "
-            "FROM messages m JOIN threads t ON t.id=m.thread_id WHERE m.is_sent=0"):
-        # 숨김은 노이즈 포함해 센다(복구용). 전체/미개봉/… 는 노이즈 제외.
-        if r["hidden"]:
-            n_hidden += 1
-            continue
-        if r["id"] in noise_msg:      # 메시지 단위 노이즈(캐시) — is_noise 재계산 없음
-            continue
-        total += 1
-        if not r["read_at"]:
-            n_unread += 1
-        if r["thread_id"] in await_ids:
-            n_await += 1
-        if r["thread_id"] in dead_ids:
-            n_dead += 1
-        if r["flagged"]:
-            n_flag += 1
-    counts = {"": total, "unread": n_unread, "awaiting": n_await,
-              "deadline": n_dead, "flagged": n_flag, "hidden": n_hidden}
+    # 탭 카운트는 SQLite 한 번의 집계로 계산한다. id 문자열은 내부 정수만 사용한다.
+    def _in_expr(ids, col, *, negate=False):
+        if not ids:
+            return "1" if negate else "0"
+        op = "NOT IN" if negate else "IN"
+        return f"{col} {op} ({','.join(str(int(i)) for i in ids)})"
+
+    real = _in_expr(noise_msg, "m.id", negate=True)
+    awaiting = _in_expr(await_ids, "m.thread_id")
+    deadline = _in_expr(dead_ids, "m.thread_id")
+    visible = "(t.hidden IS NULL OR t.hidden=0)"
+    agg = store.db.execute(
+        f"""SELECT
+          COALESCE(SUM(CASE WHEN {visible} AND {real} THEN 1 ELSE 0 END),0) total,
+          COALESCE(SUM(CASE WHEN {visible} AND {real}
+            AND (m.read_at IS NULL OR m.read_at='') THEN 1 ELSE 0 END),0) unread,
+          COALESCE(SUM(CASE WHEN {visible} AND {real} AND {awaiting}
+            THEN 1 ELSE 0 END),0) awaiting,
+          COALESCE(SUM(CASE WHEN {visible} AND {real} AND {deadline}
+            THEN 1 ELSE 0 END),0) deadline,
+          COALESCE(SUM(CASE WHEN {visible} AND {real} AND t.flagged=1
+            THEN 1 ELSE 0 END),0) flagged,
+          COALESCE(SUM(CASE WHEN t.hidden=1 THEN 1 ELSE 0 END),0) hidden
+        FROM messages m JOIN threads t ON t.id=m.thread_id WHERE m.is_sent=0"""
+    ).fetchone()
+    counts = {"": agg["total"], "unread": agg["unread"],
+              "awaiting": agg["awaiting"], "deadline": agg["deadline"],
+              "flagged": agg["flagged"], "hidden": agg["hidden"]}
     body = "".join(items) or "<p class='empty'>수신 메일 없음</p>"
     return ("<h1>메일함</h1>"
             + _list_filter_bar("/mail", flt, counts)
@@ -2191,8 +2184,7 @@ def render_threads(store, cfg, offset: int = 0, flt: str = "") -> str:
     ncsv = ",".join(str(int(i)) for i in noise_ids)
     nx = f" AND t.id NOT IN ({ncsv})" if noise_ids else ""    # alias t. (행 쿼리·unread)
     nxb = f" AND id NOT IN ({ncsv})" if noise_ids else ""     # bare id (agg: FROM threads)
-    await_ids = _awaiting_thread_ids(store)
-    dead_ids = _deadline_thread_ids(store)
+    await_ids, dead_ids = _signal_sets(store)
     if flt == "hidden":
         cond = "WHERE t.hidden=1"
     elif flt == "awaiting":
@@ -2204,25 +2196,20 @@ def render_threads(store, cfg, offset: int = 0, flt: str = "") -> str:
     elif flt == "flagged":
         cond = "WHERE t.flagged=1 AND (t.hidden IS NULL OR t.hidden=0)" + nx
     elif flt == "unread":
-        cond = ("WHERE (t.hidden IS NULL OR t.hidden=0) AND EXISTS("
-                "SELECT 1 FROM messages WHERE thread_id=t.id AND is_sent=0 "
-                "AND (read_at IS NULL OR read_at=''))" + nx)
+        cond = ("WHERE (t.hidden IS NULL OR t.hidden=0) "
+                "AND s.unread_received_count>0" + nx)
     else:
         cond = "WHERE (t.hidden IS NULL OR t.hidden=0)" + nx
     rows = store.db.execute(
         f"""SELECT t.id, t.flagged, t.hidden, t.first_date, t.last_date,
-                  (SELECT subject FROM messages WHERE thread_id=t.id
-                     ORDER BY sent_on, id LIMIT 1) AS subject,
-                  (SELECT COUNT(*) FROM messages WHERE thread_id=t.id) AS n,
-                  (SELECT sender_name FROM messages WHERE thread_id=t.id
-                     ORDER BY sent_on DESC, id DESC LIMIT 1) AS last_name,
-                  (SELECT sender_addr FROM messages WHERE thread_id=t.id
-                     ORDER BY sent_on DESC, id DESC LIMIT 1) AS last_addr,
-                  (SELECT sent_on FROM messages WHERE thread_id=t.id
-                     ORDER BY sent_on DESC, id DESC LIMIT 1) AS last_on,
-                  (SELECT COUNT(*) FROM messages WHERE thread_id=t.id
-                     AND is_sent=0 AND (read_at IS NULL OR read_at='')) AS unread_n
-           FROM threads t {cond} ORDER BY t.last_date DESC LIMIT ? OFFSET ?""",
+                  first.subject, s.message_count AS n,
+                  last.sender_name AS last_name, last.sender_addr AS last_addr,
+                  last.sent_on AS last_on, s.unread_received_count AS unread_n
+           FROM threads t
+           JOIN thread_state s ON s.thread_id=t.id
+           JOIN messages first ON first.id=s.first_message_id
+           JOIN messages last ON last.id=s.latest_message_id
+           {cond} ORDER BY t.last_date DESC LIMIT ? OFFSET ?""",
         (_PAGE + 1, offset)).fetchall()
     has_more = len(rows) > _PAGE
     rows = rows[:_PAGE]
@@ -2253,9 +2240,8 @@ def render_threads(store, cfg, offset: int = 0, flt: str = "") -> str:
         "COALESCE(SUM(CASE WHEN flagged=1 AND (hidden IS NULL OR hidden=0)" + nxb + " THEN 1 ELSE 0 END),0) flag, "
         "COALESCE(SUM(CASE WHEN hidden=1 THEN 1 ELSE 0 END),0) hid FROM threads").fetchone()
     n_unread = store.db.execute(
-        "SELECT COUNT(DISTINCT m.thread_id) c FROM messages m "
-        "JOIN threads t ON t.id=m.thread_id WHERE m.is_sent=0 "
-        "AND (m.read_at IS NULL OR m.read_at='') AND (t.hidden IS NULL OR t.hidden=0)" + nx
+        "SELECT COUNT(*) c FROM threads t JOIN thread_state s ON s.thread_id=t.id "
+        "WHERE s.unread_received_count>0 AND (t.hidden IS NULL OR t.hidden=0)" + nx
     ).fetchone()["c"]
     # 응답대기·기한 뱃지는 리스트와 동일 집합이어야 한다: await/dead ∩ 비노이즈 ∩ 비숨김.
     # hidden 은 (휘발성이라) 신호 캐시에서 빠져 있으므로 여기서 라이브로 제외 — 리스트
@@ -3321,7 +3307,8 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _panes(self, store, inner: str, pane: str, today: str) -> tuple[str, str]:
+    def _panes(self, store, inner: str, pane: str, today: str,
+               path: str = "") -> tuple[str, str]:
         """요청된 패널 외의 기본 콘텐츠 — 좌측 기본은 홈, 우측은 읽기(상세) 패널.
 
         좌측은 상단 메뉴 콘텐츠(홈/메일함/스레드/검색/기록), 우측은
@@ -3330,6 +3317,8 @@ class _Handler(BaseHTTPRequestHandler):
         좌우 중복이 됐음)."""
         if pane == "left":
             return inner, _READING_HINT
+        if path.startswith("/thread/"):
+            return render_threads(store, self.cfg), inner
         return render_home(store, self.cfg, today), inner
 
     def _is_fetch(self) -> bool:
@@ -3420,7 +3409,7 @@ class _Handler(BaseHTTPRequestHandler):
             if frag:
                 body = inner
             else:
-                left, right = self._panes(store, inner, pane, today)
+                left, right = self._panes(store, inner, pane, today, path)
                 rw = self.cfg.opt("web", "reading_width", default=1200)
                 theme = self.cfg.opt("web", "theme", default="light")
                 body = _shell(title, left, right, refresh, read_w=rw, theme=theme)

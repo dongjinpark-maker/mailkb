@@ -17,57 +17,12 @@ from datetime import date, timedelta
 from . import search as search_mod
 from .clean import strip_preserved
 from .config import Config
+from .features import DECISION_RX, DEADLINE_RX, REQUEST_RX
 from .store import Store
 
-# "까지"는 날짜/시각/상대시점이 선행해야 기한이다 — "현재까지 진행중" 류의
-# 범위·부사 용법을 배제한다. 줄 전체를 감싸는 lazy 래퍼([^\n]*?…[^\n]*)는
-# 수만 자 본문에서 백트래킹 폭발을 일으키므로 금지 — 키워드만 매칭하고
-# 스니펫은 _line_at 으로 뽑는다. (web 스레드 상세의 기한 신호 표시도 공유)
-_TIME_WORD = (
-    r"(?:오늘|금일|내일|명일|익일|모레|이번\s*주|금주|다음\s*주|차주|내주|주말|월말|"
-    r"(?:월|화|수|목|금|토|일)요일|오전|오후|아침|저녁|자정|정오|"
-    r"\d{1,2}\s*시(?:\s*\d{1,2}\s*분)?|\d{1,2}:\d{2}|"
-    r"\d{1,2}\s*[/.]\s*\d{1,2}|\d{1,2}\s*월\s*\d{1,2}\s*일|\d{1,2}\s*일|EOD|COB)"
-)
-DEADLINE_RX = re.compile(
-    r"(?:" + _TIME_WORD + r"\s*(?:\([^)\n]{0,8}\)\s*)?까지"   # "6/29(월)까지"
-    r"|기한|마감|회신\s*(?:부탁|요청|바랍)|확정해\s*주|주시면)",
-    re.IGNORECASE,
-)
-
-# 결정/승인 '요청' 신호 — 요청 앵커드(오탐 방지). "승인 올리겠습니다" 처럼 요청이
-# 아닌 서술은 매칭되면 안 되므로, 승인류 뒤에 부탁/요청/필요 등이 와야 잡는다.
-_DECISION_RX = re.compile(
-    r"("
-    r"(승인|결재|재가|컨펌|approve|confirm)\s*(을|를|해)?\s*"
-    r"(부탁|요청|필요|바랍|주시|주세요|주실|해\s*주|가능|여부)"
-    r"|검토\s*(부탁|요청)"
-    r"|의견\s*(을|를)?\s*(주|부탁|달라|주세요|주시)"
-    r"|결정\s*(을|를|이|해)?\s*(부탁|필요|해\s*주|주시)"
-    r"|판단\s*(을|를|이)?\s*(부탁|필요|바랍)"
-    r"|가부[^\n]{0,10}(회신|부탁|판단|결정|주)"
-    r")"
-)
-
-# '실제 요청' 신호 — 나에게 행동/답을 요구하는 표현. 개입 큐 오탐의 최대 원인이
-# "요청 없는 메일(종결 인사·순수 공유 FYI·내 질문에 온 답변)"을 응답 대기로 잡던
-# 것이라, 이 신호가 있어야 '내 응답 대기/내가 넘긴 공'으로 인정한다.
-# 주의: "참고 바랍니다"·"확인 바랍니다"(FYI 성) 나 종결 인사는 요청으로 보지 않는다
-# — 그래서 '바랍/주세요'는 반드시 회신·검토·의견 등 '행동 동사' 뒤에서만 잡는다.
-# (report.REQUEST_RX 는 §1 '증발한 요청' 판정 전용의 더 좁은 별개 정의 — 합치지 말 것)
-_REQUEST_RX = re.compile(
-    r"("
-    r"(회신|답변|답장|검토|의견|판단|결정|승인|재가|컨펌|처리|확답)"
-    r"\s*(을|를|해|이|여부)?\s*(부탁|요청|바랍|주시|주세요|주실|해\s*주|가능|필요|달)"
-    r"|부탁\s*(드립|드려|합니|해\s*주)"
-    r"|요청\s*(드립|드려|합니)"
-    r"|필요합니다|필요하[여니]"
-    r"|가능(할까요|한가요|하신지|하실|할지|합니까|한지)"
-    r"|(알려|공유|전달|보내|검토)\s*주(세요|시|실|십)"
-    r"|는지\s*[^\n]{0,8}(확인|검토|부탁|회신|알려|판단)"
-    r"|해\s*주(세요|실\s*수|시겠|시길)"
-    r")"
-)
+# Compatibility aliases for callers and tests using review's historical names.
+_DECISION_RX = DECISION_RX
+_REQUEST_RX = REQUEST_RX
 
 
 def _line_at(text: str, pos: int) -> str:
@@ -299,9 +254,35 @@ def intervention_queue(
     un_days = {r["thread_id"]: r["days_old"] for r in unanswered}
     unanswered_ids = set(un_days)
 
+    tails = store.open_thread_tails()
+    workdays: dict[int, int] = {}
+    stale_ids: list[int] = []
+    for t in tails:
+        tid = t["thread_id"]
+        wd = _workdays_since(t["sent_on"], d, holidays)
+        workdays[tid] = wd
+        n_to = len([a for a in (t["to_addrs"] or "").split(";") if a])
+        if (t["msg_count"] >= 2 and wd >= stale and n_to < bcast
+                and t["last_is_sent"] == 0):
+            stale_ids.append(tid)
+
+    # 멈춘 스레드 후보의 수신 발신자를 한 번에 읽어 N개의 thread_messages()를 없앤다.
+    inbound_seen: set[int] = set()
+    inbound_real: set[int] = set()
+    for start in range(0, len(stale_ids), 800):
+        chunk = stale_ids[start:start + 800]
+        marks = ",".join("?" for _ in chunk)
+        for row in store.db.execute(
+                f"SELECT thread_id, sender_addr FROM messages "
+                f"WHERE is_sent=0 AND thread_id IN ({marks})", chunk):
+            tid = row["thread_id"]
+            inbound_seen.add(tid)
+            if not cfg.is_noise(row["sender_addr"]):
+                inbound_real.add(tid)
+
     items: list[dict] = []
     candidates: list[dict] = []
-    for t in store.open_thread_tails():
+    for t in tails:
         # (숨김 스레드는 open_thread_tails 가 이미 제외한다)
         tid = t["thread_id"]
         to = [a for a in (t["to_addrs"] or "").split(";") if a]
@@ -315,9 +296,11 @@ def intervention_queue(
         # 신호 판정은 신규 작성분만 — 보존 인용(mid-join) 속 과거 요청/기한은
         # 이미 소화된 대화라 개입 근거가 아니다
         content = strip_preserved(t["new_content"] or "")
-        dec = _DECISION_RX.search(content)
-        dead = DEADLINE_RX.search(content)
-        wd = _workdays_since(t["sent_on"], d, holidays)
+        dec = _DECISION_RX.search(content) if t["last_has_decision"] else None
+        dead = DEADLINE_RX.search(content) if t["last_has_deadline"] else None
+        req = _REQUEST_RX.search(content) if t["last_has_request"] else None
+        question = bool(t["last_has_question"])
+        wd = workdays[tid]
 
         cat = who = snippet = None
         personal = False   # 나를 명시적으로 지목(이름 언급) 또는 내 참여(내가 보낸 것에 답)
@@ -330,8 +313,7 @@ def intervention_queue(
             # 정밀도 우선: '실제 요청'이 있어야 응답 대기로 인정한다. 종결 인사
             # ("확인했습니다"), 순수 공유(FYI), 내 질문에 온 답변은 요청이 아니므로
             # 제외 — 오탐의 최대 원인이었다.
-            request = bool(dec or dead or "?" in content
-                           or _REQUEST_RX.search(content))
+            request = bool(dec or dead or question or req)
             mention = _mentions_me(content, me_names)
             direct = len(to) <= cfg.direct_to
             participated = t["my_msg_count"] >= 1
@@ -356,9 +338,9 @@ def intervention_queue(
             days = un_days.get(tid, days)
             personal = mention or participated
         elif (t["last_is_sent"] == 1 and wd >= stall and not broadcast
-              and (dec or dead or "?" in content or _REQUEST_RX.search(content))):
+              and (dec or dead or question or req)):
             cat, who, days = "stalled_mine", (to[0] if to else "?"), wd
-            m = dec or dead or _REQUEST_RX.search(content)
+            m = dec or dead or req
             snippet = _line_at(content, m.start()) if m else (
                 content.splitlines()[0].strip() if content else "")
             personal = True
@@ -366,22 +348,12 @@ def intervention_queue(
               and t["last_is_sent"] == 0):
             # 마지막이 수신일 때만 '멈춘 스레드' — 내가 마지막에 마무리한 스레드
             # (참석합니다/정상 진행 중 등)는 정체가 아니므로 제외.
-            msgs = store.thread_messages(tid)
-            inbound = [m for m in msgs if not m["is_sent"]]
-            participates = any(m["is_sent"] for m in msgs) or any(
-                set(
-                    [a for a in (m["to_addrs"] or "").split(";") if a]
-                    + [a for a in (m["cc_addrs"] or "").split(";") if a]
-                ) & me
-                for m in msgs
-            )
-            all_noise = bool(inbound) and all(
-                cfg.is_noise(m["sender_addr"]) for m in inbound
-            )
+            participates = bool(t["my_msg_count"] or t["addressed_to_me_count"])
+            all_noise = tid in inbound_seen and tid not in inbound_real
             if participates and not all_noise:
                 cat, who, days = "stalled_thread", t["sender_name"] or t["sender_addr"], wd
                 snippet = _lead_line(content)
-                personal = any(m["is_sent"] for m in msgs) or _mentions_me(content, me_names)
+                personal = bool(t["my_msg_count"]) or _mentions_me(content, me_names)
         if not cat:
             continue
         items.append({

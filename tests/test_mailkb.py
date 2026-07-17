@@ -594,6 +594,68 @@ class TestStore(unittest.TestCase):
         self.assertIn("idx_threads_last_date", plan)
         self.assertNotIn("TEMP B-TREE", plan)      # 임시 정렬 없음
 
+    def test_derived_state_incremental_out_of_order_and_read(self):
+        self.store.ingest([
+            _rec("ds2", "kim@c", [ME], "상태", "2026-07-02T09:00:00",
+                 body="내일까지 회신 부탁드립니다."),
+            _rec("ds1", "kim@c", [ME], "RE: 상태", "2026-07-01T09:00:00",
+                 reply_to="ds2"),
+            _rec("ds3", ME, ["kim@c"], "RE: 상태", "2026-07-03T09:00:00",
+                 reply_to="ds2"),
+        ])
+        tid = self.store.db.execute(
+            "SELECT thread_id FROM messages WHERE message_id='<ds2@t>'").fetchone()[0]
+        state = self.store.db.execute(
+            "SELECT * FROM thread_state WHERE thread_id=?", (tid,)).fetchone()
+        first_mid = self.store.db.execute(
+            "SELECT message_id FROM messages WHERE id=?",
+            (state["first_message_id"],)).fetchone()[0]
+        latest_mid = self.store.db.execute(
+            "SELECT message_id FROM messages WHERE id=?",
+            (state["latest_message_id"],)).fetchone()[0]
+        self.assertEqual((first_mid, latest_mid), ("<ds1@t>", "<ds3@t>"))
+        self.assertEqual(state["message_count"], 3)
+        self.assertEqual((state["received_count"], state["sent_count"]), (2, 1))
+        self.assertEqual(state["deadline_count"], 1)
+        self.assertEqual(state["unread_received_count"], 2)
+        self.store.mark_thread_read(tid)
+        unread = self.store.db.execute(
+            "SELECT unread_received_count FROM thread_state WHERE thread_id=?",
+            (tid,)).fetchone()[0]
+        self.assertEqual(unread, 0)
+        indexes = {r["name"] for r in self.store.db.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'")}
+        self.assertIn("idx_messages_thread_date", indexes)
+
+    def test_derived_state_backfills_existing_messages(self):
+        self.store.ingest([
+            _rec("bf1", "kim@c", [ME], "백필", "2026-07-01T09:00:00",
+                 body="금요일까지 검토 부탁드립니다."),
+        ])
+        path = self.store.db_path
+        self.store.db.execute("DELETE FROM message_features")
+        self.store.db.execute("DELETE FROM thread_state")
+        self.store.db.execute("DELETE FROM sync_state WHERE key='derived_version'")
+        self.store.db.commit()
+        self.store.close()
+        self.store = Store(path, [ME])
+        feature = self.store.db.execute(
+            "SELECT has_deadline, has_decision FROM message_features").fetchone()
+        state = self.store.db.execute(
+            "SELECT message_count, deadline_count FROM thread_state").fetchone()
+        self.assertEqual(tuple(feature), (1, 1))
+        self.assertEqual(tuple(state), (1, 1))
+
+    def test_ingest_failure_rolls_back_message_and_derived_state(self):
+        with mock.patch("mailkb.store.classify_content",
+                        side_effect=RuntimeError("feature failure")):
+            with self.assertRaises(RuntimeError):
+                self.store.ingest([
+                    _rec("rb1", "kim@c", [ME], "롤백", "2026-07-01T09:00:00")])
+        for table in ("messages", "threads", "message_features", "thread_state"):
+            count = self.store.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            self.assertEqual(count, 0, msg=table)
+
     def test_date_range_queries_exact_boundaries(self):
         # date(sent_on)=? → 범위 재작성이 [일, 다음날) 경계에서 정확히 등가인지
         self.store.ingest([
@@ -2881,6 +2943,7 @@ class TestWeb(unittest.TestCase):
         self.assertIn('left.addEventListener("scroll"', js)
         self.assertIn("if (listDirty && left.scrollTop < 150) refreshDisplay()", js)
         self.assertIn("if (listDirty && left && left.scrollTop < 150) refreshDisplay()", js)
+        self.assertIn('? "/threads" : "/"', js)  # 직접 thread 로드의 왼쪽은 스레드 목록
 
     def test_timeline_newest_first(self):
         # 스레드 상세는 최신 메일이 먼저 (메일 클라이언트 관례)
@@ -4579,6 +4642,15 @@ class TestNoiseCache(unittest.TestCase):
                                  "2026-07-02T09:00:00", body="자동발송")])
         _, msg1 = web._noise_sets(self.store, self.cfg)
         self.assertEqual(len(msg1), len(msg0) + 1)   # noreply = ignore_senders 매치
+
+    def test_new_ingest_classifies_only_delta(self):
+        web._noise_sets(self.store, self.cfg)
+        self.store.ingest([_recx("n2", "noreply@x.example", "증분 알림",
+                                 "2026-07-02T10:00:00", body="자동발송")])
+        with mock.patch.object(self.cfg, "is_noise", wraps=self.cfg.is_noise) as classify:
+            _, msg = web._noise_sets(self.store, self.cfg)
+        self.assertEqual(classify.call_count, 1)
+        self.assertEqual(len(msg), 1)
 
     def test_cache_hit_skips_rescan(self):
         # 변경 없으면 스캔 안 함 — is_noise 를 폭탄으로 바꿔도 캐시 히트면 호출 안 됨

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -14,6 +15,7 @@ from pathlib import Path
 from . import search as search_mod
 from .clean import (extract_new_content, inject_inline_images,
                     normalize_subject, sanitize_html)
+from .features import FEATURE_VERSION, classify_content
 from .sources.base import MailRecord
 
 _SCHEMA = """
@@ -44,6 +46,33 @@ CREATE TABLE IF NOT EXISTS message_html (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id);
 CREATE INDEX IF NOT EXISTS idx_messages_sent_on ON messages(sent_on);
+CREATE INDEX IF NOT EXISTS idx_messages_thread_date
+    ON messages(thread_id, sent_on DESC, id DESC);
+
+-- 본문을 다시 읽지 않도록 수집 시 한 번 계산하는 안정적인 신호.
+CREATE TABLE IF NOT EXISTS message_features (
+    message_id       INTEGER PRIMARY KEY,
+    has_deadline     INTEGER NOT NULL DEFAULT 0,
+    has_decision     INTEGER NOT NULL DEFAULT 0,
+    has_request      INTEGER NOT NULL DEFAULT 0,
+    has_question     INTEGER NOT NULL DEFAULT 0,
+    addressed_to_me  INTEGER NOT NULL DEFAULT 0
+);
+
+-- 목록·홈이 스레드별 messages 집계를 반복하지 않도록 유지하는 영속 상태.
+CREATE TABLE IF NOT EXISTS thread_state (
+    thread_id              INTEGER PRIMARY KEY,
+    first_message_id       INTEGER NOT NULL,
+    first_sent_on          TEXT NOT NULL DEFAULT '',
+    latest_message_id      INTEGER NOT NULL,
+    latest_sent_on         TEXT NOT NULL DEFAULT '',
+    message_count          INTEGER NOT NULL DEFAULT 0,
+    sent_count             INTEGER NOT NULL DEFAULT 0,
+    received_count         INTEGER NOT NULL DEFAULT 0,
+    unread_received_count  INTEGER NOT NULL DEFAULT 0,
+    addressed_to_me_count  INTEGER NOT NULL DEFAULT 0,
+    deadline_count         INTEGER NOT NULL DEFAULT 0
+);
 
 CREATE TABLE IF NOT EXISTS threads (
     id                INTEGER PRIMARY KEY,
@@ -194,8 +223,8 @@ class Store:
         self.db.execute("PRAGMA temp_store=MEMORY")    # 정렬·임시 결과 RAM
         self.db.execute("PRAGMA mmap_size=268435456")  # 256MB 메모리맵 읽기
         self.db.executescript(_SCHEMA)
-        # (구 _migrate 는 2026-07-12 제거 — 스키마 개편은 clean start 로,
-        #  기존 DB 는 삭제 후 sync --full 재수집)
+        # 일반 스키마 개편은 clean start 원칙. 목록용 파생 테이블만 원본 messages에서
+        # 결과 불변으로 재생성할 수 있어 _ensure_derived_state가 버전별 1회 백필한다.
         try:
             self.db.execute(_FTS_TRIGRAM)
             self.fts_tokenizer = "trigram"
@@ -203,9 +232,82 @@ class Store:
             self.db.execute(_FTS_FALLBACK)
             self.fts_tokenizer = "unicode61"
         self.db.commit()
+        self._ensure_derived_state()
 
     def close(self) -> None:
         self.db.close()
+
+    def _derived_version(self) -> str:
+        addr_sig = hashlib.sha256(
+            "\0".join(sorted(self.my_addresses)).encode("utf-8")
+        ).hexdigest()[:12]
+        return f"{FEATURE_VERSION}:{addr_sig}"
+
+    def _addressed_to_me(self, to_addrs: str, cc_addrs: str) -> int:
+        addrs = {a.lower() for a in (to_addrs + ";" + cc_addrs).split(";") if a}
+        return int(bool(addrs & self.my_addresses))
+
+    def _ensure_derived_state(self) -> None:
+        """Backfill derived rows once per feature/address configuration version."""
+        expected = self._derived_version()
+        row = self.db.execute(
+            "SELECT value FROM sync_state WHERE key='derived_version'"
+        ).fetchone()
+        if row and row["value"] == expected:
+            return
+
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            self.db.execute("DELETE FROM message_features")
+            for m in self.db.execute(
+                    "SELECT id, to_addrs, cc_addrs, new_content FROM messages"):
+                deadline, decision, request, question = classify_content(m["new_content"])
+                addressed = self._addressed_to_me(
+                    m["to_addrs"] or "", m["cc_addrs"] or "")
+                self.db.execute(
+                    "INSERT INTO message_features "
+                    "(message_id, has_deadline, has_decision, has_request, "
+                    "has_question, addressed_to_me) VALUES (?,?,?,?,?,?)",
+                    (m["id"], deadline, decision, request, question, addressed),
+                )
+
+            self.db.execute("DELETE FROM thread_state")
+            self.db.execute(
+                """INSERT INTO thread_state
+                   (thread_id, first_message_id, first_sent_on,
+                    latest_message_id, latest_sent_on, message_count,
+                    sent_count, received_count, unread_received_count,
+                    addressed_to_me_count, deadline_count)
+                   SELECT t.id,
+                          (SELECT id FROM messages WHERE thread_id=t.id
+                           ORDER BY sent_on ASC, id ASC LIMIT 1),
+                          (SELECT sent_on FROM messages WHERE thread_id=t.id
+                           ORDER BY sent_on ASC, id ASC LIMIT 1),
+                          (SELECT id FROM messages WHERE thread_id=t.id
+                           ORDER BY sent_on DESC, id DESC LIMIT 1),
+                          (SELECT sent_on FROM messages WHERE thread_id=t.id
+                           ORDER BY sent_on DESC, id DESC LIMIT 1),
+                          COUNT(m.id),
+                          COALESCE(SUM(CASE WHEN m.is_sent=1 THEN 1 ELSE 0 END), 0),
+                          COALESCE(SUM(CASE WHEN m.is_sent=0 THEN 1 ELSE 0 END), 0),
+                          COALESCE(SUM(CASE WHEN m.is_sent=0 AND
+                              (m.read_at IS NULL OR m.read_at='') THEN 1 ELSE 0 END), 0),
+                          COALESCE(SUM(f.addressed_to_me), 0),
+                          COALESCE(SUM(CASE WHEN m.is_sent=0 THEN f.has_deadline ELSE 0 END), 0)
+                   FROM threads t
+                   JOIN messages m ON m.thread_id=t.id
+                   JOIN message_features f ON f.message_id=m.id
+                   GROUP BY t.id"""
+            )
+            self.db.execute(
+                "INSERT INTO sync_state(key, value) VALUES('derived_version', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (expected,),
+            )
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
 
     # ------------------------------------------------------------- sync
 
@@ -225,24 +327,28 @@ class Store:
         """
         stats = SyncStats()
         max_seen = self.last_sync() or ""
-        for rec in records:
-            stats.fetched += 1
-            if self._insert(rec, stats, image_cutoff):
-                stats.inserted += 1
-            else:
-                stats.skipped += 1
-            if rec.sent_on > max_seen:
-                max_seen = rec.sent_on
-            if progress:
-                progress(stats)
-        if max_seen:
-            self.db.execute(
-                "INSERT INTO sync_state(key, value) VALUES('last_sync', ?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (max_seen,),
-            )
-        self.db.commit()
-        return stats
+        try:
+            for rec in records:
+                stats.fetched += 1
+                if self._insert(rec, stats, image_cutoff):
+                    stats.inserted += 1
+                else:
+                    stats.skipped += 1
+                if rec.sent_on > max_seen:
+                    max_seen = rec.sent_on
+                if progress:
+                    progress(stats)
+            if max_seen:
+                self.db.execute(
+                    "INSERT INTO sync_state(key, value) VALUES('last_sync', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (max_seen,),
+                )
+            self.db.commit()
+            return stats
+        except Exception:
+            self.db.rollback()
+            raise
 
     def _insert(self, rec: MailRecord, stats: SyncStats,
                 image_cutoff: str | None = None) -> bool:
@@ -291,8 +397,23 @@ class Store:
             self.db.execute(
                 "INSERT INTO message_html(message_id, html) VALUES (?, ?)",
                 (cur.lastrowid, body_html))
+        deadline, decision, request, question = classify_content(new_content)
+        addressed = self._addressed_to_me(
+            ";".join(a.lower() for a in rec.to),
+            ";".join(a.lower() for a in rec.cc),
+        )
+        self.db.execute(
+            "INSERT INTO message_features "
+            "(message_id, has_deadline, has_decision, has_request, "
+            "has_question, addressed_to_me) VALUES (?,?,?,?,?,?)",
+            (cur.lastrowid, deadline, decision, request, question, addressed),
+        )
         self.db.execute(_FTS_SYNC, (cur.lastrowid, rec.subject, new_content))
         self._touch_thread(thread_id, rec.sent_on)
+        self._update_thread_state(
+            thread_id, cur.lastrowid, rec.sent_on, is_sent,
+            addressed, deadline if not is_sent else 0,
+        )
         # 새 수신 메일이 숨긴 스레드에 오면 자동 숨김 해제 — "지금은 조용히,
         # 새 소식 오면 다시" (구 추적제외의 자동 복귀를 숨김이 흡수, 2026-07-12).
         # 내가 보낸 답장(is_sent=1)으로는 해제하지 않음 — "처리 중인데 다시
@@ -356,6 +477,51 @@ class Store:
                  last_date  = CASE WHEN last_date  < ? THEN ? ELSE last_date END
                WHERE id=?""",
             (sent_on, sent_on, sent_on, sent_on, thread_id),
+        )
+
+    def _update_thread_state(self, thread_id: int, message_id: int,
+                             sent_on: str, is_sent: int, addressed: int,
+                             inbound_deadline: int) -> None:
+        """Apply one appended message to its thread's persistent aggregate."""
+        received = 0 if is_sent else 1
+        self.db.execute(
+            """INSERT INTO thread_state
+               (thread_id, first_message_id, first_sent_on,
+                latest_message_id, latest_sent_on, message_count,
+                sent_count, received_count, unread_received_count,
+                addressed_to_me_count, deadline_count)
+               VALUES (?,?,?,?,?,1,?,?,?,?,?)
+               ON CONFLICT(thread_id) DO UPDATE SET
+                 first_message_id = CASE
+                   WHEN excluded.first_sent_on < thread_state.first_sent_on
+                     OR (excluded.first_sent_on = thread_state.first_sent_on
+                         AND excluded.first_message_id < thread_state.first_message_id)
+                   THEN excluded.first_message_id ELSE thread_state.first_message_id END,
+                 first_sent_on = CASE
+                   WHEN excluded.first_sent_on < thread_state.first_sent_on
+                     OR (excluded.first_sent_on = thread_state.first_sent_on
+                         AND excluded.first_message_id < thread_state.first_message_id)
+                   THEN excluded.first_sent_on ELSE thread_state.first_sent_on END,
+                 latest_message_id = CASE
+                   WHEN excluded.latest_sent_on > thread_state.latest_sent_on
+                     OR (excluded.latest_sent_on = thread_state.latest_sent_on
+                         AND excluded.latest_message_id > thread_state.latest_message_id)
+                   THEN excluded.latest_message_id ELSE thread_state.latest_message_id END,
+                 latest_sent_on = CASE
+                   WHEN excluded.latest_sent_on > thread_state.latest_sent_on
+                     OR (excluded.latest_sent_on = thread_state.latest_sent_on
+                         AND excluded.latest_message_id > thread_state.latest_message_id)
+                   THEN excluded.latest_sent_on ELSE thread_state.latest_sent_on END,
+                 message_count = thread_state.message_count + 1,
+                 sent_count = thread_state.sent_count + excluded.sent_count,
+                 received_count = thread_state.received_count + excluded.received_count,
+                 unread_received_count = thread_state.unread_received_count
+                                         + excluded.unread_received_count,
+                 addressed_to_me_count = thread_state.addressed_to_me_count
+                                          + excluded.addressed_to_me_count,
+                 deadline_count = thread_state.deadline_count + excluded.deadline_count""",
+            (thread_id, message_id, sent_on, message_id, sent_on,
+             is_sent, received, received, addressed, inbound_deadline),
         )
 
     def _update_people(self, rec: MailRecord, is_sent: int) -> None:
@@ -568,13 +734,11 @@ class Store:
         rows = self.db.execute(
             """
             SELECT t.id AS thread_id, m.subject, m.sender_name, m.sender_addr,
-                   m.sent_on, m.message_id,
+                   m.sent_on, m.message_id, m.to_addrs,
                    CAST(julianday('now') - julianday(m.sent_on) AS INTEGER) AS days_old
             FROM threads t
-            JOIN messages m ON m.id = (
-                SELECT id FROM messages WHERE thread_id = t.id
-                ORDER BY sent_on DESC, id DESC LIMIT 1
-            )
+            JOIN thread_state s ON s.thread_id=t.id
+            JOIN messages m ON m.id=s.latest_message_id
             WHERE (t.hidden IS NULL OR t.hidden = 0)
               AND m.is_sent = 0
               AND m.sent_on >= datetime('now', ?)
@@ -582,33 +746,15 @@ class Store:
             """,
             (f"-{days} days",),
         ).fetchall()
-        return [r for r in rows if self._last_to_me(r["thread_id"], max_recipients)]
-
-    def _last_to_me(self, thread_id: int, max_recipients: int = 50) -> bool:
-        """마지막 메일이 '나에게 향한' 것인지.
-
-        To 에 내가 있어야 하고, 수신자 max_recipients 이상의 단체 발송(전사·팀
-        공지류)은 회신 의무가 약하므로 제외 — 필요하면 스레드에 직접 회신하거나
-        note 로 승격하면 된다.
-        """
-        row = self.db.execute(
-            """SELECT to_addrs FROM messages WHERE thread_id=?
-               ORDER BY sent_on DESC, id DESC LIMIT 1""",
-            (thread_id,),
-        ).fetchone()
-        if not row:
-            return False
-        tos = [a for a in row["to_addrs"].split(";") if a]
-        if len(tos) >= max_recipients:
-            return False
-        return bool(set(tos) & self.my_addresses)
+        result = []
+        for row in rows:
+            tos = [a for a in (row["to_addrs"] or "").split(";") if a]
+            if len(tos) < max_recipients and set(tos) & self.my_addresses:
+                result.append(row)
+        return result
 
     def open_thread_tails(self) -> list[sqlite3.Row]:
-        """열린 스레드별 '최신 메시지 1건' + 파생값 (개입 큐용).
-
-        unanswered() 의 상관 서브쿼리 패턴 재사용. 동분(同分) 메일에서 '마지막'
-        이 흔들리지 않도록 sent_on 동률 시 id DESC 로 확정.
-        """
+        """열린 스레드별 최신 메시지와 수집 시 유지한 파생값."""
         return self.db.execute(
             """
             SELECT t.id AS thread_id, t.last_date, t.rolling_summary,
@@ -616,14 +762,16 @@ class Store:
                    m.sender_name, m.sender_addr, m.to_addrs, m.cc_addrs,
                    m.new_content, m.subject, m.sent_on,
                    CAST(julianday('now') - julianday(m.sent_on) AS INTEGER) AS days_old,
-                   (SELECT COUNT(*) FROM messages WHERE thread_id=t.id) AS msg_count,
-                   (SELECT COUNT(*) FROM messages WHERE thread_id=t.id AND is_sent=1)
-                       AS my_msg_count
+                   s.message_count AS msg_count, s.sent_count AS my_msg_count,
+                   s.addressed_to_me_count, s.deadline_count,
+                   f.has_deadline AS last_has_deadline,
+                   f.has_decision AS last_has_decision,
+                   f.has_request AS last_has_request,
+                   f.has_question AS last_has_question
             FROM threads t
-            JOIN messages m ON m.id = (
-                SELECT id FROM messages WHERE thread_id=t.id
-                ORDER BY sent_on DESC, id DESC LIMIT 1
-            )
+            JOIN thread_state s ON s.thread_id=t.id
+            JOIN messages m ON m.id=s.latest_message_id
+            JOIN message_features f ON f.message_id=m.id
             WHERE (t.hidden IS NULL OR t.hidden=0)
             ORDER BY m.sent_on DESC
             """
@@ -737,6 +885,11 @@ class Store:
             "WHERE thread_id=? AND is_sent=0 AND (read_at IS NULL OR read_at='')",
             (datetime.now().isoformat(timespec="seconds"), thread_id),
         )
+        if cur.rowcount > 0:
+            self.db.execute(
+                "UPDATE thread_state SET unread_received_count=0 WHERE thread_id=?",
+                (thread_id,),
+            )
         self.db.commit()
         return cur.rowcount > 0
 
