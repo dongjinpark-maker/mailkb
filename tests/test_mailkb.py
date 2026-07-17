@@ -13,8 +13,9 @@ from urllib.parse import unquote as urllib_unquote
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from mailkb import distill, notes, review, web
+from mailkb import actions, distill, notes, review, web
 from mailkb import search as search_mod
+from mailkb.features import classify_message
 from mailkb.clean import (
     PRESERVED_MARK,
     extract_new_content,
@@ -647,7 +648,7 @@ class TestStore(unittest.TestCase):
         self.assertEqual(tuple(state), (1, 1))
 
     def test_ingest_failure_rolls_back_message_and_derived_state(self):
-        with mock.patch("mailkb.store.classify_content",
+        with mock.patch("mailkb.store.classify_message",
                         side_effect=RuntimeError("feature failure")):
             with self.assertRaises(RuntimeError):
                 self.store.ingest([
@@ -767,6 +768,7 @@ class TestMidJoinPreserve(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.store = Store(Path(self.tmp.name) / "t.sqlite", [ME])
+        self.cfg = Config(home=Path(self.tmp.name), my_addresses=[ME])
 
     def tearDown(self):
         self.store.close()
@@ -870,7 +872,7 @@ class TestMidJoinPreserve(unittest.TestCase):
         self.store._prune_html(30)
         row = self.store.thread_messages(tid)[0]
         self.assertFalse(row["body_html"])
-        out = web.render_thread(self.store, tid)
+        out = web.render_thread(self.store, self.cfg, tid)
         self.assertIn("qfold", out)
         self.assertIn("이전 본문 텍스트", out)
 
@@ -1043,7 +1045,7 @@ class TestInlineImages(unittest.TestCase):
             inline_images={"x@y": self.PNG})])
         self.store.maybe_prune_html(14)
         tid = self.store.message("1")["thread_id"]
-        out = web.render_thread(self.store, tid)
+        out = web.render_thread(self.store, self.cfg, tid)
         self.assertIn("class='imgstrip'", out)            # 마커
         self.assertIn("class='md-rich'", out)             # 서식 기본 표시 (CSS 기본값)
         self.assertIn("<table class='md-table'>", out)    # 표 렌더
@@ -1062,7 +1064,7 @@ class TestInlineImages(unittest.TestCase):
         self.store.ingest([self._img_rec("img", f"{old_day}T09:00:00")])
         self.store.maybe_prune_html(14)
         tid = self.store.message("1")["thread_id"]
-        out = web.render_thread(self.store, tid)
+        out = web.render_thread(self.store, self.cfg, tid)
         self.assertIn("class='imgstrip'", out)        # 마커 배너
         self.assertIn("파형 공유드립니다", out)        # 텍스트 본문 함께
         self.assertNotIn("md-toggle", out)             # 마커는 html 취급 안 함
@@ -1548,7 +1550,8 @@ class TestViewModel(unittest.TestCase):
                        body_text="회신 부탁드립니다. 내일까지 확정 필요."),
         ])
         tid = store.message("1")["thread_id"]
-        d = web.format_detail(store, tid)
+        cfg = Config(home=Path(tmp.name), my_addresses=[ME])
+        d = web.format_detail(store, cfg, tid)
         self.assertEqual(d["title"], "일정 협의")
         self.assertEqual(len(d["timeline"]), 1)
         joined = "\n".join(d["analysis"])
@@ -1569,11 +1572,12 @@ class TestViewModel(unittest.TestCase):
                        body_text="본문입니다."),
         ])
         tid = store.message("1")["thread_id"]
+        cfg = Config(home=Path(tmp.name), my_addresses=[ME])
         # 요약 없을 때: 헤더 없음
-        self.assertNotIn("[누적 요약]", "\n".join(web.format_detail(store, tid)["analysis"]))
+        self.assertNotIn("[누적 요약]", "\n".join(web.format_detail(store, cfg, tid)["analysis"]))
         # 요약 있을 때: 헤더 + 내용 표시 (#21: "롤링" 아님)
         store.save_summary(tid, "핵심: 일정 확정 대기.", 1)
-        joined = "\n".join(web.format_detail(store, tid)["analysis"])
+        joined = "\n".join(web.format_detail(store, cfg, tid)["analysis"])
         self.assertIn("[누적 요약]", joined)
         self.assertIn("핵심: 일정 확정 대기.", joined)
         self.assertNotIn("[롤링 요약]", joined)
@@ -1590,7 +1594,8 @@ class TestViewModel(unittest.TestCase):
                        body_text="굵게 확인", body_html="<p>굵게 <b>확인</b></p>"),
         ])
         tid = store.message("1")["thread_id"]
-        d = web.format_detail(store, tid)
+        cfg = Config(home=Path(tmp.name), my_addresses=[ME])
+        d = web.format_detail(store, cfg, tid)
         self.assertIn("<b>확인</b>", d["timeline"][0]["html"])
 
 
@@ -1793,8 +1798,17 @@ class TestDeadlineRegex(unittest.TestCase):
             self.assertIsNone(review.DEADLINE_RX.search(s), msg=s)
 
     def test_other_keywords_still_match(self):
-        for s in ["제출 기한은 다음과 같습니다", "마감 임박", "회신 부탁드립니다"]:
+        for s in ["제출 기한은 다음과 같습니다", "마감 임박", "ASAP 처리",
+                  "차주 중 확정", "다음 주 초까지"]:
             self.assertRegex(s, review.DEADLINE_RX, msg=s)
+
+    def test_request_proxies_removed_from_deadline(self):
+        # '회신 부탁' 류는 요청 계층(STRONG_REQUEST_RX)의 일 — ⏰(기한)은 순수 기한만.
+        # 구 혼합 설계에서는 모든 회신 부탁이 ⏰ 를 켜 ↩ 와 사실상 중복이었다.
+        from mailkb.features import STRONG_REQUEST_RX
+        for s in ["회신 부탁드립니다", "자료 주시면 감사하겠습니다"]:
+            self.assertIsNone(review.DEADLINE_RX.search(s), msg=s)
+            self.assertRegex(s, STRONG_REQUEST_RX, msg=s)
 
     def test_no_backtracking_on_long_line(self):
         # 수만 자 단일 줄(무매치)에서 폭발하지 않아야 한다 (#5)
@@ -1830,7 +1844,7 @@ class TestWorkdays(unittest.TestCase):
 class TestIntervention(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.store = Store(Path(self.tmp.name) / "t.sqlite", [ME])
+        self.store = Store(Path(self.tmp.name) / "t.sqlite", [ME], ["김도현"])
         self.cfg = Config(
             home=Path(self.tmp.name), my_addresses=[ME], my_names=["김도현"],
             ignore_senders=["noreply"], internal_domains=["corp.example"],
@@ -1895,6 +1909,8 @@ class TestIntervention(unittest.TestCase):
         self.assertEqual(q[0]["days"], 3)  # 영업일 Wed→Mon
 
     def test_stalled_thread_cc_only(self):
+        # CC 로 온 질문은 이제 '확인 후보'(MAYBE)가 흡수 — 멈춘 스레드로 중복
+        # 노출하지 않는다 (2026-07-17 액션 판정기 통합).
         self.store.ingest([
             self._r("t1", "jung@corp.example", [ME, "kim@corp.example"],
                     "표준 논의", "2026-07-13T09:00:00", "방향 논의 필요"),
@@ -1903,9 +1919,12 @@ class TestIntervention(unittest.TestCase):
                     "2026-07-14T09:00:00", "어떻게 진행할까요?",
                     cc=[ME], reply_to="t1"),
         ])
-        q = review.intervention_queue(self.store, self.cfg, "2026-07-20", unanswered=[])
-        self.assertEqual(len(q), 1)
-        self.assertEqual(q[0]["category"], "stalled_thread")
+        q, cand = review.intervention_queue(
+            self.store, self.cfg, "2026-07-20", unanswered=[],
+            return_candidates=True)
+        self.assertEqual(q, [])
+        tid = self._tid("표준 논의")
+        self.assertIn(tid, {c["thread_id"] for c in cand})
 
     def test_mentions_me_helper(self):
         self.assertTrue(review._mentions_me("김도현님 확인 부탁", ["김도현"]))
@@ -2546,7 +2565,7 @@ class TestWeb(unittest.TestCase):
         from mailkb import web
         self.web = web
         self.tmp = tempfile.TemporaryDirectory()
-        self.store = Store(Path(self.tmp.name) / "t.sqlite", [ME])
+        self.store = Store(Path(self.tmp.name) / "t.sqlite", [ME], ["김도현"])
         self.cfg = Config(home=Path(self.tmp.name), my_addresses=[ME],
                           my_names=["김도현"], ignore_senders=["noreply"],
                           internal_domains=["corp.example"])
@@ -2589,7 +2608,7 @@ class TestWeb(unittest.TestCase):
 
     def test_thread_renders_html_and_blocks_remote_img(self):
         tid = self.store.message("1")["thread_id"]
-        out = self.web.render_thread(self.store, tid)
+        out = self.web.render_thread(self.store, self.cfg, tid)
         self.assertIn("<b>부탁</b>", out)             # 서식 렌더
         self.assertIn("data-blocked-src", out)         # 원격 이미지 차단
         self.assertIn("일부 이미지를 표시할 수 없습니다", out)   # 안내 배너
@@ -2614,7 +2633,7 @@ class TestWeb(unittest.TestCase):
             "SELECT id, thread_id FROM messages WHERE message_id='<fb@t>'").fetchone()
         self.assertEqual(first["thread_id"], second["thread_id"])   # 같은 스레드
         # 스레드 상세: 두 메일 모두 앵커 id 를 가진다
-        detail = self.web.render_thread(self.store, first["thread_id"])
+        detail = self.web.render_thread(self.store, self.cfg, first["thread_id"])
         self.assertIn(f"id='msg-{first['id']}'", detail)
         self.assertIn(f"id='msg-{second['id']}'", detail)
         # '예산초과분' 은 둘째 메일에만 → 링크가 둘째 메일로 focus
@@ -2642,7 +2661,7 @@ class TestWeb(unittest.TestCase):
         tid = self.store.db.execute(
             "SELECT thread_id FROM messages WHERE subject='주간 보고'"
         ).fetchone()["thread_id"]
-        out = self.web.render_thread(self.store, tid)
+        out = self.web.render_thread(self.store, self.cfg, tid)
         self.assertIn(">텍스트 보기</button>", out)      # 토글 버튼 (서식이 기본)
         self.assertIn("class='md-raw'", out)            # 저장 텍스트 보존(토글용)
         self.assertIn("md-rich", out)                   # 렌더 결과
@@ -2653,13 +2672,13 @@ class TestWeb(unittest.TestCase):
     def test_thread_no_md_toggle_for_html_mail(self):
         # HTML 메일(w1)은 이미 서식 → 마크다운 토글 없음
         tid = self.store.message("1")["thread_id"]
-        out = self.web.render_thread(self.store, tid)
+        out = self.web.render_thread(self.store, self.cfg, tid)
         self.assertNotIn("md-toggle", out)
 
     def test_html_mail_wrapped_for_dark_flatten(self):
         # 메일 원본 HTML 은 .mailhtml 로 감싸 다크 평탄화 대상이 된다
         tid = self.store.message("1")["thread_id"]
-        out = self.web.render_thread(self.store, tid)
+        out = self.web.render_thread(self.store, self.cfg, tid)
         self.assertIn("<div class='mailhtml'>", out)
         # 다크 평탄화 규칙이 CSS 에 존재 (색·배경·링크)
         self.assertIn(":root[data-theme='dark'] .mailhtml", self.web._CSS)
@@ -2676,7 +2695,7 @@ class TestWeb(unittest.TestCase):
         tid = self.store.db.execute(
             "SELECT thread_id FROM messages WHERE subject='일반 문의'"
         ).fetchone()["thread_id"]
-        out = self.web.render_thread(self.store, tid)
+        out = self.web.render_thread(self.store, self.cfg, tid)
         self.assertNotIn("md-toggle", out)
         self.assertNotIn("md-rich", out)
 
@@ -2743,7 +2762,7 @@ class TestWeb(unittest.TestCase):
         tid = self.store.db.execute(
             "SELECT thread_id FROM messages WHERE subject='표 보고'"
         ).fetchone()["thread_id"]
-        out = self.web.render_thread(self.store, tid)
+        out = self.web.render_thread(self.store, self.cfg, tid)
         self.assertIn("md-toggle", out)
         self.assertIn("md-table", out)
         self.assertIn("<th", out)
@@ -2958,7 +2977,7 @@ class TestWeb(unittest.TestCase):
         ])
         tid = [r["thread_id"] for r in self.store.db.execute(
             "SELECT thread_id FROM messages WHERE subject='순서건'")][0]
-        d = self.web.format_detail(self.store, tid)
+        d = self.web.format_detail(self.store, self.cfg, tid)
         self.assertEqual(d["timeline"][0]["sent_on"][:10], "2026-07-03")
         self.assertEqual(d["timeline"][-1]["sent_on"][:10], "2026-07-01")
 
@@ -3011,14 +3030,14 @@ class TestWeb(unittest.TestCase):
     def test_thread_header_sender_first(self):
         # 본문 헤더: 발신인(mh-who)이 날짜(mh-when)보다 먼저
         tid = self.store.message("1")["thread_id"]
-        out = self.web.render_thread(self.store, tid)
+        out = self.web.render_thread(self.store, self.cfg, tid)
         self.assertIn("mh-who", out)
         self.assertLess(out.index("mh-who"), out.index("mh-when"))
 
     def test_dismiss_removed_and_signal_wording(self):
         # 추적제외 폐지(2026-07-12): 버튼 없음 + 신호 문구는 ↩/⏰ 새 표현
         tid = self.store.message("1")["thread_id"]
-        out = self.web.render_thread(self.store, tid)
+        out = self.web.render_thread(self.store, self.cfg, tid)
         self.assertNotIn("추적 제외", out)
         self.assertNotIn("/dismiss'", out)
         self.assertIn("↩ 내 응답 대기", out)          # 구 '⚑ 미답변 — 내 회신 없음'
@@ -3191,19 +3210,19 @@ class TestWeb(unittest.TestCase):
                        attachments=["제목 없는 첨부 파일 00002.png"]),
         ])
         t1 = self.store.message("2")["thread_id"]   # 첨부건 (w1 다음)
-        d1 = self.web.format_detail(self.store, t1)
+        d1 = self.web.format_detail(self.store, self.cfg, t1)
         self.assertEqual(d1["timeline"][0]["attach"], "보고서.xlsx")
-        out1 = self.web.render_thread(self.store, t1)
+        out1 = self.web.render_thread(self.store, self.cfg, t1)
         self.assertIn("📎보고서.xlsx", out1)
         self.assertNotIn("제목 없는 첨부 파일", out1)
         t2 = self.store.message("3")["thread_id"]   # 이미지만 → 📎 자체가 없음
-        out2 = self.web.render_thread(self.store, t2)
+        out2 = self.web.render_thread(self.store, self.cfg, t2)
         self.assertNotIn("📎", out2)
         self.assertNotIn("첨부 추출", out2)   # 의미 있는 첨부 없음 → 버튼도 숨김
 
     def test_thread_page_has_action_forms(self):
         tid = self.store.message("1")["thread_id"]
-        out = self.web.render_thread(self.store, tid)
+        out = self.web.render_thread(self.store, self.cfg, tid)
         for a in ("hide", "note", "open"):
             self.assertIn(f"action='/thread/{tid}/{a}'", out)
         # 발신자 차단은 주소별 보기 페이지로 이동 → 스레드엔 없음
@@ -3277,10 +3296,10 @@ class TestWeb(unittest.TestCase):
             sent_on="2026-07-04T11:00:00", body_text="첨부", attachments=["a.xlsx"])])
         tid = self.store.db.execute(
             "SELECT thread_id FROM messages WHERE subject='첨부건'").fetchone()["thread_id"]
-        self.assertIn(f"action='/thread/{tid}/attach'", self.web.render_thread(self.store, tid))
+        self.assertIn(f"action='/thread/{tid}/attach'", self.web.render_thread(self.store, self.cfg, tid))
         # 첨부 없는 스레드엔 버튼 없음
         tid0 = self.store.message("1")["thread_id"]
-        self.assertNotIn("/attach'", self.web.render_thread(self.store, tid0))
+        self.assertNotIn("/attach'", self.web.render_thread(self.store, self.cfg, tid0))
 
     def test_saved_ai_shown_on_home_get(self):
         # B1: 저장된 AI 정리가 홈 새로고침(GET)에도 반영 (개입 흡수)
@@ -3319,12 +3338,12 @@ class TestWeb(unittest.TestCase):
     # ─────────────────── 플래그 (기능 2) — 아이콘 유/무
     def test_flag_toggle_action_and_badge(self):
         tid = self.store.message("1")["thread_id"]
-        out = self.web.render_thread(self.store, tid)
+        out = self.web.render_thread(self.store, self.cfg, tid)
         self.assertIn(f"action='/thread/{tid}/flag'", out)       # 플래그 버튼
         self.assertIn("⚐", out)                                  # 색 없는 flag(미표시)
         self.web.perform_action(self.store, self.cfg, f"/thread/{tid}/flag", {})
         self.assertEqual(self.store.thread(tid)["flagged"], 1)
-        out2 = self.web.render_thread(self.store, tid)
+        out2 = self.web.render_thread(self.store, self.cfg, tid)
         self.assertIn(f"action='/thread/{tid}/unflag'", out2)     # 이제 해제 버튼
         self.assertIn("flag on", out2)                            # 색 있는 flag(표시)
         self.assertIn("⚑", out2)
@@ -3358,7 +3377,7 @@ class TestWeb(unittest.TestCase):
         for out in (self.web.render_mail(self.store, self.cfg),
                     self.web.render_threads(self.store, self.cfg)):
             self.assertIn("class='listtabs'", out)
-            for lbl in ("전체", "미개봉", "↩ 내 응답 대기", "⏰ 기한/요청",
+            for lbl in ("전체", "미개봉", "↩ 내 응답 대기", "⏰ 기한",
                         "🚩 플래그", "🙈 숨김"):
                 self.assertIn(lbl, out)
             self.assertNotIn("추적제외", out)
@@ -3387,7 +3406,7 @@ class TestWeb(unittest.TestCase):
         out = self.web.render_threads(self.store, self.cfg, flt="awaiting")
         self.assertIn("기한 있는 요청", out)
         self.assertNotIn(f"/thread/{w_tid}'", out)
-        # 기한/요청: DEADLINE_RX 매칭 스레드만
+        # 기한: DEADLINE_RX 매칭 스레드만
         out2 = self.web.render_threads(self.store, self.cfg, flt="deadline")
         self.assertIn("기한 있는 요청", out2)
         self.assertNotIn(f"/thread/{w_tid}'", out2)
@@ -3396,10 +3415,10 @@ class TestWeb(unittest.TestCase):
         self.assertIn("기한 있는 요청", m)
         full = self.web.render_mail(self.store, self.cfg)
         self.assertIn("↩ 내 응답 대기 1", full)
-        self.assertIn("⏰ 기한/요청 1", full)
+        self.assertIn("⏰ 기한 1", full)
         thr = self.web.render_threads(self.store, self.cfg)   # 스레드 뱃지도 1/1
         self.assertIn("↩ 내 응답 대기 1", thr)
-        self.assertIn("⏰ 기한/요청 1", thr)
+        self.assertIn("⏰ 기한 1", thr)
         # 숨기면 신호 필터에서도 빠짐 — 리스트뿐 아니라 뱃지 카운트에서도(회귀 가드).
         # 신호 캐시는 hidden 을 제외하지 않으므로 카운트 지점의 라이브 제외가 필요하다.
         self.store.hide_thread(dl_tid, True)
@@ -3407,10 +3426,10 @@ class TestWeb(unittest.TestCase):
                          self.web.render_threads(self.store, self.cfg, flt="awaiting"))
         thr2 = self.web.render_threads(self.store, self.cfg)
         self.assertIn("↩ 내 응답 대기 0", thr2)       # 숨김 스레드가 뱃지를 부풀리지 않음
-        self.assertIn("⏰ 기한/요청 0", thr2)
+        self.assertIn("⏰ 기한 0", thr2)
         full2 = self.web.render_mail(self.store, self.cfg)
         self.assertIn("↩ 내 응답 대기 0", full2)       # 메일함 뱃지도 0(원래 정상, 확인)
-        self.assertIn("⏰ 기한/요청 0", full2)
+        self.assertIn("⏰ 기한 0", full2)
 
     # ─────────────────── 숨기기 (기능 2) — 추적·메일함·기본목록에서 제외
     def test_hide_excludes_from_queue_mail_and_threads(self):
@@ -3441,12 +3460,12 @@ class TestWeb(unittest.TestCase):
 
     def test_hide_button_and_unhide_button(self):
         tid = self.store.message("1")["thread_id"]
-        out = self.web.render_thread(self.store, tid)
+        out = self.web.render_thread(self.store, self.cfg, tid)
         self.assertIn(f"action='/thread/{tid}/hide'", out)
         self.assertIn("숨기기", out)
         self.assertNotIn("/unread'", out)                        # 안읽음 버튼 삭제됨
         self.store.hide_thread(tid, True)
-        out2 = self.web.render_thread(self.store, tid)
+        out2 = self.web.render_thread(self.store, self.cfg, tid)
         self.assertIn(f"action='/thread/{tid}/unhide'", out2)    # 숨김 중 → 해제
         self.assertIn("숨김 해제", out2)
 
@@ -3490,7 +3509,7 @@ class TestWeb(unittest.TestCase):
 
     def test_thread_sender_name_links_to_person(self):
         # 참여자(수신 발신자) 이름 클릭 → 주소별 메일
-        out = self.web.render_thread(self.store, self.store.message("1")["thread_id"])
+        out = self.web.render_thread(self.store, self.cfg, self.store.message("1")["thread_id"])
         self.assertIn("<a href='/person?addr=kim%40corp.example'", out)
 
     def test_render_person_page_mailbox_style(self):
@@ -3758,7 +3777,7 @@ class TestWeb(unittest.TestCase):
 
     def test_thread_record_decision_manual(self):
         tid = self.store.message("1")["thread_id"]
-        out = self.web.render_thread(self.store, tid)
+        out = self.web.render_thread(self.store, self.cfg, tid)
         self.assertIn("record-decision", out)     # 수동 기록 폼 노출
         self.assertIn("class='lbl'>장기기억<", out)   # 버튼 라벨
         self.assertIn(">✕ 닫기<", out)                # 펼침 시 교체 라벨(CSS 토글)
@@ -4668,23 +4687,416 @@ class TestNoiseCache(unittest.TestCase):
         self.assertNotIn("자동", html)                 # 노이즈 메시지 제외됨
         self.assertIn("실제 업무", html)                # 실제 메일은 표시
 
-    def test_signal_cache_hide_unhide_correct(self):
-        # 신호 캐시는 hidden 무관 — 숨김/해제는 호출부 라이브 필터가 즉시 반영(캐시 무효화 X)
+    def test_signal_hide_unhide_live(self):
+        # 액션 판정은 요청 시점 라이브 — 숨김/해제가 ↩ 집합·목록에 즉시 반영
+        # ("확인 요청" 제목 = 요청 표지 + 직접 수신 → REQUIRED)
         self.store.ingest([_recx("w1", "boss@corp.example", "확인 요청",
                                  "2026-07-05T09:00:00", body="확인 부탁", to=[ME])])
         tid = self.store.db.execute(
             "SELECT thread_id FROM messages WHERE sender_addr='boss@corp.example'"
         ).fetchone()[0]
-        aw, _ = web._signal_sets(self.store)
+        _, aw, _, _ = web._action_state(self.store, self.cfg)
         self.assertIn(tid, aw)                         # 응답 대기 신호
         self.assertIn("확인 요청", web.render_mail(self.store, self.cfg, flt="awaiting"))
         self.store.hide_thread(tid, True)              # 데이터 불변, hidden 만 변경
-        aw2, _ = web._signal_sets(self.store)
-        self.assertEqual(aw, aw2)                      # 캐시 그대로(무효화 안 됨)
-        self.assertNotIn("확인 요청",                   # 그래도 라이브 필터로 제외
+        _, aw2, _, _ = web._action_state(self.store, self.cfg)
+        self.assertNotIn(tid, aw2)                     # 숨김 → 판정 NONE (라이브)
+        self.assertNotIn("확인 요청",
                          web.render_mail(self.store, self.cfg, flt="awaiting"))
         self.store.hide_thread(tid, False)             # 해제 → 다시 보임
         self.assertIn("확인 요청", web.render_mail(self.store, self.cfg, flt="awaiting"))
+
+
+class TestFeatureGating(unittest.TestCase):
+    """L1 문장 게이팅 — 확인된 오탐·미탐(2026-07-17 규칙 분석)의 정식 회귀.
+
+    원칙: 요청·기한은 같은 문장에 완료/과거 문맥이 있으면 무효, 순서 무관
+    (마지막 문장 우선이 아니라 문장별 게이팅 후 OR), 인사 관용구는 요청이 아님.
+    """
+
+    def _f(self, body, **kw):
+        return classify_message(body, **kw)
+
+    def test_pleasantries_are_not_requests(self):
+        for s in ("참고 부탁드립니다.", "앞으로도 잘 부탁드립니다.",
+                  "많은 관심 부탁드립니다.", "양해 부탁드립니다.", "참고 바랍니다."):
+            self.assertEqual(self._f(s)["has_request"], 0, msg=s)
+
+    def test_completed_and_historical_gated(self):
+        f = self._f("검토 요청 건을 완료했습니다.")
+        self.assertEqual((f["has_request"], f["has_decision"], f["has_completion"]),
+                         (0, 0, 1))
+        for s in ("승인 요청 드렸던 건 처리됐습니다.", "요청하신 자료 송부드립니다.",
+                  "지난번 검토 부탁드린 건 회신 왔습니다.", "아래와 같이 처리했습니다."):
+            self.assertEqual(self._f(s)["has_request"], 0, msg=s)
+        self.assertEqual(self._f("승인 올리겠습니다.")["has_decision"], 0)
+        # 완료 문장의 기한도 무효 — "금요일까지 완료했습니다"는 기한이 아니다
+        self.assertEqual(self._f("금요일까지 완료했습니다.")["has_deadline"], 0)
+        self.assertEqual(self._f("현재까지 진행중입니다.")["has_deadline"], 0)
+
+    def test_strong_requests_detected(self):
+        for s in ("검토 부탁드립니다.", "회신 부탁드립니다.", "의견 주세요.",
+                  "확인해 주시겠어요?", "한번 봐주실 수 있을까요?",
+                  "Please review and let me know.", "Could you confirm?"):
+            self.assertEqual(self._f(s)["has_strong_request"], 1, msg=s)
+
+    def test_weak_vs_strong_split(self):
+        f = self._f("확인 부탁드립니다.")
+        self.assertEqual((f["has_strong_request"], f["has_weak_request"]), (0, 1))
+        f = self._f("검토 부탁드립니다.")
+        self.assertEqual(f["has_strong_request"], 1)
+
+    def test_fullwidth_question_detected(self):
+        self.assertEqual(self._f("확인 가능한가요？")["has_question"], 1)
+
+    def test_sentence_gating_is_order_free(self):
+        # 재개: 완료 문장 뒤의 새 요청은 살아있다
+        f = self._f("검토는 완료했습니다. 추가 항목은 내일까지 회신 부탁드립니다.")
+        self.assertEqual((f["has_strong_request"], f["has_deadline"]), (1, 1))
+        # 한국어 맺음말이 마지막이어도 앞 문장의 요청은 유지(마지막 문장 우선 아님)
+        f = self._f("내일까지 회신 부탁드립니다. 감사합니다. 좋은 하루 되세요.")
+        self.assertEqual(f["has_strong_request"], 1)
+
+    def test_remind_revives_historical(self):
+        f = self._f("지난번 요청드렸던 자료, 다시 한번 부탁드립니다.")
+        self.assertEqual(f["has_request"], 1)
+
+    def test_withdrawal(self):
+        f = self._f("회신 불필요합니다. 참고만 하세요.")
+        self.assertEqual((f["has_withdrawal"], f["has_request"]), (1, 0))
+        self.assertEqual(self._f("해당 요청은 취소합니다.")["has_withdrawal"], 1)
+        # "무시해 주세요"가 강한 요청('~해 주세요')으로 오인되면 철회가 재개로
+        # 뒤집힌다 — 독립 코퍼스 평가가 잡은 구멍(오탐 26건의 원인)
+        f = self._f("문제가 해결되어 기존 요청은 무시해 주세요. 감사합니다.")
+        self.assertEqual((f["has_withdrawal"], f["has_request"]), (1, 0))
+
+    def test_conditional_not_completion(self):
+        # "문제/이상 없으면 ~해 주세요"는 조건부 요청 — 완료 게이트에 걸리면 안 됨
+        f = self._f("문제 없으면 승인 의견을 회신 바랍니다.")
+        self.assertEqual(f["has_strong_request"], 1)
+        f = self._f("이상 없으면 진행해 주세요.")
+        self.assertEqual(f["has_strong_request"], 1)
+        # 서술형은 여전히 완료
+        self.assertEqual(self._f("검토했고 이상 없습니다.")["has_completion"], 1)
+
+    def test_hedged_request_is_weak(self):
+        # "가능하면 ~해 주시면"은 완곡 — REQUIRED 근거(강한 요청)가 아니라 약한 요청
+        f = self._f("가능하면 검토해 주시면 감사하겠습니다.")
+        self.assertEqual((f["has_strong_request"], f["has_weak_request"]), (0, 1))
+
+    def test_deadline_vocabulary(self):
+        for s in ("금주 내로 검토 부탁드립니다.", "오늘 중으로 부탁드립니다.",
+                  "3일 내로 회신 부탁드립니다.", "가능한 빨리 회신 주세요.",
+                  "ASAP 처리 부탁드립니다.", "EOD까지 부탁드립니다."):
+            self.assertEqual(self._f(s)["has_deadline"], 1, msg=s)
+        self.assertEqual(self._f("작년 12월까지 담당했던 건입니다.")["has_deadline"], 0)
+
+    def test_mentions_subject_trivial(self):
+        f = self._f("김도현 수석님이 확인해 주시면 좋겠습니다.", names=["김도현"])
+        self.assertEqual(f["mentions_me"], 1)
+        f = self._f("각 담당자는 금일까지 회신 바랍니다.")
+        self.assertEqual(f["mentions_group"], 1)
+        self.assertEqual(
+            self._f("본문", subject="[검토 요청] 설계안")["subject_has_request"], 1)
+        self.assertEqual(
+            self._f("본문", subject="주간 현황 공유")["subject_has_request"], 0)
+        self.assertEqual(self._f("++김수석")["is_trivial"], 1)
+
+
+class TestActionFold(unittest.TestCase):
+    """L2 액션 상태기계 — 전이·역순 refold·무작위 drift·백필 등가."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "t.sqlite", [ME], ["김도현"])
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _r(self, mid, sender, to, subject, when, body, reply_to=""):
+        return MailRecord(
+            message_id=f"<{mid}@t>", subject=subject,
+            sender_name=sender.split("@")[0], sender_addr=sender,
+            to=to, sent_on=when, body_text=body,
+            in_reply_to=f"<{reply_to}@t>" if reply_to else "",
+            references=[f"<{reply_to}@t>"] if reply_to else [])
+
+    def _action(self, tid):
+        return dict(self.store.db.execute(
+            "SELECT action_source_id, action_strength, action_kind, "
+            "action_has_deadline, completion_after_action "
+            "FROM thread_state WHERE thread_id=?", (tid,)).fetchone())
+
+    def _tid(self, mid):
+        return self.store.db.execute(
+            "SELECT thread_id FROM messages WHERE message_id=?",
+            (f"<{mid}@t>",)).fetchone()[0]
+
+    def test_lifecycle_open_trivial_resolve_reopen_complete_withdraw(self):
+        st = self.store
+        st.ingest([self._r("a1", "kim@corp.example", [ME], "검토건",
+                           "2026-07-01T09:00:00", "내일까지 검토 부탁드립니다.")])
+        tid = self._tid("a1")
+        a = self._action(tid)
+        self.assertGreater(a["action_source_id"], 0)
+        self.assertEqual((a["action_strength"], a["action_has_deadline"]),
+                         ("strong", 1))
+        # 내 trivial 발신(++)은 해소가 아니다
+        st.ingest([self._r("a2", ME, ["kim@corp.example"], "RE: 검토건",
+                           "2026-07-01T10:00:00", "++박수석", reply_to="a1")])
+        self.assertGreater(self._action(tid)["action_source_id"], 0)
+        # 내 실질 회신 = 해소 (⏰ 함께 소멸 — 기한이 영구히 남던 문제의 수정)
+        st.ingest([self._r("a3", ME, ["kim@corp.example"], "RE: 검토건",
+                           "2026-07-01T11:00:00", "검토 의견 드립니다.", reply_to="a1")])
+        a = self._action(tid)
+        self.assertEqual((a["action_source_id"], a["action_has_deadline"]), (0, 0))
+        # 새 수신 요청 → 재개
+        st.ingest([self._r("a4", "kim@corp.example", [ME], "RE: 검토건",
+                           "2026-07-02T09:00:00", "추가건도 검토 부탁드립니다.",
+                           reply_to="a1")])
+        self.assertGreater(self._action(tid)["action_source_id"], 0)
+        # 상대의 완료 통보는 해소가 아니라 표시만(잘못 닫힘 = 조용히 놓친 공)
+        st.ingest([self._r("a5", "kim@corp.example", [ME], "RE: 검토건",
+                           "2026-07-02T10:00:00", "추가건은 저희가 처리했습니다.",
+                           reply_to="a1")])
+        a = self._action(tid)
+        self.assertGreater(a["action_source_id"], 0)
+        self.assertEqual(a["completion_after_action"], 1)
+        # 명시적 철회만 상대 측에서 닫을 수 있다
+        st.ingest([self._r("a6", "kim@corp.example", [ME], "RE: 검토건",
+                           "2026-07-02T11:00:00", "회신 불필요합니다.",
+                           reply_to="a1")])
+        self.assertEqual(self._action(tid)["action_source_id"], 0)
+
+    def test_weak_nag_keeps_strength_updates_source(self):
+        st = self.store
+        st.ingest([
+            self._r("b1", "lee@corp.example", [ME], "승인건",
+                    "2026-07-03T09:00:00", "승인 부탁드립니다."),
+            self._r("b2", "lee@corp.example", [ME], "RE: 승인건",
+                    "2026-07-03T10:00:00", "확인 부탁드립니다.", reply_to="b1"),
+        ])
+        a = self._action(self._tid("b1"))
+        # 약한 재촉이 강도·decide 를 격하시키지 않고 source 만 최신으로
+        self.assertEqual((a["action_strength"], a["action_kind"]),
+                         ("strong", "decide"))
+        src_mid = self.store.db.execute(
+            "SELECT message_id FROM messages WHERE id=?",
+            (a["action_source_id"],)).fetchone()[0]
+        self.assertEqual(src_mid, "<b2@t>")
+
+    def test_out_of_order_refold(self):
+        st = self.store
+        # 최신(내 회신)을 먼저, 과거(요청)를 나중에 — Outlook 지연 수집 시나리오
+        st.ingest([self._r("c2", ME, ["kim@corp.example"], "역순건",
+                           "2026-07-04T15:00:00", "답변드립니다.")])
+        st.ingest([self._r("c1", "kim@corp.example", [ME], "역순건",
+                           "2026-07-04T09:00:00", "의견 주세요.")])
+        self.assertEqual(self._action(self._tid("c1"))["action_source_id"], 0)
+
+    def test_random_order_matches_refold_and_backfill(self):
+        import random
+        random.seed(7)
+        bodies = ["검토 부탁드립니다.", "확인했습니다. 이상 없습니다.", "참고 바랍니다.",
+                  "회신 불필요합니다.", "금일까지 회신 부탁드립니다.", "가능할까요?",
+                  "++김수석", "처리 완료했습니다.", "잘 부탁드립니다."]
+        msgs = []
+        for i in range(80):
+            sender = ME if random.random() < 0.3 else f"p{i % 4}@corp.example"
+            to = [ME] if sender != ME else ["p0@corp.example"]
+            msgs.append(self._r(
+                f"d{i}", sender, to, f"스레드{i % 6}",
+                f"2026-06-{(i % 28) + 1:02d}T{9 + (i % 9):02d}:{i % 60:02d}:00",
+                random.choice(bodies)))
+        random.shuffle(msgs)
+        for m in msgs:
+            self.store.ingest([m])
+        cols = ("action_source_id", "action_strength", "action_kind",
+                "action_has_deadline", "completion_after_action")
+        q = ("SELECT thread_id, " + ", ".join(cols) + " FROM thread_state")
+        before = {r["thread_id"]: tuple(r[c] for c in cols)
+                  for r in self.store.db.execute(q)}
+        # 증분 ≡ 전체 재접기 (같은 fold_action — drift 0 이어야)
+        for tid in before:
+            self.store._refold_thread_actions(tid)
+        self.store.db.commit()
+        after = {r["thread_id"]: tuple(r[c] for c in cols)
+                 for r in self.store.db.execute(q)}
+        self.assertEqual(before, after)
+        # 백필(버전 리셋 → 재오픈) ≡ 증분
+        path = self.store.db_path
+        self.store.db.execute("DELETE FROM sync_state WHERE key='derived_version'")
+        self.store.db.commit()
+        self.store.close()
+        self.store = Store(path, [ME], ["김도현"])
+        rebuilt = {r["thread_id"]: tuple(r[c] for c in cols)
+                   for r in self.store.db.execute(q)}
+        self.assertEqual(after, rebuilt)
+
+    def test_name_config_change_triggers_backfill(self):
+        st = self.store
+        st.ingest([self._r("n1", "kim@corp.example",
+                           ["team@corp.example", ME, "x@corp.example",
+                            "y@corp.example", "z@corp.example"],
+                           "지목건", "2026-07-05T09:00:00",
+                           "박부장님이 회신 부탁드립니다.")])
+        mid = st.db.execute("SELECT id FROM messages").fetchone()[0]
+        self.assertEqual(st.db.execute(
+            "SELECT mentions_me FROM message_features WHERE message_id=?",
+            (mid,)).fetchone()[0], 0)
+        path = st.db_path
+        st.close()
+        # 이름 추가 → derived_version 변경 → 자동 백필로 mentions_me 갱신
+        self.store = Store(path, [ME], ["김도현", "박부장"])
+        self.assertEqual(self.store.db.execute(
+            "SELECT mentions_me FROM message_features WHERE message_id=?",
+            (mid,)).fetchone()[0], 1)
+
+
+class TestActionLadder(unittest.TestCase):
+    """L3 판정 사다리 + 홈·웹·상세 일치성 + ⏰ 해소."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "t.sqlite", [ME], ["김도현"])
+        self.cfg = Config(home=Path(self.tmp.name), my_addresses=[ME],
+                          my_names=["김도현"], ignore_senders=["noreply"],
+                          internal_domains=["corp.example"],
+                          raw={"filters": {"external_allowlist": ["partner.example"]}})
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _scen(self, records):
+        before = {r[0] for r in self.store.db.execute("SELECT id FROM threads")}
+        self.store.ingest(records)
+        new = [r[0] for r in self.store.db.execute("SELECT id FROM threads")
+               if r[0] not in before]
+        return actions.evaluate_thread(self.store, self.cfg, new[0]), new[0]
+
+    def _r(self, mid, sender, to, subject, body, cc=None, when=None):
+        return _recx(mid, sender, subject,
+                     when or "2026-07-16T09:00:00", body=body, to=to, cc=cc)
+
+    def test_ladder_required(self):
+        a, _ = self._scen([self._r("r1", "kim@corp.example", [ME],
+                                   "설계안", "내일까지 회신 부탁드립니다.")])
+        self.assertEqual((a.level, "strong_direct" in a.reasons), ("required", True))
+        a, _ = self._scen([self._r("r2", "kim@corp.example", [ME],
+                                   "결재안", "승인 부탁드립니다.")])
+        self.assertEqual((a.level, a.kind), ("required", "decide"))
+        a, _ = self._scen([self._r("r3", "kim@corp.example", ["lee@corp.example"],
+                                   "협의안", "김도현 수석님이 검토 부탁드립니다.",
+                                   cc=[ME])])
+        self.assertEqual((a.level, "strong_named" in a.reasons), ("required", True))
+        a, _ = self._scen([self._r("r4", "kim@corp.example", [ME],
+                                   "질의안", "이대로 진행해도 될까요?")])
+        self.assertEqual((a.level, "question_direct" in a.reasons),
+                         ("required", True))
+
+    def test_ladder_maybe(self):
+        a, _ = self._scen([self._r("m1", "kim@corp.example", [ME],
+                                   "자료안", "확인 부탁드립니다.")])
+        self.assertEqual((a.level, "weak_direct" in a.reasons), ("maybe", True))
+        # 전원·담당자 지목 + 강한 요청은 그룹이라도 REQUIRED (지목 없는 그룹은 MAYBE)
+        group = [ME] + [f"g{i}@corp.example" for i in range(9)]
+        a, _ = self._scen([self._r("m2", "kim@corp.example", group,
+                                   "공지안", "각 담당자는 금주 내로 회신 부탁드립니다.")])
+        self.assertEqual((a.level, "group_call" in a.reasons), ("required", True))
+        a, _ = self._scen([self._r("m2b", "kim@corp.example", group,
+                                   "공지안2", "일정 회신 부탁드립니다.")])
+        self.assertEqual((a.level, "group_to" in a.reasons), ("maybe", True))
+        a, _ = self._scen([
+            self._r("m3", "kim@corp.example", [ME], "처리안",
+                    "처리 부탁드립니다.", when="2026-07-15T09:00:00"),
+            self._r("m4", "kim@corp.example", [ME], "RE: 처리안",
+                    "저희 쪽에서 반영했습니다.", when="2026-07-15T10:00:00"),
+        ])
+        self.assertEqual((a.level, "completion_after" in a.reasons), ("maybe", True))
+        a, _ = self._scen([self._r("m5", "sales@outside.example", [ME],
+                                   "제안안", "검토 부탁드립니다.")])
+        self.assertEqual((a.level, "external" in a.reasons), ("maybe", True))
+
+    def test_ladder_none_and_allowlist(self):
+        a, _ = self._scen([self._r("n1", "kim@corp.example", [ME],
+                                   "공유안", "세미나 자료 공유드립니다. 참고 바랍니다.")])
+        self.assertEqual(a.level, "none")
+        a, _ = self._scen([self._r("n2", "noreply@corp.example", [ME],
+                                   "알림안", "회신 부탁드립니다.")])
+        self.assertEqual((a.level, a.reasons), ("none", ["hard_noise"]))
+        # 허용 목록의 외부 협력사는 정상 추적
+        a, _ = self._scen([self._r("n3", "kim@partner.example", [ME],
+                                   "일정안", "회신 부탁드립니다.")])
+        self.assertEqual(a.level, "required")
+
+    def test_home_web_detail_consistency(self):
+        self.store.ingest([
+            self._r("x1", "kim@corp.example", [ME], "일치성1",
+                    "내일까지 회신 부탁드립니다."),
+            self._r("x2", "lee@corp.example", [ME], "일치성2",
+                    "확인 부탁드립니다."),
+            self._r("x3", "park@corp.example", [ME], "일치성3",
+                    "요청하신 검토 완료했습니다."),
+        ])
+        q, cand = review.intervention_queue(
+            self.store, self.cfg, "2026-07-17", return_candidates=True)
+        home_req = {it["thread_id"] for it in q
+                    if it["category"] in ("decide", "respond")}
+        home_maybe = {c["thread_id"] for c in cand}
+        _, aw, may, _ = web._action_state(self.store, self.cfg)
+        self.assertEqual(home_req, set(aw))          # 홈 == 웹 ↩ (정의상 동일)
+        self.assertEqual(home_maybe, set(may))       # 확인 후보도 동일
+        for tid in aw:                               # 상세 신호도 동일 판정
+            d = web.format_detail(self.store, self.cfg, tid)
+            self.assertIn("↩ 내 응답 대기", "\n".join(d["analysis"]))
+
+    def test_deadline_clears_after_my_reply(self):
+        # ⏰ 가 영구히 남던 문제(deadline_count 누적)의 회귀 가드
+        self.store.ingest([self._r("d1", "kim@corp.example", [ME],
+                                   "기한건", "금요일까지 회신 부탁드립니다.",
+                                   when="2026-07-15T09:00:00")])
+        tid = self.store.db.execute(
+            "SELECT thread_id FROM messages WHERE message_id='<d1@t>'").fetchone()[0]
+        _, _, _, dl = web._action_state(self.store, self.cfg)
+        self.assertIn(tid, dl)
+        self.store.ingest([MailRecord(
+            message_id="<d2@t>", subject="RE: 기한건", sender_name="me",
+            sender_addr=ME, to=["kim@corp.example"],
+            sent_on="2026-07-15T10:00:00", body_text="회신드립니다. 확정했습니다.",
+            references=["<d1@t>"])])
+        _, _, _, dl2 = web._action_state(self.store, self.cfg)
+        self.assertNotIn(tid, dl2)
+
+
+class TestNoisePolicy(unittest.TestCase):
+    """제목 강한 노이즈의 앵커 매치 + 외부 허용 목록."""
+
+    def _cfg(self, **kw):
+        return Config(home=Path("."), my_addresses=[ME], **kw)
+
+    def test_subject_strong_anchored(self):
+        c = self._cfg()
+        for s in ("[nflow] 결재 알림", "Meeting Invitation: 주간회의",
+                  "[자동회신] 부재중입니다", "Notification: build failed",
+                  "RE: invitation"):
+            self.assertTrue(c.is_noise_subject_strong(s), msg=s)
+        # 핵심 수정 — 일반 단어의 부분/시작 매치로 실무 제목을 죽이지 않는다
+        for s in ("notification 설정 변경 검토 요청", "설계 검토 요청",
+                  "Invitation to review"):
+            self.assertFalse(c.is_noise_subject_strong(s), msg=s)
+
+    def test_external_allowlist(self):
+        c = self._cfg(internal_domains=["corp.example"], ignore_senders=["noreply"],
+                      raw={"filters": {"external_allowlist":
+                                       ["partner.example", "kim@vendor.example"]}})
+        self.assertTrue(c.is_noise("spam@evil.example"))
+        self.assertFalse(c.is_noise("lee@partner.example"))      # 도메인 허용
+        self.assertFalse(c.is_noise("kim@vendor.example"))       # 주소 허용
+        self.assertTrue(c.is_noise("other@vendor.example"))      # 주소 허용은 그 주소만
+        self.assertTrue(c.is_noise_sender_hard("noreply@corp.example"))
+        self.assertFalse(c.is_noise_sender_hard("spam@evil.example"))  # 외부는 policy
 
 
 if __name__ == "__main__":

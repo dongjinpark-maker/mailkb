@@ -15,8 +15,54 @@ from pathlib import Path
 from . import search as search_mod
 from .clean import (extract_new_content, inject_inline_images,
                     normalize_subject, sanitize_html)
-from .features import FEATURE_VERSION, classify_content
+from .features import FEATURE_VERSION, classify_message
 from .sources.base import MailRecord
+
+# 파생 테이블 DDL 은 _SCHEMA 와 버전 마이그레이션(drop+재생성)이 공유한다.
+# 파생 테이블은 messages 에서 결과 불변으로 재구축 가능하므로 ALTER 대신
+# drop+재생성 — SQLite 의 ADD COLUMN IF NOT EXISTS 부재를 우회한다.
+_FEATURES_DDL = """
+CREATE TABLE IF NOT EXISTS message_features (
+    message_id          INTEGER PRIMARY KEY,
+    has_deadline        INTEGER NOT NULL DEFAULT 0,
+    has_decision        INTEGER NOT NULL DEFAULT 0,
+    has_request         INTEGER NOT NULL DEFAULT 0,
+    has_strong_request  INTEGER NOT NULL DEFAULT 0,
+    has_weak_request    INTEGER NOT NULL DEFAULT 0,
+    has_question        INTEGER NOT NULL DEFAULT 0,
+    has_completion      INTEGER NOT NULL DEFAULT 0,
+    has_withdrawal      INTEGER NOT NULL DEFAULT 0,
+    mentions_me         INTEGER NOT NULL DEFAULT 0,
+    mentions_group      INTEGER NOT NULL DEFAULT 0,
+    is_trivial          INTEGER NOT NULL DEFAULT 0,
+    subject_has_request INTEGER NOT NULL DEFAULT 0,
+    addressed_to_me     INTEGER NOT NULL DEFAULT 0
+);
+"""
+
+_THREAD_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS thread_state (
+    thread_id              INTEGER PRIMARY KEY,
+    first_message_id       INTEGER NOT NULL,
+    first_sent_on          TEXT NOT NULL DEFAULT '',
+    latest_message_id      INTEGER NOT NULL,
+    latest_sent_on         TEXT NOT NULL DEFAULT '',
+    message_count          INTEGER NOT NULL DEFAULT 0,
+    sent_count             INTEGER NOT NULL DEFAULT 0,
+    received_count         INTEGER NOT NULL DEFAULT 0,
+    unread_received_count  INTEGER NOT NULL DEFAULT 0,
+    addressed_to_me_count  INTEGER NOT NULL DEFAULT 0,
+    deadline_count         INTEGER NOT NULL DEFAULT 0,
+    -- 액션 상태기계 (docs/PROPOSAL-actions.md): 열린 요청 슬롯은 스레드당 1개.
+    -- 내 실질 회신(is_trivial 아님)·명시적 철회만 닫는다. 상대의 완료 통보는
+    -- 닫지 않고 completion_after_action 표시만(잘못 닫힘 = 조용히 놓친 공).
+    action_source_id        INTEGER NOT NULL DEFAULT 0,   -- 0 = 열린 액션 없음
+    action_strength         TEXT NOT NULL DEFAULT '',     -- 'strong' | 'weak'
+    action_kind             TEXT NOT NULL DEFAULT '',     -- 'decide' | 'respond'
+    action_has_deadline     INTEGER NOT NULL DEFAULT 0,
+    completion_after_action INTEGER NOT NULL DEFAULT 0
+);
+"""
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -48,31 +94,6 @@ CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id);
 CREATE INDEX IF NOT EXISTS idx_messages_sent_on ON messages(sent_on);
 CREATE INDEX IF NOT EXISTS idx_messages_thread_date
     ON messages(thread_id, sent_on DESC, id DESC);
-
--- 본문을 다시 읽지 않도록 수집 시 한 번 계산하는 안정적인 신호.
-CREATE TABLE IF NOT EXISTS message_features (
-    message_id       INTEGER PRIMARY KEY,
-    has_deadline     INTEGER NOT NULL DEFAULT 0,
-    has_decision     INTEGER NOT NULL DEFAULT 0,
-    has_request      INTEGER NOT NULL DEFAULT 0,
-    has_question     INTEGER NOT NULL DEFAULT 0,
-    addressed_to_me  INTEGER NOT NULL DEFAULT 0
-);
-
--- 목록·홈이 스레드별 messages 집계를 반복하지 않도록 유지하는 영속 상태.
-CREATE TABLE IF NOT EXISTS thread_state (
-    thread_id              INTEGER PRIMARY KEY,
-    first_message_id       INTEGER NOT NULL,
-    first_sent_on          TEXT NOT NULL DEFAULT '',
-    latest_message_id      INTEGER NOT NULL,
-    latest_sent_on         TEXT NOT NULL DEFAULT '',
-    message_count          INTEGER NOT NULL DEFAULT 0,
-    sent_count             INTEGER NOT NULL DEFAULT 0,
-    received_count         INTEGER NOT NULL DEFAULT 0,
-    unread_received_count  INTEGER NOT NULL DEFAULT 0,
-    addressed_to_me_count  INTEGER NOT NULL DEFAULT 0,
-    deadline_count         INTEGER NOT NULL DEFAULT 0
-);
 
 CREATE TABLE IF NOT EXISTS threads (
     id                INTEGER PRIMARY KEY,
@@ -202,10 +223,76 @@ def image_cutoff_for(retain_days: int) -> str:
     return (datetime.now() - timedelta(days=retain_days)).date().isoformat()
 
 
+# message_features 컬럼 (INSERT 공용) — 스키마 _FEATURES_DDL 와 순서 무관 이름 매칭.
+_FEATURE_COLS = (
+    "has_deadline", "has_decision", "has_request", "has_strong_request",
+    "has_weak_request", "has_question", "has_completion", "has_withdrawal",
+    "mentions_me", "mentions_group", "is_trivial", "subject_has_request",
+    "addressed_to_me",
+)
+
+# 액션 상태 기본값 — '열린 요청 없음'.
+_EMPTY_ACTION = {
+    "action_source_id": 0, "action_strength": "", "action_kind": "",
+    "action_has_deadline": 0, "completion_after_action": 0,
+}
+_ACTION_COLS = tuple(_EMPTY_ACTION)
+
+
+def fold_action(state: dict, msg) -> dict:
+    """스레드 액션 상태 전이 — 메시지 1통 적용. 증분(_update_thread_state)과
+    재접기(_refold_thread_actions)·백필이 같은 함수를 써서 정의상 등가.
+
+    전이 규칙 (docs/PROPOSAL-actions.md):
+      내 실질 발신       → 해소 (++수신인 추가·빈 본문 등 trivial 은 유지)
+      수신 + 명시적 철회 → 해소 (같은 메일의 새 요청은 아래에서 다시 연다)
+      수신 + 요청 증거   → 열기/갱신 — 최신 요청 메일이 source, 강도·기한은 열린
+                           창 안에서 단조(강한 요청 뒤 약한 재촉이 격하시키지 않음)
+      수신 + 완료 통보만 → 열려 있으면 completion_after_action=1 (해소 아님 —
+                           잘못 닫힘은 조용히 놓친 공이라 '확인 후보' 강등까지만)
+      그 외(FYI·일반)    → 유지
+    """
+    if msg["is_sent"]:
+        if not msg["is_trivial"]:
+            return dict(_EMPTY_ACTION)
+        return state
+    if msg["has_withdrawal"]:
+        state = dict(_EMPTY_ACTION)
+    # 이름 지목(mentions_me)도 약한 증거 — "김OO님, 자료 공유드립니다"는 훑어볼
+    # 가치가 있다(확인 후보). 요청 신호 없이 지목만이면 L3 가 MAYBE 까지만 올린다.
+    evidence = (msg["has_strong_request"] or msg["has_weak_request"]
+                or msg["has_decision"] or msg["has_question"]
+                or msg["has_deadline"] or msg["mentions_me"])
+    if evidence:
+        was_open = bool(state["action_source_id"])
+        strong = bool(msg["has_strong_request"] or msg["has_decision"]
+                      or (was_open and state["action_strength"] == "strong"))
+        decide = bool(msg["has_decision"]
+                      or (was_open and state["action_kind"] == "decide"))
+        return {
+            "action_source_id": msg["id"],
+            "action_strength": "strong" if strong else "weak",
+            "action_kind": "decide" if decide else "respond",
+            "action_has_deadline": int(bool(
+                msg["has_deadline"]
+                or (was_open and state["action_has_deadline"]))),
+            "completion_after_action": 0,
+        }
+    if msg["has_completion"] and state["action_source_id"]:
+        return {**state, "completion_after_action": 1}
+    return state
+
+
 class Store:
-    def __init__(self, db_path: Path, my_addresses: list[str]):
+    def __init__(self, db_path: Path, my_addresses: list[str],
+                 my_names: list[str] | tuple = ()):
         self.db_path = db_path
         self.my_addresses = {a.lower() for a in my_addresses}
+        # 본문 '나 지목' 판정용 이름 — 설정 이름 + 내 주소 로컬파트(설정 의존이라
+        # _derived_version 해시에 포함, 바뀌면 message_features 백필).
+        self.my_names = sorted({n.strip().lower() for n in my_names if n.strip()})
+        self._signal_names = tuple(self.my_names) + tuple(
+            a.split("@")[0] for a in sorted(self.my_addresses))
         self.db = sqlite3.connect(db_path)
         self.db.row_factory = sqlite3.Row
         # incremental vacuum: 이미지 프룬이 지운 공간을 조각 단위로 회수 —
@@ -223,6 +310,9 @@ class Store:
         self.db.execute("PRAGMA temp_store=MEMORY")    # 정렬·임시 결과 RAM
         self.db.execute("PRAGMA mmap_size=268435456")  # 256MB 메모리맵 읽기
         self.db.executescript(_SCHEMA)
+        # 파생 테이블(재구축 가능) — 버전 마이그레이션이 drop+재생성으로 스키마를 바꾼다.
+        self.db.executescript(_FEATURES_DDL)
+        self.db.executescript(_THREAD_STATE_DDL)
         # 일반 스키마 개편은 clean start 원칙. 목록용 파생 테이블만 원본 messages에서
         # 결과 불변으로 재생성할 수 있어 _ensure_derived_state가 버전별 1회 백필한다.
         try:
@@ -238,17 +328,42 @@ class Store:
         self.db.close()
 
     def _derived_version(self) -> str:
-        addr_sig = hashlib.sha256(
-            "\0".join(sorted(self.my_addresses)).encode("utf-8")
+        # my_names 포함 — mentions_me 가 저장 비트라 이름이 바뀌면 백필해야
+        # 낡은 지목 판정이 남지 않는다.
+        cfg_sig = hashlib.sha256(
+            ("\0".join(sorted(self.my_addresses))
+             + "\1" + "\0".join(self.my_names)).encode("utf-8")
         ).hexdigest()[:12]
-        return f"{FEATURE_VERSION}:{addr_sig}"
+        return f"{FEATURE_VERSION}:{cfg_sig}"
 
     def _addressed_to_me(self, to_addrs: str, cc_addrs: str) -> int:
         addrs = {a.lower() for a in (to_addrs + ";" + cc_addrs).split(";") if a}
         return int(bool(addrs & self.my_addresses))
 
+    def _insert_features(self, message_id: int, feats: dict) -> None:
+        cols = ", ".join(_FEATURE_COLS)
+        marks = ",".join("?" * (len(_FEATURE_COLS) + 1))
+        self.db.execute(
+            f"INSERT INTO message_features (message_id, {cols}) VALUES ({marks})",
+            (message_id, *[feats[c] for c in _FEATURE_COLS]),
+        )
+
+    def _write_action_state(self, thread_id: int, st: dict) -> None:
+        self.db.execute(
+            "UPDATE thread_state SET action_source_id=?, action_strength=?, "
+            "action_kind=?, action_has_deadline=?, completion_after_action=? "
+            "WHERE thread_id=?",
+            (st["action_source_id"], st["action_strength"], st["action_kind"],
+             st["action_has_deadline"], st["completion_after_action"], thread_id),
+        )
+
     def _ensure_derived_state(self) -> None:
-        """Backfill derived rows once per feature/address configuration version."""
+        """파생 행을 기능/설정 버전당 1회 백필.
+
+        버전이 다르면 파생 테이블을 drop+재생성해 스키마 변경까지 흡수한다
+        (재구축 가능한 테이블이므로 안전 — Outlook 재수집·DB 삭제 불필요).
+        executescript 는 진행 중 트랜잭션을 커밋해 버리므로 여기선 execute 만.
+        """
         expected = self._derived_version()
         row = self.db.execute(
             "SELECT value FROM sync_state WHERE key='derived_version'"
@@ -258,20 +373,19 @@ class Store:
 
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            self.db.execute("DELETE FROM message_features")
+            self.db.execute("DROP TABLE IF EXISTS message_features")
+            self.db.execute("DROP TABLE IF EXISTS thread_state")
+            self.db.execute(_FEATURES_DDL)
+            self.db.execute(_THREAD_STATE_DDL)
             for m in self.db.execute(
-                    "SELECT id, to_addrs, cc_addrs, new_content FROM messages"):
-                deadline, decision, request, question = classify_content(m["new_content"])
-                addressed = self._addressed_to_me(
+                    "SELECT id, subject, to_addrs, cc_addrs, new_content "
+                    "FROM messages"):
+                feats = classify_message(
+                    m["new_content"], m["subject"] or "", self._signal_names)
+                feats["addressed_to_me"] = self._addressed_to_me(
                     m["to_addrs"] or "", m["cc_addrs"] or "")
-                self.db.execute(
-                    "INSERT INTO message_features "
-                    "(message_id, has_deadline, has_decision, has_request, "
-                    "has_question, addressed_to_me) VALUES (?,?,?,?,?,?)",
-                    (m["id"], deadline, decision, request, question, addressed),
-                )
+                self._insert_features(m["id"], feats)
 
-            self.db.execute("DELETE FROM thread_state")
             self.db.execute(
                 """INSERT INTO thread_state
                    (thread_id, first_message_id, first_sent_on,
@@ -299,6 +413,21 @@ class Store:
                    JOIN message_features f ON f.message_id=m.id
                    GROUP BY t.id"""
             )
+            # 액션 상태 — 스레드별 시간순 fold. 한 번의 정렬 스캔으로 전 스레드를
+            # 접는다(스레드 경계에서 플러시). 증분 경로와 같은 fold_action.
+            rows = self.db.execute(
+                """SELECT m.thread_id, m.id AS id, m.is_sent, f.*
+                   FROM messages m JOIN message_features f ON f.message_id=m.id
+                   ORDER BY m.thread_id, m.sent_on, m.id""").fetchall()
+            cur_tid, state = None, dict(_EMPTY_ACTION)
+            for m in rows:
+                if m["thread_id"] != cur_tid:
+                    if cur_tid is not None and state != _EMPTY_ACTION:
+                        self._write_action_state(cur_tid, state)
+                    cur_tid, state = m["thread_id"], dict(_EMPTY_ACTION)
+                state = fold_action(state, m)
+            if cur_tid is not None and state != _EMPTY_ACTION:
+                self._write_action_state(cur_tid, state)
             self.db.execute(
                 "INSERT INTO sync_state(key, value) VALUES('derived_version', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -397,23 +526,17 @@ class Store:
             self.db.execute(
                 "INSERT INTO message_html(message_id, html) VALUES (?, ?)",
                 (cur.lastrowid, body_html))
-        deadline, decision, request, question = classify_content(new_content)
-        addressed = self._addressed_to_me(
+        feats = classify_message(new_content, rec.subject or "",
+                                 self._signal_names)
+        feats["addressed_to_me"] = self._addressed_to_me(
             ";".join(a.lower() for a in rec.to),
             ";".join(a.lower() for a in rec.cc),
         )
-        self.db.execute(
-            "INSERT INTO message_features "
-            "(message_id, has_deadline, has_decision, has_request, "
-            "has_question, addressed_to_me) VALUES (?,?,?,?,?,?)",
-            (cur.lastrowid, deadline, decision, request, question, addressed),
-        )
+        self._insert_features(cur.lastrowid, feats)
         self.db.execute(_FTS_SYNC, (cur.lastrowid, rec.subject, new_content))
         self._touch_thread(thread_id, rec.sent_on)
         self._update_thread_state(
-            thread_id, cur.lastrowid, rec.sent_on, is_sent,
-            addressed, deadline if not is_sent else 0,
-        )
+            thread_id, cur.lastrowid, rec.sent_on, is_sent, feats)
         # 새 수신 메일이 숨긴 스레드에 오면 자동 숨김 해제 — "지금은 조용히,
         # 새 소식 오면 다시" (구 추적제외의 자동 복귀를 숨김이 흡수, 2026-07-12).
         # 내가 보낸 답장(is_sent=1)으로는 해제하지 않음 — "처리 중인데 다시
@@ -480,10 +603,11 @@ class Store:
         )
 
     def _update_thread_state(self, thread_id: int, message_id: int,
-                             sent_on: str, is_sent: int, addressed: int,
-                             inbound_deadline: int) -> None:
+                             sent_on: str, is_sent: int, feats: dict) -> None:
         """Apply one appended message to its thread's persistent aggregate."""
         received = 0 if is_sent else 1
+        addressed = feats["addressed_to_me"]
+        inbound_deadline = feats["has_deadline"] if not is_sent else 0
         self.db.execute(
             """INSERT INTO thread_state
                (thread_id, first_message_id, first_sent_on,
@@ -523,6 +647,35 @@ class Store:
             (thread_id, message_id, sent_on, message_id, sent_on,
              is_sent, received, received, addressed, inbound_deadline),
         )
+        # 액션 상태기계 — 이 메시지가 최신이면 증분 전이, 역순 삽입(Outlook 이
+        # 오래된 메일을 늦게 줌)이면 이 스레드만 재접기. 두 경로가 같은
+        # fold_action 을 쓰므로 결과는 정의상 등가(드리프트 테스트가 가드).
+        row = self.db.execute(
+            "SELECT latest_message_id, action_source_id, action_strength, "
+            "action_kind, action_has_deadline, completion_after_action "
+            "FROM thread_state WHERE thread_id=?", (thread_id,)).fetchone()
+        if row["latest_message_id"] == message_id:
+            msg = dict(feats)
+            msg["id"] = message_id
+            msg["is_sent"] = is_sent
+            new = fold_action({k: row[k] for k in _ACTION_COLS}, msg)
+            if any(new[k] != row[k] for k in _ACTION_COLS):
+                self._write_action_state(thread_id, new)
+        else:
+            self._refold_thread_actions(thread_id)
+
+    def _refold_thread_actions(self, thread_id: int) -> None:
+        """스레드의 액션 상태를 시간순 전체 재계산 — 역순 삽입 보정.
+
+        비용은 이 스레드 크기에 비례(전체 DB 재계산 아님)."""
+        state = dict(_EMPTY_ACTION)
+        for m in self.db.execute(
+                """SELECT m.id AS id, m.is_sent, f.* FROM messages m
+                   JOIN message_features f ON f.message_id=m.id
+                   WHERE m.thread_id=? ORDER BY m.sent_on, m.id""",
+                (thread_id,)):
+            state = fold_action(state, m)
+        self._write_action_state(thread_id, state)
 
     def _update_people(self, rec: MailRecord, is_sent: int) -> None:
         def upsert(addr: str, name: str, from_inc: int, to_inc: int) -> None:

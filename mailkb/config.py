@@ -35,12 +35,17 @@ ignore_senders = ["noreply", "no-reply", "notification@", "jira@", "build@"]
 # 사내 도메인 — 설정하면 외부 도메인 발신(스팸 등)은 미답변/기한/요약에서 제외.
 # 외부 파트너 메일도 추적하려면 빈 리스트로. 예: ["company.co.kr"]
 internal_domains = []
+# 외부 허용 목록 — internal_domains 를 켠 상태에서 추적할 협력사 도메인/주소.
+# 예: external_allowlist = ["partner.co.kr", "kim@vendor.com"]
+external_allowlist = []
 # 추가 차단 발신자는 <home>/blocked_senders.txt 에 누적된다 (mailkb block <주소>).
 # 실제 수신 차단은 Outlook 규칙으로 병행 — 이 파일은 mailkb 신호에서만 제외.
-# 제목 기반 노이즈 2단계 (소문자 부분 매치, 키를 지우면 아래 기본값 적용):
-#  - strong: 내 참여 여부와 무관하게 무조건 제외 (시스템 알림/설문 등)
+# 제목 기반 노이즈 2단계 (키를 지우면 아래 기본값 적용):
+#  - strong: 내 참여 여부와 무관하게 무조건 제외 (시스템 알림/설문 등).
+#            앵커 매치 — '[태그]'는 포함, 일반 단어는 제목 시작 또는 '단어:' 형태만
+#            ("notification 설정 변경 검토 요청" 같은 실무 제목은 안 죽는다)
 #  - weak:   내가 답장하지 않았고 수신 3인 이상 대량일 때만 제외 (주간보고 등 —
-#            내가 논의에 참여한 스레드는 유지)
+#            내가 논의에 참여한 스레드는 유지). 소문자 부분 매치.
 subject_noise_strong = ["invitation", "notification", "자동회신", "자동 회신",
                         "[nflow]", "[nwork]", "승계통보", "설문요청", "설문 요청"]
 subject_noise_weak = ["weekly report", "주간보고", "주간 보고", "[회의록]"]
@@ -112,6 +117,11 @@ holidays = [
 
 _AI_RULES_COMMENT_RX = re.compile(r"<!--.*?-->", re.DOTALL)
 
+# 답장/전달 접두 — 제목 강한 노이즈의 시작 일치 판정 전에 벗겨낸다.
+_REPLY_PREFIX_RX = re.compile(
+    r"^\s*(?:(?:re|fw|fwd|aw|답장|회신|전달)\s*:\s*|\[\s*(?:re|fw|fwd)\s*\]\s*)+",
+    re.IGNORECASE)
+
 # 제목 노이즈 기본값 — config.toml 에 키가 없어도 적용 (구버전 설정 호환)
 _SUBJECT_NOISE_STRONG = ["invitation", "notification", "자동회신", "자동 회신",
                          "[nflow]", "[nwork]", "승계통보", "설문요청", "설문 요청"]
@@ -164,24 +174,44 @@ class Config:
     def blocklist_path(self) -> Path:
         return self.home / "blocked_senders.txt"
 
+    def is_noise_sender_hard(self, addr: str) -> bool:
+        """확실한 노이즈 발신 — 자동발송(ignore_senders)·차단(blocked) 부분 매치.
+
+        액션 판정(actions.py)에서 다른 증거와 무관하게 즉시 NONE 이 되는 유일한
+        발신자 조건. 외부 도메인은 여기 안 들어간다(policy — is_noise_external)."""
+        addr = (addr or "").lower()
+        return (any(pat in addr for pat in self.ignore_senders)
+                or any(pat in addr for pat in self.blocked_senders))
+
+    def is_noise_external(self, addr: str) -> bool:
+        """정책 노이즈 — internal_domains 설정 시 외부 도메인 발신(스팸 대응).
+
+        external_allowlist(협력사 도메인·주소)는 예외 — '외부 전부 노이즈 vs
+        외부 스팸 유입'의 전부 아니면 전무 구조를 허용 목록이 푼다. 액션
+        판정에서는 즉시 제외가 아니라 강등 요소로만 쓴다."""
+        if not self.internal_domains:
+            return False
+        addr = (addr or "").lower()
+        domain = addr.rsplit("@", 1)[-1]
+        if any(domain == d or domain.endswith("." + d)
+               for d in self.internal_domains):
+            return False
+        allow = [str(a).lower() for a in
+                 (self.opt("filters", "external_allowlist", default=None) or [])]
+        if any(a in addr if "@" in a else
+               (domain == a or domain.endswith("." + a)) for a in allow):
+            return False
+        return True
+
     def is_noise(self, addr: str) -> bool:
         """자동발송/스팸/차단 판정 — 미답변·기한 신호·롤링 요약·개입 큐에서 제외.
 
         1) ignore_senders 부분 문자열 매치 (noreply, jira@ 등)
         2) blocked_senders 부분 문자열 매치 (mailkb block 으로 누적)
-        3) internal_domains 설정 시, 외부 도메인 발신 전부 (스팸 대응)
+        3) internal_domains 설정 시, 외부 도메인 발신 전부
+           (filters.external_allowlist 의 협력사 도메인·주소는 예외)
         """
-        addr = (addr or "").lower()
-        if any(pat in addr for pat in self.ignore_senders):
-            return True
-        if any(pat in addr for pat in self.blocked_senders):
-            return True
-        if self.internal_domains:
-            domain = addr.rsplit("@", 1)[-1]
-            if not any(domain == d or domain.endswith("." + d)
-                       for d in self.internal_domains):
-                return True
-        return False
+        return self.is_noise_sender_hard(addr) or self.is_noise_external(addr)
 
     def is_blocked(self, addr: str) -> bool:
         addr = (addr or "").lower()
@@ -202,9 +232,27 @@ class Config:
         return cur
 
     def is_noise_subject_strong(self, subject: str) -> bool:
-        """제목 강한 노이즈 — 참여 여부 무관 무조건 제외 (소문자 부분 매치)."""
+        """제목 강한 노이즈 — 참여 여부 무관 무조건 제외 (앵커 매치).
+
+        구 부분 문자열 매치는 "notification 설정 변경 검토 요청" 같은 실무 제목을
+        죽였다(2026-07-17). 패턴별 매치 규칙:
+        - '[태그]' 패턴: 제목 어디든 포함 (이미 정밀)
+        - 일반 패턴: '패턴:' 또는 '[패턴]' 형태로 포함("Notification: …",
+          "Meeting Invitation: …"), 또는 답장 접두 제거 후 제목 전체가 패턴.
+          시스템 제목의 표지는 콜론/브래킷 — 맨 단어 시작 일치는 사람 제목
+          ("notification 설정 변경 …")을 죽여서 뺐다.
+        (약한 노이즈는 미참여+대량 조건이 이미 좁혀 부분 매치 유지 — is_noise_subject_weak)
+        """
         s = (subject or "").lower()
-        return any(pat in s for pat in self.subject_noise_strong)
+        core = _REPLY_PREFIX_RX.sub("", s).strip()
+        for pat in self.subject_noise_strong:
+            p = pat.lower()
+            if p.startswith("["):
+                if p in s:
+                    return True
+            elif f"{p}:" in s or f"[{p}]" in s or core == p:
+                return True
+        return False
 
     def is_noise_subject_weak(self, subject: str) -> bool:
         """제목 약한 노이즈 후보 — 미참여+대량일 때만 제외 (판정은 review 쪽)."""

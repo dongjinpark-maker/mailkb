@@ -12,6 +12,7 @@ import threading
 import time
 from datetime import date
 
+from . import actions
 from . import config as config_mod
 from . import notes, review
 from . import store as store_mod
@@ -19,7 +20,7 @@ from .store import Store
 
 
 def _store(cfg) -> Store:
-    return Store(cfg.db_path, cfg.my_addresses)
+    return Store(cfg.db_path, cfg.my_addresses, cfg.my_names)
 
 
 def _fmt_row(m) -> str:
@@ -402,6 +403,118 @@ def cmd_act(args) -> None:
     print("\n".join(lines).rstrip())
 
 
+_AUDIT_LEVELS = {"required": "REQUIRED", "maybe": "MAYBE", "none": "NONE"}
+
+
+def _audit_rows(store, cfg, sample: int) -> list[dict]:
+    """감사 대상 — 최근 활동 스레드(수신 있는 것) 최신순 sample 건 + 현재 판정.
+
+    열린 액션이 없는(NONE) 스레드도 섞는다 — 오탐만이 아니라 놓침(FN)도 보여야
+    규칙 품질이 측정된다."""
+    acts = actions.classify_threads(store, cfg)
+    rows = []
+    for t in store.open_thread_tails():
+        if t["last_is_sent"] and t["msg_count"] == t["my_msg_count"]:
+            continue                     # 내 발신 전용 스레드는 감사 대상 아님
+        a = acts.get(t["thread_id"]) or actions.Action(actions.NONE)
+        rows.append({
+            "thread_id": t["thread_id"], "subject": t["subject"],
+            "who": t["sender_name"] or t["sender_addr"],
+            "sent_on": (a.sent_on or t["sent_on"])[:16],
+            "level": a.level, "kind": a.kind,
+            "reasons": list(a.reasons),
+            "reason_text": a.reason_text() or "열린 요청 없음",
+            "evidence": actions.evidence_sentence(store, a),
+        })
+        if len(rows) >= sample:
+            break
+    return rows
+
+
+def _audit_print(i: int, r: dict) -> None:
+    lv = _AUDIT_LEVELS.get(r["level"], r["level"])
+    kind = f"/{r['kind']}" if r["kind"] else ""
+    print(f"[{i:>3}] #{r['thread_id']} {lv}{kind}  {r['subject'][:48]}")
+    print(f"      {r['who']} · {r['sent_on']} · {r['reason_text']}")
+    if r["evidence"]:
+        print(f"      「{r['evidence'][:76]}」")
+
+
+def cmd_audit(args) -> None:
+    """분류 판정 감사 — 실메일 위에서 판정+근거를 보고, 라벨을 쌓아 측정한다.
+
+    합성 문장 평가의 한계(자기 채점) 보완: 라벨은 <home>/labels.jsonl 에만
+    쌓인다(개인정보는 data/ 원칙). --report 는 저장 라벨을 현재 규칙으로
+    재판정해 혼동 행렬을 낸다 — 규칙을 고칠 때마다 실메일 기준 개선/후퇴가 보인다.
+    """
+    import json as _json
+    cfg = config_mod.load(args.home)
+    store = _store(cfg)
+    labels_path = cfg.home / "labels.jsonl"
+
+    if args.report:
+        if not labels_path.exists():
+            print("라벨 없음 — 먼저 `mailkb audit --label` 로 라벨을 쌓으세요.")
+            return
+        recs = [_json.loads(ln) for ln in
+                labels_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        # 같은 스레드 재라벨 시 마지막 것만
+        latest = {r["thread_id"]: r for r in recs}
+        matrix: dict[tuple, int] = {}
+        mismatch = []
+        for r in latest.values():
+            cur = actions.evaluate_thread(store, cfg, r["thread_id"]).level
+            matrix[(r["truth"], cur)] = matrix.get((r["truth"], cur), 0) + 1
+            if r["truth"] != cur:
+                mismatch.append((r, cur))
+        lv = ["required", "maybe", "none"]
+        print(f"라벨 {len(latest)}건 (정답 × 현재 판정)")
+        print(f"{'':>10} " + " ".join(f"{_AUDIT_LEVELS[c]:>9}" for c in lv))
+        for t in lv:
+            print(f"{_AUDIT_LEVELS[t]:>10} "
+                  + " ".join(f"{matrix.get((t, c), 0):>9}" for c in lv))
+        ok = sum(matrix.get((t, t), 0) for t in lv)
+        print(f"일치 {ok}/{len(latest)}")
+        for r, cur in mismatch:
+            print(f"  ✗ #{r['thread_id']} {r['subject'][:40]} — 정답 "
+                  f"{_AUDIT_LEVELS[r['truth']]}, 현재 {_AUDIT_LEVELS[cur]}")
+        return
+
+    rows = _audit_rows(store, cfg, args.sample)
+    if not rows:
+        print("감사할 스레드 없음")
+        return
+    if not args.label:
+        for i, r in enumerate(rows, 1):
+            _audit_print(i, r)
+        print(f"\n{len(rows)}건 — 라벨을 쌓으려면 `mailkb audit --label`")
+        return
+
+    today = date.today().isoformat()
+    keymap = {"y": None, "r": "required", "m": "maybe", "x": "none"}
+    n_saved = 0
+    print("판정이 맞으면 y, 틀리면 정답을 r(equired)/m(aybe)/x(none), s 건너뜀, q 종료")
+    with labels_path.open("a", encoding="utf-8") as f:
+        for i, r in enumerate(rows, 1):
+            _audit_print(i, r)
+            try:
+                ans = input("  → [y/r/m/x/s/q] ").strip().lower()
+            except EOFError:
+                break
+            if ans == "q":
+                break
+            if ans not in keymap:
+                continue
+            truth = keymap[ans] or r["level"]
+            f.write(_json.dumps({
+                "date": today, "thread_id": r["thread_id"],
+                "subject": r["subject"], "level": r["level"],
+                "kind": r["kind"], "reasons": r["reasons"], "truth": truth,
+            }, ensure_ascii=False) + "\n")
+            n_saved += 1
+    print(f"라벨 {n_saved}건 저장 → {labels_path} (요약: mailkb audit --report)")
+
+
 def cmd_block(args) -> None:
     cfg = config_mod.load(args.home)
     if config_mod.add_blocked(cfg, args.addr):
@@ -641,6 +754,12 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("--note", help="AI 에 줄 추가 정보 (예: 'ECN은 처리 중, 납기건 우선')")
     sp.add_argument("--backend", help="AI 백엔드 이름")
     sp.set_defaults(fn=cmd_act)
+
+    sp = sub.add_parser("audit", help="분류 판정 감사 — 실메일 라벨링·혼동 행렬")
+    sp.add_argument("--sample", type=int, default=30, help="샘플 수 (최신순)")
+    sp.add_argument("--label", action="store_true", help="대화형 라벨링 → labels.jsonl")
+    sp.add_argument("--report", action="store_true", help="라벨 대비 현재 판정 혼동 행렬")
+    sp.set_defaults(fn=cmd_audit)
 
     sp = sub.add_parser("noise", help="발신자별 수신량·차단 후보")
     sp.add_argument("--limit", type=int, default=30)

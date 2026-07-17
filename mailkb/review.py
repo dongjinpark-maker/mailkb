@@ -14,15 +14,17 @@ import subprocess
 import time
 from datetime import date, timedelta
 
+from . import actions, features
 from . import search as search_mod
 from .clean import strip_preserved
 from .config import Config
-from .features import DECISION_RX, DEADLINE_RX, REQUEST_RX
+from .features import DECISION_RX, DEADLINE_RX, REQUEST_RX, is_trivial_msg
 from .store import Store
 
 # Compatibility aliases for callers and tests using review's historical names.
 _DECISION_RX = DECISION_RX
 _REQUEST_RX = REQUEST_RX
+_is_trivial_msg = is_trivial_msg
 
 
 def _line_at(text: str, pos: int) -> str:
@@ -32,30 +34,8 @@ def _line_at(text: str, pos: int) -> str:
     return text[start : end if end != -1 else len(text)].strip()
 
 
-# '무의미 한 줄' 메시지 — 수신인 추가(++)·FYI·단순 전달/공유. 요약 대상 길이
-# (summary_min_msgs) 계산에서 제외한다. 보수적 판정: '++이름' 은 짧을 때만
-# (++ 뒤에 실질 내용이 이어지는 메일은 통과), 관용구는 본문 전체가 그 문구일 때만.
-_TRIVIAL_PLUS_MAX = 30      # "++홍길동 수석" 급 한 줄 상한
-_TRIVIAL_PHRASES = {
-    "fyi", "f.y.i", "fyi입니다",
-    "참고", "참고하세요", "참고 하세요", "참고바랍니다", "참고 바랍니다",
-    "참고부탁드립니다", "참고 부탁드립니다", "참고요",
-    "공유", "공유합니다", "공유드립니다", "공유 드립니다",
-    "전달", "전달합니다", "전달드립니다", "전달 드립니다",
-    "본문 참고", "하기 참고", "아래 참고", "상기 참고",
-    "수신인 추가", "수신자 추가", "수신 추가", "참조 추가",
-}
-
-
-def _is_trivial_msg(text: str) -> bool:
-    """실질 내용 없는 메시지인가 — 빈 본문, '++이름'(수신인 추가), FYI/전달 한 줄."""
-    s = " ".join((text or "").split())
-    if not s:
-        return True
-    if (s.startswith("++") or s.startswith("+ ")) and len(s) <= _TRIVIAL_PLUS_MAX:
-        return True
-    core = s.rstrip(".!~^:;)").strip().lower()
-    return core in _TRIVIAL_PHRASES
+# '무의미 한 줄' 판정은 features.is_trivial_msg 로 이관(L2 상태기계와 공유,
+# 2026-07-17) — 위 별칭 _is_trivial_msg 가 종전 이름을 유지한다.
 
 
 def _subject_noise(cfg: Config, subject: str, *, i_replied: bool, n_to: int) -> bool:
@@ -190,7 +170,7 @@ def today_digest(store: Store, cfg: Config, date_iso: str) -> dict:
 
 
 def deadline_signals(store: Store, cfg: Config, date_iso: str) -> list[tuple[str, str]]:
-    """오늘 수신 메일에서 기한/요청 문장 추출 (규칙 기반).
+    """오늘 수신 메일에서 기한 문장 추출 (규칙 기반 — 요청 프록시 분리 후 순수 기한).
 
     노이즈 발신과 대량 발송(To 3인 이상 — 전사 공지의 "금일 18시까지" 류)은
     개인 액션 신호가 아니므로 제외.
@@ -203,11 +183,18 @@ def deadline_signals(store: Store, cfg: Config, date_iso: str) -> list[tuple[str
             continue  # Invitation 류의 "…까지" 오염 차단
         if len([a for a in m["to_addrs"].split(";") if a]) >= 3:
             continue
-        # 보존 인용(mid-join)은 신호 대상이 아님 — 신규 작성분만 스캔
+        # 보존 인용(mid-join)은 신호 대상이 아님 — 신규 작성분만, 문장 게이팅
+        # 적용("금요일까지 완료했습니다" 같은 완료 문맥 기한 제외 — L1 과 동일 기준)
         body = strip_preserved(m["new_content"])
-        found = DEADLINE_RX.search(body)
-        if found:
-            signals.append((m["subject"], _line_at(body, found.start())))
+        for s in features.split_sentences(body):
+            if not DEADLINE_RX.search(s):
+                continue
+            if ((features.COMPLETION_RX.search(s)
+                 or features.HISTORICAL_RX.search(s))
+                    and not features.REMIND_RX.search(s)):
+                continue
+            signals.append((m["subject"], s.strip()))
+            break
     return signals
 
 
@@ -222,6 +209,15 @@ def filtered_unanswered(store: Store, cfg: Config) -> list:
             and not cfg.is_noise_subject_strong(r["subject"])]
 
 
+def _days_between(sent_on_iso: str, today_iso: str) -> int:
+    """달력일 경과 — 액션 원본 메일 기준 D+ 표기."""
+    try:
+        return max(0, (date.fromisoformat(today_iso[:10])
+                       - date.fromisoformat(sent_on_iso[:10])).days)
+    except (ValueError, TypeError):
+        return 0
+
+
 def intervention_queue(
     store: Store,
     cfg: Config,
@@ -231,28 +227,32 @@ def intervention_queue(
 ) -> list[dict]:
     """'무엇에 개입해야 하나' 결정론 액션 큐.
 
-    열린 스레드의 최신 메일을 훑어 우선순위 첫 매칭 카테고리에 1회만 배정한다:
-      decide         내 결정 대기 (수신·To에 나·결정요청, 그룹 To 허용)
-      respond        내 응답 대기 (store.unanswered 재사용)
+    decide/respond 는 공통 판정기(actions.classify_threads)의 REQUIRED —
+    웹 ↩ 탭·스레드 상세와 정의상 같은 집합이다(홈·웹 불일치 제거, 2026-07-17).
+    본문 정규식 재실행 없음: 저장 신호(L1)·액션 상태(L2)의 좁은 조인으로 판정하고,
+    스니펫·근거 문장만 신호 원본 메시지에서 복원한다.
+
+      decide         내 결정 대기 (REQUIRED · 결정 요청)
+      respond        내 응답 대기 (REQUIRED · 그 외 요청/질문)
       stalled_mine   내가 넘긴 공 (내가 마지막·영업 stall_workdays 넘게 무응답·요청 포함)
       stalled_thread 멈춘 스레드 (열림·2통+·내 참여·영업 stale_workdays 넘게 무활동)
-    대량발송(To ≥ broadcast_to)·노이즈는 제외. 정체 판정은 영업일 기준.
 
-    return_candidates=True 면 (items, candidates) 를 반환한다. candidates 는
-    미답변 풀에서 '요청 신호가 약해' 결정론이 뺀 경계 항목들 — AI(haiku) 분류가
-    이 중 실제 액션이 필요한 것을 다시 건져 FN(놓침)을 줄이는 후보 풀이다.
+    return_candidates=True 면 (items, candidates) 반환. candidates 는 판정기의
+    MAYBE(확인 후보) — 홈 접힌 목록으로 노출되고 AI(haiku) 분류가 실제 액션을
+    다시 건져 FN(놓침)을 줄이는 후보 풀이다. unanswered 인자는 구 시그니처
+    호환용으로 받되 더는 판정에 쓰지 않는다.
     """
     d = date_iso or date.today().isoformat()
     stall, stale = cfg.stall_workdays, cfg.stale_workdays
-    bcast, holidays, me = cfg.broadcast_to, cfg.holidays, store.my_addresses
-    # 나를 명시적으로 언급했는지 판정할 이름 후보(설정 이름 + 내 주소 로컬파트)
+    bcast, holidays = cfg.broadcast_to, cfg.holidays
     me_names = [n for n in cfg.my_names if n] + [
         a.split("@")[0] for a in cfg.my_addresses if a]
 
-    if unanswered is None:
-        unanswered = filtered_unanswered(store, cfg)
-    un_days = {r["thread_id"]: r["days_old"] for r in unanswered}
-    unanswered_ids = set(un_days)
+    acts = actions.classify_threads(store, cfg)
+    # 신호 원본 본문(스니펫·근거용) — REQUIRED/MAYBE 만 배치 조회
+    src_ids = [a.source_id for a in acts.values()
+               if a.level != actions.NONE and a.source_id]
+    src = {m["id"]: m for m in store.messages_by_ids(src_ids)}
 
     tails = store.open_thread_tails()
     workdays: dict[int, int] = {}
@@ -286,63 +286,56 @@ def intervention_queue(
         # (숨김 스레드는 open_thread_tails 가 이미 제외한다)
         tid = t["thread_id"]
         to = [a for a in (t["to_addrs"] or "").split(";") if a]
-        # 제목 노이즈 — 4분류 전부 이 한 지점에서 차단
+        a = acts.get(tid)
+        wd = workdays[tid]
+
+        if a and a.level == actions.REQUIRED:
+            m = src.get(a.source_id)
+            content = strip_preserved(m["new_content"] or "") if m else ""
+            items.append({
+                "category": "decide" if a.kind == "decide" else "respond",
+                "thread_id": tid,
+                "subject": t["subject"],
+                "who": a.sender_name or a.sender_addr,
+                "days": _days_between(a.sent_on, d),
+                "snippet": (actions.evidence_from_body(content)
+                            or _lead_line(content))[:120],
+                "tag": "⏰" if a.has_deadline else "",
+                # 나 지목·내 참여·직접 수신(decide 포함) — ★ 정렬 우선
+                "personal": bool(a.named or a.participated
+                                 or a.kind == "decide"),
+                "reason": a.reason_text(),
+            })
+            continue
+        if a and a.level == actions.MAYBE:
+            m = src.get(a.source_id)
+            content = strip_preserved(m["new_content"] or "") if m else ""
+            candidates.append({
+                "thread_id": tid,
+                "subject": t["subject"],
+                "who": a.sender_name or a.sender_addr,
+                "snippet": _lead_line(content)[:120],
+                "days": _days_between(a.sent_on, d),
+                "content": content[:400],
+                "tag": "⏰" if a.has_deadline else "",
+                "reason": a.reason_text(),
+            })
+            continue
+
+        # ── 정체 2종 (종전 논리 — 저장 신호로 본문 재스캔 없이) ──
         if _subject_noise(cfg, t["subject"],
                           i_replied=t["my_msg_count"] >= 1, n_to=len(to)):
             continue
-        me_in_to = bool(set(to) & me)
         broadcast = len(to) >= bcast
-        noise = cfg.is_noise(t["sender_addr"])
-        # 신호 판정은 신규 작성분만 — 보존 인용(mid-join) 속 과거 요청/기한은
-        # 이미 소화된 대화라 개입 근거가 아니다
         content = strip_preserved(t["new_content"] or "")
-        dec = _DECISION_RX.search(content) if t["last_has_decision"] else None
-        dead = DEADLINE_RX.search(content) if t["last_has_deadline"] else None
-        req = _REQUEST_RX.search(content) if t["last_has_request"] else None
-        question = bool(t["last_has_question"])
-        wd = workdays[tid]
-
+        signal = bool(t["last_has_decision"] or t["last_has_deadline"]
+                      or t["last_has_question"] or t["last_has_request"])
         cat = who = snippet = None
-        personal = False   # 나를 명시적으로 지목(이름 언급) 또는 내 참여(내가 보낸 것에 답)
+        personal = False
         days = t["days_old"]
-        if t["last_is_sent"] == 0 and me_in_to and dec and not noise and not broadcast:
-            cat, who = "decide", t["sender_name"] or t["sender_addr"]
-            snippet = _line_at(content, dec.start())
-            personal = True
-        elif tid in unanswered_ids:
-            # 정밀도 우선: '실제 요청'이 있어야 응답 대기로 인정한다. 종결 인사
-            # ("확인했습니다"), 순수 공유(FYI), 내 질문에 온 답변은 요청이 아니므로
-            # 제외 — 오탐의 최대 원인이었다.
-            request = bool(dec or dead or question or req)
-            mention = _mentions_me(content, me_names)
-            direct = len(to) <= cfg.direct_to
-            participated = t["my_msg_count"] >= 1
-            # 나를 콕 집어 이름으로 언급하면 그대로 유지(원 설계 — 대규모라도 확인
-            # 대상). 그 외에는 '실제 요청'이 있고 나에게 온 것(직접수신·내 참여)일
-            # 때만 — 종결 인사·순수 공유(FYI)·내 질문에 온 답변은 요청이 없어 빠진다.
-            if not (mention or (request and (direct or participated))):
-                # 결정론이 뺀 경계 항목(종결/FYI/내 질문에 온 답변) — 버리지 않고
-                # AI(haiku) 분류 후보로 남긴다(요청 시 반환). FN 축소용.
-                candidates.append({
-                    "thread_id": tid,
-                    "subject": t["subject"],
-                    "who": t["sender_name"] or t["sender_addr"],
-                    "snippet": _lead_line(content)[:120],
-                    "days": un_days.get(tid, days),
-                    "content": content[:400],
-                    "tag": "⏰" if dead else "",
-                })
-                continue
-            cat, who = "respond", t["sender_name"] or t["sender_addr"]
-            snippet = _lead_line(content)
-            days = un_days.get(tid, days)
-            personal = mention or participated
-        elif (t["last_is_sent"] == 1 and wd >= stall and not broadcast
-              and (dec or dead or question or req)):
+        if t["last_is_sent"] == 1 and wd >= stall and not broadcast and signal:
             cat, who, days = "stalled_mine", (to[0] if to else "?"), wd
-            m = dec or dead or req
-            snippet = _line_at(content, m.start()) if m else (
-                content.splitlines()[0].strip() if content else "")
+            snippet = actions.evidence_from_body(content) or _lead_line(content)
             personal = True
         elif (t["msg_count"] >= 2 and wd >= stale and not broadcast
               and t["last_is_sent"] == 0):
@@ -363,7 +356,7 @@ def intervention_queue(
             "who": who,
             "days": days,
             "snippet": (snippet or "")[:120],
-            "tag": "⏰" if dead else "",
+            "tag": "⏰" if t["last_has_deadline"] else "",
             "personal": personal,
         })
 

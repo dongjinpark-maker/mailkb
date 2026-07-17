@@ -21,7 +21,7 @@ from datetime import date, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-from . import __version__, config as cfgmod, report, review
+from . import __version__, actions, config as cfgmod, report, review
 from .clean import (PRESERVED_MARK, QFOLD_CLOSE, QFOLD_OPEN,
                     hide_image_signatures, strip_preserved)
 from .store import Store, image_cutoff_for
@@ -827,12 +827,14 @@ def load_daily(cfg, today: str) -> str | None:
 def build_home(store, cfg, today: str, daily_md: str | None) -> dict:
     """홈 렌더가 쓰는 키만. 결정 렌즈는 md 파싱 대신 원장(decisions)을 직접 조회."""
     missed = review.filtered_unanswered(store, cfg)
-    intervention = review.intervention_queue(store, cfg, today, unanswered=missed)
+    intervention, maybe = review.intervention_queue(
+        store, cfg, today, unanswered=missed, return_candidates=True)
     dc = store.decision_counts()
     return {
         "has_review": daily_md is not None,
         "missed": missed,
         "intervention": intervention,
+        "maybe": maybe,                        # 확인 후보(MAYBE) — 접힌 회수 통로
         "digest": review.today_digest(store, cfg, today),
         "n_dec": dc.get("confirmed", 0),
         "n_dec_pending": dc.get("candidate", 0),
@@ -852,10 +854,12 @@ def _visible_attach(names: str) -> str:
     return ";".join(kept)
 
 
-def format_detail(store, thread_id: int) -> dict:
+def format_detail(store, cfg, thread_id: int) -> dict:
     """디테일 뷰 데이터: 상단 분석 + 하단 메일 타임라인.
 
     각 타임라인 항목은 표시용 html(정제됨)과 텍스트(html 없을 때 폴백)를 함께 준다.
+    신호(↩/⏰)는 홈 개입 큐·목록 탭과 같은 공통 판정기(actions) — 화면 간 불일치가
+    정의상 없고, 판정 이유와 근거 문장을 함께 보여준다.
     """
     t = store.thread(thread_id)
     msgs = store.thread_messages(thread_id)
@@ -864,18 +868,17 @@ def format_detail(store, thread_id: int) -> dict:
 
     subject = msgs[0]["subject"]
     participants = sorted({m["sender_name"] or m["sender_addr"] for m in msgs})
-    me = store.my_addresses
-    last = msgs[-1]
-    last_to = [a for a in last["to_addrs"].split(";") if a]
 
-    signals: list[str] = []
     # ↩ = 답장 화살표 — 수동 플래그(⚐/⚑)와 글리프 충돌 회피. 개입 큐의
     # '내 응답 대기' 카테고리와 같은 용어(2026-07-12 정렬).
-    if not last["is_sent"] and len(last_to) < 3 and (set(last_to) & me):
+    act = actions.evaluate_thread(store, cfg, thread_id)
+    signals: list[str] = []
+    if act.level == actions.REQUIRED:
         signals.append("↩ 내 응답 대기")
-    if any(review.DEADLINE_RX.search(strip_preserved(m["new_content"] or ""))
-           for m in msgs if not m["is_sent"]):
-        signals.append("⏰ 기한/요청")
+    elif act.level == actions.MAYBE:
+        signals.append("☑ 확인 후보")
+    if act.has_deadline and act.level != actions.NONE:
+        signals.append("⏰ 기한")
 
     analysis = [
         f"제목: {subject}",
@@ -885,6 +888,9 @@ def format_detail(store, thread_id: int) -> dict:
     ]
     if signals:
         analysis.append("신호: " + "  ".join(signals))
+        ev = actions.evidence_sentence(store, act)
+        analysis.append("판정: " + act.reason_text()
+                        + (f" — 「{ev}」" if ev else ""))
     # 누적 요약: 있으면 표시, 없으면 아무것도 안 보임(빈 안내문 제거 — 요약이 없을 땐
     # 안 보이는 게 자연스러움)
     summ = review.strip_summary_header(t["rolling_summary"])  # 기존 '갱신된 요약' 머리말 제거
@@ -1639,7 +1645,7 @@ def _job_progress(msg: str) -> None:
 def _run_review_job(cfg, ai: bool, today: str) -> None:
     from . import notes
     try:
-        store = Store(cfg.db_path, cfg.my_addresses)
+        store = Store(cfg.db_path, cfg.my_addresses, cfg.my_names)
         try:
             det = review.deterministic(store, cfg, today)
             ai_text = note = None
@@ -1699,7 +1705,7 @@ def _run_sync_job(cfg) -> None:
         com = False
     msg, n = "", 0
     try:
-        store = Store(cfg.db_path, cfg.my_addresses)
+        store = Store(cfg.db_path, cfg.my_addresses, cfg.my_names)
         try:
             msg, n = _do_sync(store, cfg)
         finally:
@@ -1882,6 +1888,23 @@ def render_home(store, cfg, today: str, refine_note: str | None = None) -> str:
                    "placeholder='AI 정리 — 추가 정보(선택): 예) ECN은 처리 중, 납기건 우선'>"
                    "<button>AI 정리</button></form>")
 
+    # ── 확인 후보 (MAYBE) — 강등 판정의 회수 통로: 훑어서 잘못 내린 공을 건진다 ──
+    maybe = m.get("maybe") or []
+    if maybe:
+        rows = []
+        for c in maybe:
+            why = f" <span class='dim'>· {esc(c['reason'])}</span>" if c.get("reason") else ""
+            snip = (f"<span class='snip'>「{esc(c['snippet'])}」</span>"
+                    if c.get("snippet") else "")
+            rows.append(
+                f"<div class='item'><a href='/thread/{c['thread_id']}'>"
+                f"{esc(c['subject'])}</a> <span class='who'>· {esc(c['who'])}</span> "
+                f"<span class='day'>— D+{c['days']}{(' ' + esc(c['tag'])) if c.get('tag') else ''}</span>"
+                f"{why}{snip}</div>")
+        out.append(f"<details class='catfold'><summary>확인 후보 ({len(maybe)}) "
+                   "<span class='dim'>· 모호한 신호 — 훑어서 회수</span></summary>"
+                   + "".join(rows) + "</details>")
+
     # ── 오늘 메일 핵심 (접기) ──
     out.append(_digest_details(m.get("digest") or {}))
 
@@ -1949,7 +1972,7 @@ def _more_html(path: str, offset: int) -> str:
 # (추적제외 탭은 2026-07-12 폐지 — 숨김이 흡수, 새 수신 시 자동 해제.
 #  응답 대기/기한·요청은 스레드 상세의 신호(↩/⏰)와 같은 판정을 필터로 노출.)
 _LIST_FILTERS = [("", "전체"), ("unread", "미개봉"),
-                 ("awaiting", "↩ 내 응답 대기"), ("deadline", "⏰ 기한/요청"),
+                 ("awaiting", "↩ 내 응답 대기"), ("deadline", "⏰ 기한"),
                  ("flagged", "🚩 플래그"), ("hidden", "🙈 숨김")]
 
 
@@ -1961,34 +1984,19 @@ def _list_flt(qs) -> str:
     return ""
 
 
-def _signal_sets(store) -> tuple:
-    """응답대기·기한 스레드. 본문은 sync 때 계산하므로 여기서는 좁은 상태만 읽는다."""
-    me = store.my_addresses
-    aw: set = set()
-    dl: set = set()
-    for r in store.db.execute(
-            """SELECT s.thread_id, s.deadline_count, m.is_sent, m.to_addrs
-               FROM thread_state s
-               JOIN messages m ON m.id=s.latest_message_id"""):
-        if r["deadline_count"]:
-            dl.add(r["thread_id"])
-        if not r["is_sent"]:
-            tos = [a for a in (r["to_addrs"] or "").split(";") if a]
-            if len(tos) < 3 and set(tos) & me:
-                aw.add(r["thread_id"])
-    return frozenset(aw), frozenset(dl)
+def _action_state(store, cfg) -> tuple:
+    """(acts, REQUIRED, MAYBE, ⏰) — 목록·탭·뱃지가 쓰는 공통 판정 1회분.
 
-
-def _awaiting_thread_ids(store) -> frozenset:
-    """'↩ 내 응답 대기' 스레드 — 마지막 메일이 수신이고 To(3인 미만)에 내가 포함.
-    스레드 상세의 ↩ 신호와 동일. hidden 제외는 호출부 쿼리가 담당한다."""
-    return _signal_sets(store)[0]
-
-
-def _deadline_thread_ids(store) -> frozenset:
-    """'⏰ 기한/요청' 스레드 — 수신 메일 본문에 기한/요청 신호(DEADLINE_RX).
-    스레드 상세의 ⏰ 신호와 동일. hidden 제외는 호출부 쿼리가 담당한다."""
-    return _signal_sets(store)[1]
+    홈 개입 큐(review.intervention_queue)·스레드 상세와 같은
+    actions.classify_threads 판정 — 화면 간 불일치가 정의상 없다.
+    ↩ = REQUIRED, ⏰ = 열린 액션에 기한(내 회신·철회로 액션이 닫히면 함께 소멸).
+    """
+    acts = actions.classify_threads(store, cfg)
+    req = frozenset(t for t, a in acts.items() if a.level == actions.REQUIRED)
+    may = frozenset(t for t, a in acts.items() if a.level == actions.MAYBE)
+    dl = frozenset(t for t, a in acts.items()
+                   if a.has_deadline and a.level != actions.NONE)
+    return acts, req, may, dl
 
 
 def _ids_cond(ids: set, col: str) -> str:
@@ -2028,7 +2036,8 @@ def _noise_config_version(cfg) -> tuple:
     """is_noise / is_noise_subject_strong 이 의존하는 설정 표면 전체(지문 재료).
     새 노이즈 입력을 추가하면 여기에도 넣어야 캐시가 stale 되지 않는다."""
     return (tuple(cfg.ignore_senders), tuple(cfg.blocked_senders),
-            tuple(cfg.internal_domains), tuple(cfg.subject_noise_strong))
+            tuple(cfg.internal_domains), tuple(cfg.subject_noise_strong),
+            tuple(cfg.opt("filters", "external_allowlist", default=None) or []))
 
 
 def _noise_sets(store, cfg) -> tuple:
@@ -2078,15 +2087,39 @@ def _noise_thread_ids(store, cfg) -> frozenset:
     return _noise_sets(store, cfg)[0]
 
 
+def _maybe_fold(store, acts, maybe_ids) -> str:
+    """↩ 탭 하단의 접힌 '확인 후보'(MAYBE) — 강등 판정의 회수 통로.
+
+    강등(완료 통보·대량 발송·외부·약한 신호)의 목적지는 제거가 아니라 여기다:
+    잘못 강등된 공은 사용자가 훑어서 회수할 수 있어야 한다(미탐 비용 비대칭).
+    복구 뷰이므로 노이즈 메시지 필터는 적용하지 않는다.
+    """
+    if not maybe_ids:
+        return ""
+    pairs = sorted(((t, acts[t]) for t in maybe_ids),
+                   key=lambda p: p[1].sent_on, reverse=True)
+    items = []
+    for tid, a in pairs:
+        who = a.sender_name or a.sender_addr
+        items.append(
+            f"<a class='mrow read' href='/thread/{tid}'>"
+            f"<span class='mtop'><span class='mfrom'>{esc(a.subject)}</span>"
+            f"<span class='mdate'>{esc(_fmt_when(a.sent_on))}</span></span>"
+            f"<span class='msubj'>{esc(who)} · {esc(a.reason_text())}</span></a>")
+    return (f"<details class='catfold'><summary>확인 후보 ({len(pairs)}) "
+            "<span class='dim'>· 모호한 신호 — 훑어서 회수</span></summary>"
+            f"<div class='mlist'>{''.join(items)}</div></details>")
+
+
 def render_mail(store, cfg, offset: int = 0, flt: str = "") -> str:
     """메일함 — 노이즈 제외 수신함, 최신순. 스레드 목록과 같은 필터 바(양쪽 통일).
 
-    flt: '' 전체 | unread 미개봉 | awaiting 응답 대기 | deadline 기한/요청 |
+    flt: '' 전체 | unread 미개봉 | awaiting 응답 대기 | deadline 기한 |
     flagged 플래그 | hidden 숨김. 숨김은 전체/그 외 필터에서 빠지고 'hidden'
     탭에서만. offset>0 이면 조각만 반환.
     """
-    # 신호 필터(응답 대기·기한/요청)는 스레드 단위 판정 — 소속 메일을 보여준다
-    await_ids, dead_ids = _signal_sets(store)
+    # 신호 필터(응답 대기·기한)는 스레드 단위 판정 — 소속 메일을 보여준다
+    acts, await_ids, maybe_ids, dead_ids = _action_state(store, cfg)
     _, noise_msg = _noise_sets(store, cfg)   # 메시지 단위 노이즈(캐시) — is_noise 재계산 제거
     if flt == "hidden":
         tcond = "t.hidden=1"
@@ -2158,9 +2191,10 @@ def render_mail(store, cfg, offset: int = 0, flt: str = "") -> str:
               "awaiting": agg["awaiting"], "deadline": agg["deadline"],
               "flagged": agg["flagged"], "hidden": agg["hidden"]}
     body = "".join(items) or "<p class='empty'>수신 메일 없음</p>"
+    fold = _maybe_fold(store, acts, maybe_ids) if flt == "awaiting" else ""
     return ("<h1>메일함</h1>"
             + _list_filter_bar("/mail", flt, counts)
-            + f"<div class='mlist'>{body}{more}</div>")
+            + f"<div class='mlist'>{body}{more}</div>" + fold)
 
 
 def _thread_span_days(first: str, last: str) -> int:
@@ -2175,7 +2209,7 @@ def _thread_span_days(first: str, last: str) -> int:
 def render_threads(store, cfg, offset: int = 0, flt: str = "") -> str:
     """스레드 — 메일함과 같은 목록 UI: 제목 [N통] · 마지막 발신인 · 날짜.
 
-    flt: '' 전체 | unread 미개봉 | awaiting 응답 대기 | deadline 기한/요청 |
+    flt: '' 전체 | unread 미개봉 | awaiting 응답 대기 | deadline 기한 |
     flagged 플래그 | hidden 숨김. 메일함과 같은 필터 바(양쪽 통일).
     숨김은 전체/그 외 필터에서 빠지고 숨김 탭에서만.
     """
@@ -2184,7 +2218,7 @@ def render_threads(store, cfg, offset: int = 0, flt: str = "") -> str:
     ncsv = ",".join(str(int(i)) for i in noise_ids)
     nx = f" AND t.id NOT IN ({ncsv})" if noise_ids else ""    # alias t. (행 쿼리·unread)
     nxb = f" AND id NOT IN ({ncsv})" if noise_ids else ""     # bare id (agg: FROM threads)
-    await_ids, dead_ids = _signal_sets(store)
+    acts, await_ids, maybe_ids, dead_ids = _action_state(store, cfg)
     if flt == "hidden":
         cond = "WHERE t.hidden=1"
     elif flt == "awaiting":
@@ -2253,9 +2287,10 @@ def render_threads(store, cfg, offset: int = 0, flt: str = "") -> str:
               "deadline": len(dead_ids - noise_ids - hidden_ids),
               "flagged": agg["flag"], "hidden": agg["hid"]}
     body = "".join(items) or "<p class='empty'>스레드 없음</p>"
+    fold = _maybe_fold(store, acts, maybe_ids) if flt == "awaiting" else ""
     return ("<h1>스레드</h1>"
             + _list_filter_bar("/threads", flt, counts)
-            + f"<div class='mlist'>{body}{more}</div>")
+            + f"<div class='mlist'>{body}{more}</div>" + fold)
 
 
 def _actions_bar(tid: int, t, has_attach: bool, decider: str = "") -> str:
@@ -2299,8 +2334,8 @@ def _actions_bar(tid: int, t, has_attach: bool, decider: str = "") -> str:
     return f"<div class='actions'>{''.join(forms)}</div>"
 
 
-def render_thread(store, tid: int) -> str:
-    d = format_detail(store, tid)
+def render_thread(store, cfg, tid: int) -> str:
+    d = format_detail(store, cfg, tid)
     t = store.thread(tid)
     out = [f"<h1>{esc(d['title'])}</h1>"]
     if t:
@@ -2314,7 +2349,7 @@ def render_thread(store, tid: int) -> str:
         if not a:
             continue
         # "[롤링" 은 구버전 저장 노트 호환용 (표시 문구는 "누적 요약"으로 개명)
-        cls = " class='sig'" if a.startswith(("신호", "[누적", "[롤링")) else ""
+        cls = " class='sig'" if a.startswith(("신호", "판정", "[누적", "[롤링")) else ""
         out.append(f"<div{cls}>{esc(a)}</div>")
     out.append("</div>")
     # text-only 메일 중 마크다운으로 보이는 게 하나라도 있으면 스레드당 토글 버튼 1개.
@@ -2768,7 +2803,7 @@ def _aisearch_progress(stage: str, payload=None) -> None:
 
 def _run_aisearch_job(cfg, query: str, today: str, use_cache: bool) -> None:
     try:
-        store = Store(cfg.db_path, cfg.my_addresses)
+        store = Store(cfg.db_path, cfg.my_addresses, cfg.my_names)
         try:
             res = review.ai_search(store, cfg, query, today,
                                    use_cache=use_cache, progress=_aisearch_progress)
@@ -3280,7 +3315,7 @@ def route(store, cfg, path, qs, today):
         except (IndexError, ValueError):
             return "404", "<p>잘못된 스레드</p>", 404, "right"
         store.mark_thread_read(tid)   # 열람 = 읽음 (다음 목록 렌더에 반영)
-        return "스레드", render_thread(store, tid), 200, "right"
+        return "스레드", render_thread(store, cfg, tid), 200, "right"
     return "404", "<p class='empty'>없는 페이지</p>", 404, "right"
 
 
@@ -3376,7 +3411,7 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/latest":             # 표시 최신화 토큰 — DB 변경(새 메일) 감지용(가벼움)
             # MAX(rowid) 만으로 충분 — messages 는 삭제 없이 append-only 라 새 메일이면
             # 반드시 증가. COUNT(*) 는 대형 DB 에서 매 폴링(60s)마다 전수 스캔이라 제거.
-            st = Store(self.cfg.db_path, self.cfg.my_addresses)
+            st = Store(self.cfg.db_path, self.cfg.my_addresses, self.cfg.my_names)
             try:
                 row = st.db.execute(
                     "SELECT COALESCE(MAX(rowid), 0) FROM messages").fetchone()
@@ -3391,7 +3426,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
         frag = (qs.get("frag") or [""])[0] == "1"
         today = date.today().isoformat()
-        store = Store(self.cfg.db_path, self.cfg.my_addresses)
+        store = Store(self.cfg.db_path, self.cfg.my_addresses, self.cfg.my_names)
         try:
             if path == "/stats":
                 # 통계 분석 — 좌/우 셸 대신 전폭 단일 컬럼이되, 상단 nav 셸은
@@ -3476,7 +3511,7 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         today = date.today().isoformat()
-        store = Store(self.cfg.db_path, self.cfg.my_addresses)
+        store = Store(self.cfg.db_path, self.cfg.my_addresses, self.cfg.my_names)
         try:
             if path in ("/refine", "/lens/intervene/refine"):  # AI 정리 = 홈 인라인 렌더(200 직접)
                 note = (form.get("note") or [""])[0].strip()
@@ -3598,7 +3633,7 @@ def serve(cfg, port: int = 8765,
     # 서버 수명 동안 idle 읽기 연결 하나를 상시 열어두면 요청 close 가 마지막이
     # 아니게 되어 체크포인트 폭주를 막는다(결과 불변 — 그냥 유휴 연결).
     try:
-        _keepalive = Store(cfg.db_path, cfg.my_addresses)
+        _keepalive = Store(cfg.db_path, cfg.my_addresses, cfg.my_names)
     except Exception:
         _keepalive = None
     import os
