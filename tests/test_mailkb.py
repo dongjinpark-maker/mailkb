@@ -2746,11 +2746,14 @@ class TestWeb(unittest.TestCase):
         self.assertIn("검토 요청", out)           # 개입 큐 항목이 홈에
         self.assertIn("/thread/", out)
 
-    def test_home_has_refine_form(self):
-        # 구 개입 페이지의 'AI 정리' 폼이 홈으로 이전됨
+    def test_home_has_no_refine_form(self):
+        # 홈 'AI 정리' 입력창·버튼 제거(2026-07-17) — 라우트·폼 모두 사라졌다.
+        # 자동 주석은 유지(test_saved_ai_shown_on_home_get 가 가드).
         out = self.web.render_home(self.store, self.cfg, "2026-07-04")
-        self.assertIn("action='/refine'", out)
-        self.assertIn("AI 정리", out)
+        self.assertNotIn("/refine", out)
+        self.assertNotIn("AI 정리", out)
+        self.assertNotIn("class='refine'", self.web._CSS)
+        self.assertNotIn("/refine", self.web._APP_JS)
 
     def test_win_size_arg_clamps_and_defaults(self):
         # 창 크기 인자 정규화 — 신뢰 못 할 값을 --window-size 에 그대로 안 넣음
@@ -2945,7 +2948,7 @@ class TestWeb(unittest.TestCase):
         page = self.web.render_stats_page(self.store, self.cfg, 4)
         self.assertIn("<header class='top'>", page)
         self.assertIn("<span class='brand'>Minerva</span>", page)
-        for menu in ("홈", "메일함", "스레드", "검색", "기록", "통계"):
+        for menu in ("홈", "메일함", "스레드", "검색", "기억", "통계"):
             self.assertIn(menu, page, msg=menu)
         self.assertIn("통계 분석", page)          # 본문 제목
         self.assertIn("검토 기간", page)          # 기간 선택 바
@@ -3138,7 +3141,7 @@ class TestWeb(unittest.TestCase):
     def test_nav_order_with_mail_menu(self):
         nav = self.web._NAV
         # 검색은 링크가 아니라 헤더 검색창으로 승격 — 링크 순서는 통계까지
-        order = ["홈", "메일함", "스레드", "기록", "통계"]
+        order = ["홈", "메일함", "스레드", "기억", "통계"]
         pos = [nav.index(f">{t}</a>") for t in order]
         self.assertEqual(pos, sorted(pos))   # 명시된 순서 그대로
         self.assertIn('href="/mail"', nav)
@@ -3828,7 +3831,7 @@ class TestWeb(unittest.TestCase):
         self.assertFalse(self.web._start_review(self.cfg, False, "2026-07-04"))
         self.web._review_job.update(running=False, msg="")
 
-    # ─────────────────── 기록 메뉴 · 결정 원장 (Phase 1)
+    # ─────────────────── 기억 메뉴(구 기록) · 장기기억 (Phase 1)
 
     def test_records_page_tabs_default_daily(self):
         out = self.web.render_records(self.store, self.cfg, {}, "2026-07-04")

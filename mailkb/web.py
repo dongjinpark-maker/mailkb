@@ -466,9 +466,6 @@ button { padding: 6px 12px; font-size: 14px; border: 1px solid var(--border-stro
     border-radius: 6px; background: var(--surface); color: var(--ink); cursor: pointer; }
 button:hover { border-color: var(--accent); background: var(--hover-bg); }
 button.danger:hover { border-color: var(--danger); background: var(--danger-bg); }
-.refine { margin: 8px 0 16px; display: flex; gap: 8px; }
-.refine input[type=text] { flex: 1; padding: 7px 10px; font-size: 14px;
-    border: 1px solid var(--border-strong); border-radius: 6px; }
 details { margin: 10px 0; }
 summary { cursor: pointer; font-weight: 600; font-size: 15px; padding: 4px 0; color: var(--ink-2); }
 input, select, textarea { background: var(--surface); color: var(--ink); }
@@ -1000,7 +997,7 @@ def format_detail(store, cfg, thread_id: int) -> dict:
 # 바로 검색. 값은 app.js syncNavSearch 가 /search 일 때 URL 의 q 로 채운다.
 _NAV = ('<nav><a href="/">홈</a>'
         '<a href="/mail">메일함</a><a href="/threads">스레드</a>'
-        '<a href="/records">기록</a><a href="/stats">통계</a>'
+        '<a href="/records">기억</a><a href="/stats">통계</a>'
         "<form class='navsearch' method='get' action='/search' role='search'>"
         "<input name='q' placeholder='🔍 검색' aria-label='검색' autocomplete='off'>"
         "</form>"
@@ -1125,7 +1122,7 @@ _APP_JS = r"""
     if (path === "/" || path === "/mail" || path === "/threads" ||
         path === "/search" || path === "/records" || path === "/daily" ||
         path === "/settings") return "left";
-    if (path === "/refine" || path === "/lens/intervene" || path === "/person") return "left";
+    if (path === "/lens/intervene" || path === "/person") return "left";
     return "right";
   }
   function paneEl(p) { return p === "left" ? left : right; }
@@ -1315,7 +1312,7 @@ _APP_JS = r"""
   function navTarget(path) {
     path = (path || "/").replace(/\/+$/, "") || "/";
     if (path === "/") return "/";
-    if (path === "/daily") return "/records";   /* 구 데일리 경로 → 기록 메뉴 */
+    if (path === "/daily") return "/records";   /* 구 데일리 경로 → 기억 메뉴 */
     var tops = ["/mail", "/threads", "/search", "/records", "/stats", "/settings"];
     for (var i = 0; i < tops.length; i++) {
       if (path === tops[i] || path.indexOf(tops[i] + "/") === 0) return tops[i];
@@ -1577,7 +1574,7 @@ _APP_JS = r"""
         fin.searchParams.delete("frag");
         fin.searchParams.delete("msg");
         var p = paneFor(fin.pathname);
-        /* 303 을 따라온 경우만 주소 갱신 — 200 직접 응답(refine)은 유지 */
+        /* 303 을 따라온 경우만 주소 갱신 — 직접 200 응답이면 현재 주소 유지 */
         inject(p, html, res.redirected ? fin.pathname + (fin.search || "") : null);
         if (msg) toast(msg);
         /* 스레드 상태 변경(플래그·숨김·신호 해제/복원)은 왼쪽(홈·메일함·
@@ -1873,7 +1870,7 @@ def render_review_status(store=None):
         pend = store.decision_counts().get("candidate", 0)
         if pend:
             links.insert(0, f"<a href='/records?tab=decisions'>"
-                            f"반영 대기 {pend}건 → 기록 › 장기기억</a>")
+                            f"반영 대기 {pend}건 → 기억 › 장기기억</a>")
     return (f"<h1>오늘 메일 정리</h1>{body}"
             "<p>" + " · ".join(links) + " · <a href='/'>홈</a></p>", False)
 
@@ -1911,16 +1908,17 @@ def _is_act(it: dict) -> bool:
     return it["category"] == "decide" or (it["category"] == "respond" and it.get("personal"))
 
 
-def render_home(store, cfg, today: str, refine_note: str | None = None) -> str:
+def render_home(store, cfg, today: str) -> str:
     """홈 = 단일 대시보드. 구 개입 페이지를 흡수해 '지금 할 일'만 전면에 두고
-    나머지 개입은 접는다(미니멀). refine_note 가 오면 그 큐로 AI 정리 재실행."""
+    나머지 개입은 접는다(미니멀).
+
+    AI 주석(긴급도·사유·제안)은 '오늘 메일 정리'가 붙여 저장한 것을 읽어 반영한다
+    — 홈에서 메모를 주고 재실행하던 'AI 정리' 입력창은 제거(2026-07-17 사용자
+    요청, PROPOSAL-distill.md 가 Phase 2 예고분으로 남겼던 정리. 자동 주석은 유지).
+    """
     m = build_home(store, cfg, today, load_daily(cfg, today))
-    base = m["intervention"]
-    if refine_note is not None:
-        queue = review.ai_refine_intervention(
-            store, cfg, base, extra_context=refine_note or None, persist_date=today)
-    else:
-        queue = review.apply_saved_ai(base, store.load_intervention_ai(today))
+    queue = review.apply_saved_ai(m["intervention"],
+                                  store.load_intervention_ai(today))
 
     out = [f"<h1>Minerva · {esc(today)}</h1>",
            "<div class='actions'>"
@@ -1959,11 +1957,6 @@ def render_home(store, cfg, today: str, refine_note: str | None = None) -> str:
             out.append(f"<details class='catfold'{openattr}>"
                        f"<summary>그 외 개입 ({len(rest)}) <span class='dim'>· {counts}</span></summary>"
                        + "".join(body) + "</details>")
-        # AI 정리 (구 개입 페이지에서 홈으로 이전)
-        out.append("<form class='refine' method='post' action='/refine'>"
-                   f"<input type='text' name='note' value='{esc(refine_note or '')}' "
-                   "placeholder='AI 정리 — 추가 정보(선택): 예) ECN은 처리 중, 납기건 우선'>"
-                   "<button>AI 정리</button></form>")
 
     # ── 확인 후보 (MAYBE) — 강등 판정의 회수 통로: 훑어서 잘못 내린 공을 건진다 ──
     maybe = m.get("maybe") or []
@@ -1992,7 +1985,7 @@ def render_home(store, cfg, today: str, refine_note: str | None = None) -> str:
                f"<a href='/records?tab=decisions'>결정 <b>{m['n_dec']}</b>{pend}</a></div>")
     if not (m["n_dec"] or m["n_dec_pending"]) and not m["has_review"]:
         out.append("<p class='dim'>· 장기기억은 <b>오늘 메일 정리</b>가 제안을 올려 "
-                   "채웁니다 (반영은 기록 › 장기기억에서)</p>")
+                   "채웁니다 (반영은 기억 › 장기기억에서)</p>")
     return "\n".join(out)
 
 
@@ -2397,7 +2390,7 @@ def _actions_bar(tid: int, t, has_attach: bool, decider: str = "") -> str:
     _btn("open", "Outlook 열기")
     if has_attach:
         _btn("attach", "첨부 추출")
-    # 장기기억 수동 기록 — 사람이 쓰므로 즉시 반영 (기록 › 장기기억에 축적).
+    # 장기기억 수동 기록 — 사람이 쓰므로 즉시 반영 (기억 › 장기기억에 축적).
     # summary 라벨은 펼치면 '✕ 닫기'로 바뀜(CSS) — 라벨 중복 없이 접기 유지.
     forms.append(
         "<details class='recdec'><summary><span class='lbl'>장기기억</span>"
@@ -3159,7 +3152,10 @@ def render_daily(cfg, day: str, today: str | None = None) -> str:
     return "\n".join(out)
 
 
-# ────────────────── 기록 (데일리·장기기억 — 주간/분기는 Phase 2)
+# ────────────────── 기억 (데일리·장기기억 — 주간/분기는 Phase 2)
+# 메뉴명(2026-07-17 사용자 확정): 기억(구 기록) — '기록'은 앱의 모든 것(메일·스레드·
+# 노트)에 해당해 변별력이 없었다. 하루 단위 기억(데일리) ↔ 영구 기억(장기기억)으로
+# 아래 용어 체계와 한 묶음. 경로 /records 는 유지(URL↔표시명 불일치는 무해).
 # 용어(2026-07-12 사용자 확정): 장기기억(구 결정 원장) · 반영 대기(구 검토 대기) ·
 # 반영/유보(구 확정/반려). DB status 값(candidate/confirmed/rejected)은 그대로 —
 # 화면 용어만. AI 는 '반영문 초안'(자기완결 한 문장)을 제안하고 사람이 반영한다.
@@ -3249,7 +3245,7 @@ def render_decisions(store, qs) -> str:
 
 
 def render_records(store, cfg, qs, today: str) -> str:
-    """기록 페이지 — 탭: 데일리 | 장기기억. (주간·분기 탭은 Phase 2 에서 추가)"""
+    """기억 페이지 — 탭: 데일리 | 장기기억. (주간·분기 탭은 Phase 2 에서 추가)"""
     tab = (qs.get("tab") or ["daily"])[0]
     if tab not in ("daily", "decisions"):
         tab = "daily"
@@ -3423,8 +3419,10 @@ def route(store, cfg, path, qs, today):
     if path == "/settings":
         return "설정", render_settings(store, cfg), 200, "left"
     if path in ("/records", "/daily"):
-        # 기록(데일리·결정 원장). /daily 는 구 메뉴 경로 — 북마크 호환 흡수.
-        return "기록", render_records(store, cfg, qs, today), 200, "left"
+        # 기억(데일리·장기기억). /daily 는 구 메뉴 경로 — 북마크 호환 흡수.
+        # 경로 /records 는 표시명 개편(기록→기억, 2026-07-17) 후에도 유지 — URL 과
+        # 표시명이 어긋나도 동선엔 영향이 없고, 옛 북마크 호환 분기만 늘어난다.
+        return "기억", render_records(store, cfg, qs, today), 200, "left"
     if path == "/review/status":
         inner, running = render_review_status(store)
         return "정리", inner, 200, "right"
@@ -3471,7 +3469,7 @@ class _Handler(BaseHTTPRequestHandler):
                path: str = "") -> tuple[str, str]:
         """요청된 패널 외의 기본 콘텐츠 — 좌측 기본은 홈, 우측은 읽기(상세) 패널.
 
-        좌측은 상단 메뉴 콘텐츠(홈/메일함/스레드/검색/기록), 우측은
+        좌측은 상단 메뉴 콘텐츠(홈/메일함/스레드/검색/기억), 우측은
         스레드·메일 상세를 여는 읽기 영역. 데일리도 좌측 메뉴라 우측 기본은
         데일리가 아니라 안내 문구(이전엔 우측 기본이 데일리라 데일리 메뉴가
         좌우 중복이 됐음).
@@ -3638,17 +3636,6 @@ class _Handler(BaseHTTPRequestHandler):
         today = date.today().isoformat()
         store = Store(self.cfg.db_path, self.cfg.my_addresses, self.cfg.my_names, noise=self.cfg)
         try:
-            if path in ("/refine", "/lens/intervene/refine"):  # AI 정리 = 홈 인라인 렌더(200 직접)
-                note = (form.get("note") or [""])[0].strip()
-                inner = render_home(store, self.cfg, today, refine_note=note)
-                if self._is_fetch():
-                    self._send_html(inner)             # fragment — 좌측에 주입됨
-                else:
-                    left, right = self._panes(store, inner, "left", today)
-                    rw = self.cfg.opt("web", "reading_width", default=1200)
-                    th = self.cfg.opt("web", "theme", default="light")
-                    self._send_html(_shell("홈", left, right, read_w=rw, theme=th))
-                return
             if path == "/review":                     # 데일리 생성(백그라운드)
                 ai = bool((form.get("ai") or [""])[0])
                 _start_review(self.cfg, ai, today)

@@ -1343,7 +1343,7 @@ def _render_changes(lines: list[str], det: dict) -> set[int]:
         lines.append(f"- [#{d['thread_id']}] {d['title']}{who}{why}")
     if dec:
         lines.append(f"- ※ 장기기억 반영 대기 {len(dec)}건 — "
-                     "웹 '기록 › 장기기억'에서 반영/유보")
+                     "웹 '기억 › 장기기억'에서 반영/유보")
     lines.append("")
     return delta_ids | {d["thread_id"] for d in dec}
 

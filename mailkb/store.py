@@ -151,7 +151,7 @@ CREATE TABLE IF NOT EXISTS intervention_ai (
 );
 
 -- 결정 원장 (지식 증류 Phase 1): 데일리 수확이 후보(candidate)로 적재,
--- 확정(confirmed)은 사람이 웹 '기록 › 결정' 검토 큐에서. AI 는 제안만.
+-- 반영(confirmed)은 사람이 웹 '기억 › 장기기억' 반영 대기 큐에서. AI 는 제안만.
 CREATE TABLE IF NOT EXISTS decisions (
     id            INTEGER PRIMARY KEY,
     thread_id     INTEGER NOT NULL,
