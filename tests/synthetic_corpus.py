@@ -474,6 +474,10 @@ def build_synthetic_corpus(seed: int = 20260717) -> SyntheticCorpus:
         )
 
     # 25 CC/group requests where recipient count alone must not decide.
+    # CC + collective call-out ("전원/각 담당자") without the user's name stays
+    # MAYBE — CC is an FYI convention, recoverable in the review fold
+    # (user-confirmed, 2026-07-17).  Name mentions and To-recipients stay
+    # REQUIRED.
     for i in range(25):
         person = b.person(i + 6)
         project = b.project(i + 9)
@@ -491,25 +495,33 @@ def build_synthetic_corpus(seed: int = 20260717) -> SyntheticCorpus:
             to = [ME, b.person(i + 1)[1], b.person(i + 2)[1]]
             cc = []
             target = "group_role"
+        request = _TARGETED_REQUESTS[i % len(_TARGETED_REQUESTS)]
+        cc_collective = mode == 0 and ("김도현" not in request and "도현" not in request)
         b.add_thread(
             key=f"required-targeted-{i:03d}",
             specs=[
                 _human_spec(person, to, subject, "현재 상태와 이슈를 공유드립니다.", cc=cc),
                 _human_spec(
-                    person, to, subject,
-                    _TARGETED_REQUESTS[i % len(_TARGETED_REQUESTS)],
+                    person, to, subject, request,
                     cc=cc, intent="strong_request", target=target,
                 ),
             ],
             last_days_ago=i % 12,
-            action=ACTION_REQUIRED,
+            action=ACTION_MAYBE if cc_collective else ACTION_REQUIRED,
             action_kind=KIND_RESPOND,
             source_index=1,
-            rationale="CC or group request explicitly targets the user",
+            rationale=(
+                "collective request seen via CC — review candidate"
+                if cc_collective
+                else "CC or group request explicitly targets the user"
+            ),
         )
 
-    # 60 ambiguous requests. These should be recoverable in MAYBE rather than
-    # silently promoted or discarded.
+    # 60 ambiguous or formulaic threads.  Genuinely weak requests should be
+    # recoverable in MAYBE; pure pleasantries ("참고/협조 부탁드립니다") are the
+    # false-positive class that motivated the classifier rework, so their gold
+    # label is NONE (user-confirmed, 2026-07-17).
+    _PLEASANTRY_BODY = {1, 4, 6}     # indexes into _WEAK_REQUESTS
     for i in range(60):
         person = b.person(i + 2)
         project = b.project(i + 11)
@@ -521,23 +533,28 @@ def build_synthetic_corpus(seed: int = 20260717) -> SyntheticCorpus:
         to = [ME] + [
             b.person(i + j + 1)[1] for j in range(extra_recipients)
         ]
+        pleasantry = i % len(_WEAK_REQUESTS) in _PLEASANTRY_BODY
         b.add_thread(
-            key=f"maybe-{i:03d}",
+            key=(f"pleasantry-{i:03d}" if pleasantry else f"maybe-{i:03d}"),
             specs=[
                 _human_spec(person, to, subject, "관련 배경과 이전 결론을 정리했습니다."),
                 _human_spec(
                     person, to, subject,
                     _WEAK_REQUESTS[i % len(_WEAK_REQUESTS)],
-                    intent="weak_request",
+                    intent="pleasantry" if pleasantry else "weak_request",
                     target="external" if external else ("group" if len(to) > 2 else "direct"),
                 ),
             ],
             last_days_ago=i % 15,
-            action=ACTION_MAYBE,
-            action_kind=KIND_RESPOND,
+            action=ACTION_NONE if pleasantry else ACTION_MAYBE,
+            action_kind=KIND_NONE if pleasantry else KIND_RESPOND,
             noise=NOISE_POLICY if external else NOISE_NONE,
-            source_index=1,
-            rationale="weak, group, or external request needs user review",
+            source_index=None if pleasantry else 1,
+            rationale=(
+                "closing pleasantry is FYI, not a request"
+                if pleasantry
+                else "weak, group, or external request needs user review"
+            ),
         )
 
     # 80 resolved conversations. Variants end in my substantive reply, the
@@ -610,11 +627,15 @@ def build_synthetic_corpus(seed: int = 20260717) -> SyntheticCorpus:
             rationale="FYI, answer, or completed historical request",
         )
 
-    # 70 hard-noise messages from automated systems and external promotions.
+    # 70 noise messages from automated systems and external promotions.
+    # Hard = explicitly configured senders/subjects (ignore/blocked/strong
+    # subject); external newsletters are policy noise — they become hard only
+    # when the user blocks them (definition unified with the classifier,
+    # 2026-07-17).
     for i in range(70):
         if i % 7 == 0:
             sender = (f"외부 뉴스레터{i:02d}", f"news{i:02d}@marketing.example")
-            noise = NOISE_HARD
+            noise = NOISE_POLICY
             subject = f"무료 웨비나 및 기술 뉴스레터 #{i + 1:04d}"
             body = "오늘까지 신청하면 무료 자료를 받을 수 있습니다."
         else:

@@ -8,7 +8,9 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from mailkb import actions
 from mailkb.clean import extract_new_content
+from mailkb.config import Config
 from mailkb.sources.fake import FakeSource
 from mailkb.store import Store
 from tests.synthetic_corpus import (
@@ -40,21 +42,23 @@ class TestSyntheticCorpus(unittest.TestCase):
         self.assertEqual(len(self.corpus.records), 1020)
         self.assertEqual(len(self.corpus.messages), 1020)
         self.assertEqual(len(self.corpus.threads), 490)
+        # 라벨 정의 확정(2026-07-17): 관용구 22건 NONE, CC+전원 3건 MAYBE,
+        # 외부 뉴스레터 10건은 hard 가 아니라 policy(차단 설정 시에만 hard).
         self.assertEqual(
             Counter(t.action for t in self.corpus.threads.values()),
             Counter({
-                ACTION_REQUIRED: 100,
-                ACTION_MAYBE: 60,
-                ACTION_NONE: 330,
+                ACTION_REQUIRED: 97,
+                ACTION_MAYBE: 41,
+                ACTION_NONE: 352,
             }),
         )
         self.assertEqual(
             Counter(t.noise for t in self.corpus.threads.values()),
             Counter({
                 "none": 384,
-                NOISE_HARD: 70,
+                NOISE_HARD: 60,
                 NOISE_MIXED: 30,
-                NOISE_POLICY: 6,
+                NOISE_POLICY: 16,
             }),
         )
         schedules = Counter(t.schedule for t in self.corpus.threads.values())
@@ -196,6 +200,88 @@ class TestSyntheticCorpus(unittest.TestCase):
                 )
             finally:
                 store.close()
+
+
+class TestClassifierGate(unittest.TestCase):
+    """구현 판정기를 코퍼스 정답에 상시 배선한 회귀 게이트 (액션 + 노이즈 축).
+
+    라벨은 2026-07-17 사용자 확정 기준. 규칙을 바꿔 지표가 내려가면 여기서
+    잡힌다 — 의도된 정의 변경이면 코퍼스 라벨과 이 게이트를 함께 갱신할 것.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.corpus = build_synthetic_corpus()
+        cls.tmp = tempfile.TemporaryDirectory()
+        # 액션 축: 협력사(foundry.example)는 허용 목록 — allowlist 가 policy
+        # 노이즈 분기를 우회시켜 약한 요청도 확인 후보로 남는 것까지가 계약.
+        cls.cfg = Config(
+            home=Path(cls.tmp.name),
+            my_addresses=[ME, ME_ALIAS],
+            my_names=["김도현", "도현"],
+            internal_domains=["nurisoft.co.kr"],
+            ignore_senders=["noreply", "no-reply", "notification@",
+                            "jira@", "build@"],
+            raw={"filters": {"external_allowlist": ["foundry.example"]}},
+        )
+        cls.store = Store(Path(cls.tmp.name) / "corpus.sqlite",
+                          [ME, ME_ALIAS], ["김도현", "도현"], noise=cls.cfg)
+        cls.store.ingest(cls.corpus.records)
+        cls.key_of = {
+            row["id"]: row["conversation_key"][len("SYNTHETIC-"):]
+            for row in cls.store.db.execute(
+                "SELECT id, conversation_key FROM threads")
+        }
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.store.close()
+        cls.tmp.cleanup()
+
+    def test_action_axis_gate(self):
+        acts = actions.classify_threads(self.store, self.cfg)
+        pred = {key: (acts[tid].level if tid in acts else ACTION_NONE)
+                for tid, key in self.key_of.items()}
+        result = evaluate_action_predictions(self.corpus, pred)
+        self.assertEqual(result["required"]["precision"], 1.0,
+                         msg=result["false_alarms"][:5])
+        self.assertEqual(result["required"]["recall"], 1.0,
+                         msg=result["misses"][:5])
+        exact = evaluate_axis_predictions(self.corpus, pred, "action")
+        self.assertEqual(exact["mismatches"], [])
+
+    def _predict_noise(self, tid: int) -> str:
+        """스레드 노이즈 축 예측 — 설정 중립 외부 판정(allowlist 무관).
+
+        코퍼스의 policy 라벨은 '외부라는 사실'이다. allowlist 는 액션 축의
+        추적 여부를 바꿀 뿐 외부성 자체를 바꾸지 않는다.
+        """
+        kinds = set()
+        for m in self.store.db.execute(
+                "SELECT sender_addr, subject FROM messages "
+                "WHERE thread_id=? AND is_sent=0", (tid,)):
+            if (self.cfg.is_noise_sender_hard(m["sender_addr"])
+                    or self.cfg.is_noise_subject_strong(m["subject"])):
+                kinds.add(NOISE_HARD)
+            elif not m["sender_addr"].endswith("@nurisoft.co.kr"):
+                kinds.add(NOISE_POLICY)
+            else:
+                kinds.add("none")
+        if not kinds:
+            return "none"
+        if kinds == {NOISE_HARD}:
+            return NOISE_HARD
+        if NOISE_HARD in kinds:
+            return NOISE_MIXED
+        if NOISE_POLICY in kinds:
+            return NOISE_POLICY
+        return "none"
+
+    def test_noise_axis_gate(self):
+        pred = {key: self._predict_noise(tid)
+                for tid, key in self.key_of.items()}
+        result = evaluate_axis_predictions(self.corpus, pred, "noise")
+        self.assertEqual(result["mismatches"], [], msg=result["mismatches"][:8])
 
 
 if __name__ == "__main__":
