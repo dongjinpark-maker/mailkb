@@ -3563,8 +3563,8 @@ class TestWeb(unittest.TestCase):
         self.assertIn("noteLeft", js)
         self.assertIn("isTrusted", js)                 # 마우스 클릭 → 키보드 커서 동기화
         self.assertIn('classList.contains("selected")', js)  # curIdx 선택 항목 폴백
-        # 스레드 상태 변경 시 왼쪽 목록 갱신
-        self.assertIn("flag|unflag|hide|unhide", js)
+        # 스레드 상태 변경(플래그·숨김·신호 해제/복원) 시 왼쪽 목록 즉시 갱신
+        self.assertIn("flag|unflag|hide|unhide|signal-off|signal-on", js)
 
     def test_nav_active_underline(self):
         # 현재 위치한 최상위 메뉴에 밑줄(active) 표시

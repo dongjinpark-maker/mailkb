@@ -1512,9 +1512,10 @@ _APP_JS = r"""
         /* 303 을 따라온 경우만 주소 갱신 — 200 직접 응답(refine)은 유지 */
         inject(p, html, res.redirected ? fin.pathname + (fin.search || "") : null);
         if (msg) toast(msg);
-        /* 스레드 상태 변경(플래그·숨김·추적)은 왼쪽 목록에도 즉시 반영 */
+        /* 스레드 상태 변경(플래그·숨김·신호 해제/복원)은 왼쪽(홈·메일함·
+           스레드 목록)에도 즉시 반영 — 큐·탭 카운트·확인 후보가 같이 갱신된다 */
         if (leftCur &&
-            /\/thread\/\d+\/(flag|unflag|hide|unhide)$/.test(action)) {
+            /\/thread\/\d+\/(flag|unflag|hide|unhide|signal-off|signal-on)$/.test(action)) {
           var sc = left.scrollTop;
           load(leftCur, "left", false)
             .then(function () { left.scrollTop = sc; })   /* 스크롤 유지 */
