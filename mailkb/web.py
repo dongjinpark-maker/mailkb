@@ -259,6 +259,21 @@ details.catfold { margin: 8px 0 4px; background: var(--fold); border: 1px solid 
 .lensrow a b { color: var(--ink-2); }
 .analysis { background: var(--analysis-bg); border-radius: 8px; padding: 12px 14px; margin: 10px 0; }
 .analysis .sig { color: var(--warn); } .analysis pre { margin: 4px 0; white-space: pre-wrap; }
+/* 신호 칩 — 판정 배지 + 개별 ✕(수동 해제). 신호 없으면 줄 자체가 없다. */
+.sigchips { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 10px 0 0; }
+.chip { display: inline-flex; align-items: center; gap: 2px; font-size: 13px;
+        color: var(--warn); background: var(--warn-bg); border: 1px solid var(--warn-border);
+        border-radius: 999px; padding: 2px 4px 2px 11px; }
+.chip form { display: inline; margin: 0; }
+.chip button { border: 0; background: none; color: inherit; opacity: .5;
+               cursor: pointer; padding: 1px 6px; font-size: 12px; line-height: 1; }
+.chip button:hover { opacity: 1; }
+.sigoff { display: inline-flex; gap: 8px; align-items: center; font-size: 13px;
+          color: var(--ink-3); margin: 10px 0 0; }
+.sigchips .sigoff { margin: 0; }
+.sigoff form { display: inline; margin: 0; }
+.sigoff button { border: 0; background: none; color: var(--accent); cursor: pointer;
+                 padding: 0; font-size: 13px; text-decoration: underline; }
 .msg { border: 1px solid var(--border); border-radius: 8px; margin: 12px 0; overflow: hidden;
     scroll-margin-top: 10px; transition: box-shadow .5s ease; }
 /* 검색·목록에서 연 메일을 잠깐 강조(2.8s 후 JS 가 클래스 제거 → 트랜지션으로 페이드) */
@@ -869,16 +884,9 @@ def format_detail(store, cfg, thread_id: int) -> dict:
     subject = msgs[0]["subject"]
     participants = sorted({m["sender_name"] or m["sender_addr"] for m in msgs})
 
-    # ↩ = 답장 화살표 — 수동 플래그(⚐/⚑)와 글리프 충돌 회피. 개입 큐의
-    # '내 응답 대기' 카테고리와 같은 용어(2026-07-12 정렬).
+    # 신호는 텍스트 줄이 아니라 칩(개별 ✕로 수동 해제 가능)으로 —
+    # 렌더는 render_thread 가 d["act"] 로 구성한다. 판정 근거만 분석 줄에.
     act = actions.evaluate_thread(store, cfg, thread_id)
-    signals: list[str] = []
-    if act.level == actions.REQUIRED:
-        signals.append("↩ 내 응답 대기")
-    elif act.level == actions.MAYBE:
-        signals.append("☑ 확인 후보")
-    if act.has_deadline and act.level != actions.NONE:
-        signals.append("⏰ 기한")
 
     analysis = [
         f"제목: {subject}",
@@ -886,8 +894,7 @@ def format_detail(store, cfg, thread_id: int) -> dict:
         f"{len(msgs)}통  ·  참여 {len(participants)}명",
         f"참여자: {', '.join(participants)}",
     ]
-    if signals:
-        analysis.append("신호: " + "  ".join(signals))
+    if act.level != actions.NONE:
         ev = actions.evidence_sentence(store, act)
         analysis.append("판정: " + act.reason_text()
                         + (f" — 「{ev}」" if ev else ""))
@@ -917,7 +924,8 @@ def format_detail(store, cfg, thread_id: int) -> dict:
             "body": (m["new_content"] or "").splitlines(),
         })
     timeline.reverse()   # 최신 메일 먼저 (메일 클라이언트 관례)
-    return {"title": subject, "analysis": analysis, "timeline": timeline}
+    return {"title": subject, "analysis": analysis, "timeline": timeline,
+            "act": act}
 
 
 # 검색은 nav 링크가 아니라 헤더 상시 검색창으로 승격(2026-07-15) — 어느 화면에서든
@@ -1829,7 +1837,7 @@ def _digest_details(digest: dict) -> str:
 
 
 def _is_act(it: dict) -> bool:
-    """홈 전면('지금 할 일')에 둘 항목: 내 결정 대기 + 나 지목(★) 응답.
+    """홈 전면('지금 할 일')에 둘 항목: 결정 필요 + 나 지목(★) 회신.
     나머지 개입(응답 일반·정체·멈춤)은 '그 외 개입'으로 접는다."""
     return it["category"] == "decide" or (it["category"] == "respond" and it.get("personal"))
 
@@ -1858,7 +1866,7 @@ def render_home(store, cfg, today: str, refine_note: str | None = None) -> str:
         rest = [it for it in queue if not _is_act(it)]
         nd = sum(1 for it in act if it["category"] == "decide")
         nr = len(act) - nd
-        sub = [s for s in (f"결정 {nd}" if nd else "", f"나 지목 응답 {nr}" if nr else "") if s]
+        sub = [s for s in (f"결정 {nd}" if nd else "", f"나 지목 회신 {nr}" if nr else "") if s]
         out.append("<div class='banner'><span class='big'>지금 할 일 "
                    f"{len(act)}</span>"
                    + (f" <span class='dim'>· {' · '.join(sub)}</span>" if sub else "")
@@ -1970,9 +1978,9 @@ def _more_html(path: str, offset: int) -> str:
 
 # 메일함·스레드 왼쪽 목록 공통 필터 (양쪽 통일). 순서 = 탭 순서.
 # (추적제외 탭은 2026-07-12 폐지 — 숨김이 흡수, 새 수신 시 자동 해제.
-#  응답 대기/기한·요청은 스레드 상세의 신호(↩/⏰)와 같은 판정을 필터로 노출.)
+#  회신 필요/기한은 스레드 상세의 신호(↩/⏰)와 같은 판정을 필터로 노출.)
 _LIST_FILTERS = [("", "전체"), ("unread", "미개봉"),
-                 ("awaiting", "↩ 내 응답 대기"), ("deadline", "⏰ 기한"),
+                 ("awaiting", "↩ 회신 필요"), ("deadline", "⏰ 기한"),
                  ("flagged", "🚩 플래그"), ("hidden", "🙈 숨김")]
 
 
@@ -2114,11 +2122,11 @@ def _maybe_fold(store, acts, maybe_ids) -> str:
 def render_mail(store, cfg, offset: int = 0, flt: str = "") -> str:
     """메일함 — 노이즈 제외 수신함, 최신순. 스레드 목록과 같은 필터 바(양쪽 통일).
 
-    flt: '' 전체 | unread 미개봉 | awaiting 응답 대기 | deadline 기한 |
+    flt: '' 전체 | unread 미개봉 | awaiting 회신 필요 | deadline 기한 |
     flagged 플래그 | hidden 숨김. 숨김은 전체/그 외 필터에서 빠지고 'hidden'
     탭에서만. offset>0 이면 조각만 반환.
     """
-    # 신호 필터(응답 대기·기한)는 스레드 단위 판정 — 소속 메일을 보여준다
+    # 신호 필터(회신 필요·기한)는 스레드 단위 판정 — 소속 메일을 보여준다
     acts, await_ids, maybe_ids, dead_ids = _action_state(store, cfg)
     _, noise_msg = _noise_sets(store, cfg)   # 메시지 단위 노이즈(캐시) — is_noise 재계산 제거
     if flt == "hidden":
@@ -2209,7 +2217,7 @@ def _thread_span_days(first: str, last: str) -> int:
 def render_threads(store, cfg, offset: int = 0, flt: str = "") -> str:
     """스레드 — 메일함과 같은 목록 UI: 제목 [N통] · 마지막 발신인 · 날짜.
 
-    flt: '' 전체 | unread 미개봉 | awaiting 응답 대기 | deadline 기한 |
+    flt: '' 전체 | unread 미개봉 | awaiting 회신 필요 | deadline 기한 |
     flagged 플래그 | hidden 숨김. 메일함과 같은 필터 바(양쪽 통일).
     숨김은 전체/그 외 필터에서 빠지고 숨김 탭에서만.
     """
@@ -2334,6 +2342,45 @@ def _actions_bar(tid: int, t, has_attach: bool, decider: str = "") -> str:
     return f"<div class='actions'>{''.join(forms)}</div>"
 
 
+def _signal_chips(tid: int, act) -> str:
+    """신호 칩 줄 — 각 칩의 ✕ 로 그 신호만 끈다(새 요청 오면 자동 복귀).
+
+    신호가 없으면 빈 문자열(줄 자체가 안 생김 — 번잡함 방지). 수동 해제
+    상태에서는 흐린 안내 + '복원' 만 보인다.
+    """
+    if act is None:
+        return ""
+
+    def _off(kind: str, title: str) -> str:
+        return (f"<form method='post' action='/thread/{tid}/signal-off'>"
+                f"<input type='hidden' name='kind' value='{kind}'>"
+                f"<button title='{esc(title)}'>✕</button></form>")
+
+    if "user_dismissed" in act.reasons:
+        return ("<div class='sigoff'>신호 수동 해제됨 — 새 요청 오면 자동 복귀"
+                f"<form method='post' action='/thread/{tid}/signal-on'>"
+                "<button>복원</button></form></div>")
+    # (칩은 div — span 안의 form 은 HTML 사양 위반이라 피한다)
+    chips = []
+    if act.level == actions.REQUIRED:
+        chips.append("<div class='chip'>↩ 회신 필요"
+                     + _off("action", "이 요청 건의 신호 끄기") + "</div>")
+    elif act.level == actions.MAYBE:
+        chips.append("<div class='chip'>☑ 확인 후보"
+                     + _off("action", "이 요청 건의 신호 끄기") + "</div>")
+    if act.level != actions.NONE and act.has_deadline:
+        chips.append("<div class='chip'>⏰ 기한"
+                     + _off("deadline", "기한 표시만 끄기") + "</div>")
+    restore = ""
+    if act.level != actions.NONE and act.deadline_dismissed:
+        restore = ("<div class='sigoff'>⏰ 해제됨"
+                   f"<form method='post' action='/thread/{tid}/signal-on'>"
+                   "<button>복원</button></form></div>")
+    if not chips and not restore:
+        return ""
+    return "<div class='sigchips'>" + "".join(chips) + restore + "</div>"
+
+
 def render_thread(store, cfg, tid: int) -> str:
     d = format_detail(store, cfg, tid)
     t = store.thread(tid)
@@ -2344,6 +2391,7 @@ def render_thread(store, cfg, tid: int) -> str:
         decider = next((blk["sender"] for blk in d["timeline"]
                         if not blk["is_sent"]), "")
         out.append(_actions_bar(tid, t, has_attach, decider=decider))
+    out.append(_signal_chips(tid, d.get("act")))
     out.append("<div class='analysis'>")
     for a in d["analysis"]:
         if not a:
@@ -3224,6 +3272,14 @@ def perform_action(store, cfg, path: str, form: dict) -> str:
                 status="confirmed", source="manual")
             return back + "?msg=" + _q(
                 "장기기억에 반영됨" if did else "이미 장기기억에 있음")
+        if action == "signal-off":
+            kind = (form.get("kind") or ["action"])[0]
+            ok = store.dismiss_signal(tid, kind)
+            return back + "?msg=" + _q(
+                "신호 해제 — 새 요청 오면 자동 복귀" if ok else "해제할 신호 없음")
+        if action == "signal-on":
+            store.restore_signal(tid)
+            return back + "?msg=" + _q("신호 복원")
         if action == "flag":
             store.set_flag(tid, True)
             return back + "?msg=" + _q("플래그 표시")

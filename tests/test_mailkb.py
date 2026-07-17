@@ -1554,9 +1554,11 @@ class TestViewModel(unittest.TestCase):
         d = web.format_detail(store, cfg, tid)
         self.assertEqual(d["title"], "일정 협의")
         self.assertEqual(len(d["timeline"]), 1)
+        # 신호는 분석 줄이 아니라 칩(d["act"]) — 판정 근거만 분석 줄에 남는다
+        self.assertEqual(d["act"].level, "required")
+        self.assertTrue(d["act"].has_deadline)
         joined = "\n".join(d["analysis"])
-        self.assertIn("↩ 내 응답 대기", joined)   # 마지막이 수신·내가 To
-        self.assertIn("기한", joined)     # deadline 정규식 매칭
+        self.assertIn("판정:", joined)
         # 요약이 없으면 "[누적 요약]" 자체가 안 보임(빈 안내문 제거)
         self.assertNotIn("[누적 요약]", joined)
 
@@ -3040,7 +3042,7 @@ class TestWeb(unittest.TestCase):
         out = self.web.render_thread(self.store, self.cfg, tid)
         self.assertNotIn("추적 제외", out)
         self.assertNotIn("/dismiss'", out)
-        self.assertIn("↩ 내 응답 대기", out)          # 구 '⚑ 미답변 — 내 회신 없음'
+        self.assertIn("↩ 회신 필요", out)             # 신호 칩 (구 '⚑ 미답변')
         self.assertNotIn("⚑ 미답변", out)
         self.assertNotIn("신호 포함", out)
 
@@ -3377,7 +3379,7 @@ class TestWeb(unittest.TestCase):
         for out in (self.web.render_mail(self.store, self.cfg),
                     self.web.render_threads(self.store, self.cfg)):
             self.assertIn("class='listtabs'", out)
-            for lbl in ("전체", "미개봉", "↩ 내 응답 대기", "⏰ 기한",
+            for lbl in ("전체", "미개봉", "↩ 회신 필요", "⏰ 기한",
                         "🚩 플래그", "🙈 숨김"):
                 self.assertIn(lbl, out)
             self.assertNotIn("추적제외", out)
@@ -3414,10 +3416,10 @@ class TestWeb(unittest.TestCase):
         m = self.web.render_mail(self.store, self.cfg, flt="awaiting")
         self.assertIn("기한 있는 요청", m)
         full = self.web.render_mail(self.store, self.cfg)
-        self.assertIn("↩ 내 응답 대기 1", full)
+        self.assertIn("↩ 회신 필요 1", full)
         self.assertIn("⏰ 기한 1", full)
         thr = self.web.render_threads(self.store, self.cfg)   # 스레드 뱃지도 1/1
-        self.assertIn("↩ 내 응답 대기 1", thr)
+        self.assertIn("↩ 회신 필요 1", thr)
         self.assertIn("⏰ 기한 1", thr)
         # 숨기면 신호 필터에서도 빠짐 — 리스트뿐 아니라 뱃지 카운트에서도(회귀 가드).
         # 신호 캐시는 hidden 을 제외하지 않으므로 카운트 지점의 라이브 제외가 필요하다.
@@ -3425,10 +3427,10 @@ class TestWeb(unittest.TestCase):
         self.assertNotIn("기한 있는 요청",
                          self.web.render_threads(self.store, self.cfg, flt="awaiting"))
         thr2 = self.web.render_threads(self.store, self.cfg)
-        self.assertIn("↩ 내 응답 대기 0", thr2)       # 숨김 스레드가 뱃지를 부풀리지 않음
+        self.assertIn("↩ 회신 필요 0", thr2)       # 숨김 스레드가 뱃지를 부풀리지 않음
         self.assertIn("⏰ 기한 0", thr2)
         full2 = self.web.render_mail(self.store, self.cfg)
-        self.assertIn("↩ 내 응답 대기 0", full2)       # 메일함 뱃지도 0(원래 정상, 확인)
+        self.assertIn("↩ 회신 필요 0", full2)       # 메일함 뱃지도 0(원래 정상, 확인)
         self.assertIn("⏰ 기한 0", full2)
 
     # ─────────────────── 숨기기 (기능 2) — 추적·메일함·기본목록에서 제외
@@ -5100,7 +5102,7 @@ class TestActionLadder(unittest.TestCase):
         self.assertEqual(home_maybe, set(may))       # 확인 후보도 동일
         for tid in aw:                               # 상세 신호도 동일 판정
             d = web.format_detail(self.store, self.cfg, tid)
-            self.assertIn("↩ 내 응답 대기", "\n".join(d["analysis"]))
+            self.assertEqual(d["act"].level, "required")
 
     def test_deadline_clears_after_my_reply(self):
         # ⏰ 가 영구히 남던 문제(deadline_count 누적)의 회귀 가드
@@ -5118,6 +5120,127 @@ class TestActionLadder(unittest.TestCase):
             references=["<d1@t>"])])
         _, _, _, dl2 = web._action_state(self.store, self.cfg)
         self.assertNotIn(tid, dl2)
+
+
+class TestSignalDismiss(unittest.TestCase):
+    """신호 수동 해제(상세 칩 ✕) — source 메시지 키 오버레이.
+
+    파생 테이블이 아니라 백필에 살아남고, 새 요청이 오면(source 변경) 자동
+    복귀한다. 숨김(스레드 전체)과 달리 이 요청 건만 끈다.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = Config(home=Path(self.tmp.name), my_addresses=[ME],
+                          my_names=["김도현"])
+        self.store = Store(Path(self.tmp.name) / "t.sqlite", [ME], ["김도현"],
+                           noise=self.cfg)
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _r(self, mid, sender, subject, body, when, to=None):
+        return _recx(mid, sender, subject, when, body=body, to=to or [ME])
+
+    def _seed(self):
+        self.store.ingest([self._r(
+            "d1", "kim@corp.example", "기한요청건",
+            "금요일까지 회신 부탁드립니다.", "2026-07-15T09:00:00")])
+        return self.store.db.execute(
+            "SELECT thread_id FROM messages WHERE message_id='<d1@t>'"
+        ).fetchone()[0]
+
+    def test_dismiss_action_clears_everywhere_and_restores(self):
+        tid = self._seed()
+        self.assertTrue(self.store.dismiss_signal(tid, "action"))
+        a = actions.evaluate_thread(self.store, self.cfg, tid)
+        self.assertEqual((a.level, a.reasons), ("none", ["user_dismissed"]))
+        _, aw, may, dl = web._action_state(self.store, self.cfg)
+        self.assertNotIn(tid, aw | may | dl)         # ↩·확인 후보·⏰ 모두 소멸
+        q = review.intervention_queue(self.store, self.cfg, "2026-07-16")
+        self.assertNotIn(tid, {it["thread_id"] for it in q})   # 홈 큐도
+        self.store.restore_signal(tid)
+        self.assertEqual(
+            actions.evaluate_thread(self.store, self.cfg, tid).level, "required")
+
+    def test_dismiss_deadline_only(self):
+        tid = self._seed()
+        self.assertTrue(self.store.dismiss_signal(tid, "deadline"))
+        a = actions.evaluate_thread(self.store, self.cfg, tid)
+        self.assertEqual(a.level, "required")        # 회신 필요는 유지
+        self.assertFalse(a.has_deadline)             # ⏰ 만 꺼짐
+        self.assertTrue(a.deadline_dismissed)
+        _, aw, _, dl = web._action_state(self.store, self.cfg)
+        self.assertIn(tid, aw)
+        self.assertNotIn(tid, dl)
+
+    def test_new_request_revives_signal(self):
+        tid = self._seed()
+        self.store.dismiss_signal(tid, "action")
+        # 같은 스레드에 새 요청 → source 가 바뀌어 오버레이 자동 무효
+        self.store.ingest([self._r(
+            "d2", "kim@corp.example", "RE: 기한요청건",
+            "추가 건도 검토 부탁드립니다.", "2026-07-15T10:00:00")])
+        self.assertEqual(
+            actions.evaluate_thread(self.store, self.cfg, tid).level, "required")
+
+    def test_dismiss_survives_backfill(self):
+        tid = self._seed()
+        self.store.dismiss_signal(tid, "action")
+        path = self.store.db_path
+        self.store.db.execute("DELETE FROM sync_state WHERE key='derived_version'")
+        self.store.db.commit()
+        self.store.close()
+        self.store = Store(path, [ME], ["김도현"], noise=self.cfg)  # 백필 재구축
+        self.assertEqual(
+            actions.evaluate_thread(self.store, self.cfg, tid).level, "none")
+
+    def test_dismissed_not_resurrected_as_stalled(self):
+        # 해제한 요청 건이 3영업일 뒤 '멈춘 스레드'로 재등장하면 해제를 무시하는
+        # 셈 — 정체 카테고리에서도 억제된다(새 요청이 오면 해제와 함께 복귀).
+        self.store.ingest([
+            self._r("s1", "kim@corp.example", "정체될건",
+                    "검토 부탁드립니다.", "2026-07-06T09:00:00"),
+            self._r("s2", "kim@corp.example", "RE: 정체될건",
+                    "참고 자료 첨부합니다.", "2026-07-07T09:00:00"),
+        ])
+        tid = self.store.db.execute(
+            "SELECT thread_id FROM messages WHERE message_id='<s1@t>'"
+        ).fetchone()[0]
+        self.store.dismiss_signal(tid, "action")
+        q = review.intervention_queue(self.store, self.cfg, "2026-07-15")
+        self.assertNotIn(tid, {it["thread_id"] for it in q})
+
+    def test_no_open_action_returns_false(self):
+        self.store.ingest([self._r(
+            "f1", "kim@corp.example", "공유건", "자료 공유드립니다.",
+            "2026-07-15T09:00:00")])
+        tid = self.store.db.execute(
+            "SELECT thread_id FROM messages WHERE message_id='<f1@t>'"
+        ).fetchone()[0]
+        self.assertFalse(self.store.dismiss_signal(tid, "action"))
+        self.assertFalse(self.store.dismiss_signal(tid, "unknown"))
+
+    def test_detail_chips_and_post_routes(self):
+        tid = self._seed()
+        out = web.render_thread(self.store, self.cfg, tid)
+        self.assertIn("↩ 회신 필요", out)
+        self.assertIn("⏰ 기한", out)
+        self.assertIn(f"/thread/{tid}/signal-off", out)
+        # POST 해제 → 흐린 안내 + 복원만
+        loc = web.perform_action(self.store, self.cfg,
+                                 f"/thread/{tid}/signal-off",
+                                 {"kind": ["action"]})
+        self.assertIn("신호 해제", urllib_unquote(loc))
+        out2 = web.render_thread(self.store, self.cfg, tid)
+        self.assertNotIn("↩ 회신 필요", out2)
+        self.assertIn("신호 수동 해제됨", out2)
+        self.assertIn(f"/thread/{tid}/signal-on", out2)
+        web.perform_action(self.store, self.cfg,
+                           f"/thread/{tid}/signal-on", {})
+        self.assertIn("↩ 회신 필요",
+                      web.render_thread(self.store, self.cfg, tid))
 
 
 class TestNoisePolicy(unittest.TestCase):

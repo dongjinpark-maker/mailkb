@@ -128,6 +128,17 @@ CREATE TABLE IF NOT EXISTS sync_state (
     value TEXT
 );
 
+-- 신호 수동 해제 오버레이 (상세 화면 칩의 ✕) — 파생 테이블이 아니라
+-- 백필(drop+재생성)·재접기에 살아남는다. source_id(해제 당시의 요청 메시지)에
+-- 키가 걸려 있어 같은 스레드에 새 요청이 오면(action_source_id 변경) 자동으로
+-- 무시된다 = 신호 자동 복귀. 숨김(스레드 전체)과 달리 이 요청 건만 끈다.
+CREATE TABLE IF NOT EXISTS action_overrides (
+    thread_id        INTEGER PRIMARY KEY,
+    source_id        INTEGER NOT NULL,
+    dismiss_action   INTEGER NOT NULL DEFAULT 0,   -- 회신 필요·확인 후보 해제(⏰ 포함)
+    dismiss_deadline INTEGER NOT NULL DEFAULT 0    -- ⏰ 만 해제
+);
+
 CREATE TABLE IF NOT EXISTS intervention_ai (
     date       TEXT NOT NULL,      -- 오늘자로 저장 → 날짜 바뀌면 자동 무시
     thread_id  INTEGER NOT NULL,
@@ -1080,6 +1091,44 @@ class Store:
             )
         self.db.commit()
         return cur.rowcount > 0
+
+    def dismiss_signal(self, thread_id: int, kind: str) -> bool:
+        """열린 액션의 신호 수동 해제 — kind: 'action'(회신 필요·확인 후보 전체)
+        | 'deadline'(⏰ 만). 현재 source 메시지에 걸리므로 새 요청이 오면 자동
+        복귀한다. 열린 액션이 없으면 False."""
+        if kind not in ("action", "deadline"):
+            return False
+        row = self.db.execute(
+            "SELECT action_source_id FROM thread_state WHERE thread_id=?",
+            (thread_id,)).fetchone()
+        if not row or not row["action_source_id"]:
+            return False
+        src = row["action_source_id"]
+        cur = self.db.execute(
+            "SELECT source_id, dismiss_action, dismiss_deadline "
+            "FROM action_overrides WHERE thread_id=?", (thread_id,)).fetchone()
+        da = dd = 0
+        if cur and cur["source_id"] == src:      # 같은 요청 건의 기존 해제와 병합
+            da, dd = cur["dismiss_action"], cur["dismiss_deadline"]
+        if kind == "action":
+            da = 1
+        else:
+            dd = 1
+        self.db.execute(
+            "INSERT INTO action_overrides"
+            "(thread_id, source_id, dismiss_action, dismiss_deadline) "
+            "VALUES (?,?,?,?) ON CONFLICT(thread_id) DO UPDATE SET "
+            "source_id=excluded.source_id, dismiss_action=excluded.dismiss_action, "
+            "dismiss_deadline=excluded.dismiss_deadline",
+            (thread_id, src, da, dd))
+        self.db.commit()
+        return True
+
+    def restore_signal(self, thread_id: int) -> None:
+        """수동 해제 철회 — 판정이 다시 그대로 보인다."""
+        self.db.execute(
+            "DELETE FROM action_overrides WHERE thread_id=?", (thread_id,))
+        self.db.commit()
 
     def set_flag(self, thread_id: int, on: bool) -> None:
         """수동 플래그(중요 표시) 설정/해제."""

@@ -28,6 +28,7 @@ NONE = "none"           # 액션 불필요
 # 판정 이유 코드 → 표시 문구. 모든 REQUIRED/MAYBE 는 이유를 갖는다(설명 가능성).
 REASON_LABELS = {
     "hidden": "숨긴 스레드",
+    "user_dismissed": "수동 해제",
     "hard_noise": "확실한 노이즈 발신·제목",
     "strong_direct": "직접 수신 + 명시 요청",
     "strong_named": "이름 지목 + 명시 요청",
@@ -55,6 +56,7 @@ class Action:
     kind: str = ""                      # decide | respond
     source_id: int = 0                  # 신호 원본 메시지 id
     has_deadline: bool = False
+    deadline_dismissed: bool = False    # ⏰ 만 수동 해제된 상태(복원 UI 용)
     reasons: list = field(default_factory=list)
     named: bool = False                 # 본문이 내 이름·호칭을 지목
     participated: bool = False          # 내 발신이 있는 스레드
@@ -75,11 +77,15 @@ SELECT s.thread_id, s.action_source_id, s.action_strength, s.action_kind,
        m.sender_name, m.sender_addr, m.subject, m.to_addrs, m.cc_addrs,
        m.sent_on,
        f.has_question, f.has_request, f.mentions_me, f.mentions_group,
-       f.subject_has_request
+       f.subject_has_request,
+       COALESCE(o.dismiss_action, 0) AS dismiss_action,
+       COALESCE(o.dismiss_deadline, 0) AS dismiss_deadline
 FROM thread_state s
 JOIN threads t ON t.id = s.thread_id
 JOIN messages m ON m.id = s.action_source_id
 JOIN message_features f ON f.message_id = s.action_source_id
+LEFT JOIN action_overrides o
+       ON o.thread_id = s.thread_id AND o.source_id = s.action_source_id
 WHERE s.action_source_id > 0
 """
 
@@ -103,6 +109,10 @@ def evaluate(row, cfg, me: set) -> Action:
     """
     if row["hidden"]:
         return Action(NONE, reasons=["hidden"])
+    if row["dismiss_action"]:
+        # 상세 화면 칩의 ✕ — 이 요청 건만 수동 해제(새 요청 오면 자동 복귀)
+        return Action(NONE, source_id=row["action_source_id"],
+                      reasons=["user_dismissed"])
     if (cfg.is_noise_sender_hard(row["sender_addr"])
             or cfg.is_noise_subject_strong(row["subject"])):
         return Action(NONE, reasons=["hard_noise"])
@@ -190,7 +200,10 @@ def evaluate(row, cfg, me: set) -> Action:
         level=level,
         kind=row["action_kind"] or "respond",
         source_id=row["action_source_id"],
-        has_deadline=bool(row["action_has_deadline"]),
+        has_deadline=bool(row["action_has_deadline"]
+                          and not row["dismiss_deadline"]),
+        deadline_dismissed=bool(row["action_has_deadline"]
+                                and row["dismiss_deadline"]),
         reasons=reasons,
         named=named,
         participated=participated,

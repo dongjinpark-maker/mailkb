@@ -51,8 +51,8 @@ def _subject_noise(cfg: Config, subject: str, *, i_replied: bool, n_to: int) -> 
 
 # 개입 큐 카테고리 (우선순위 순 — 스레드는 최상위 1곳에만)
 CATEGORIES = [
-    ("decide", "🔴 내 결정 대기"),
-    ("respond", "🟠 내 응답 대기"),
+    ("decide", "🔴 결정 필요"),
+    ("respond", "🟠 회신 필요"),
     ("stalled_mine", "🟡 내가 넘긴 공(정체)"),
     ("stalled_thread", "⚪ 멈춘 주요 스레드"),
 ]
@@ -227,8 +227,8 @@ def intervention_queue(
     본문 정규식 재실행 없음: 저장 신호(L1)·액션 상태(L2)의 좁은 조인으로 판정하고,
     스니펫·근거 문장만 신호 원본 메시지에서 복원한다.
 
-      decide         내 결정 대기 (REQUIRED · 결정 요청)
-      respond        내 응답 대기 (REQUIRED · 그 외 요청/질문)
+      decide         결정 필요 (REQUIRED · 결정 요청)
+      respond        회신 필요 (REQUIRED · 그 외 요청/질문)
       stalled_mine   내가 넘긴 공 (내가 마지막·영업 stall_workdays 넘게 무응답·요청 포함)
       stalled_thread 멈춘 스레드 (열림·2통+·내 참여·영업 stale_workdays 넘게 무활동)
 
@@ -284,6 +284,10 @@ def intervention_queue(
         a = acts.get(tid)
         wd = workdays[tid]
 
+        # 수동 해제(상세 칩 ✕)한 요청 건은 정체 카테고리로도 재등장하지 않는다
+        # — "이 건은 됐어"를 존중. 새 요청이 오면 해제가 풀리며 함께 복귀.
+        if a and "user_dismissed" in a.reasons:
+            continue
         if a and a.level == actions.REQUIRED:
             m = src.get(a.source_id)
             content = strip_preserved(m["new_content"] or "") if m else ""
@@ -571,7 +575,7 @@ JSONL — 한 줄이 '하루치 분류 1회 실행'이다. 각 줄:
 - date: 실행일, backend: 사용 모델, raw: 모델 원문 출력(형식 이탈 점검용)
 - items[]: 이번 실행에서 분류한 메일들. 각 항목:
   - thread_id, subject
-  - det:     결정론이 넣은 자리. "respond"=응답 대기 큐에 있던 것,
+  - det:     결정론이 넣은 자리. "respond"=회신 필요 큐에 있던 것,
              "candidate"=결정론이 약한 신호라 뺐던 놓침 후보
   - verdict: 분류기 판정 — "필요"/"불필요"/"불명"/null(파싱 실패)
   - action:  최종 처리 — respond의 "dropped"(제외=FP주장)·"kept"(유지),
@@ -622,7 +626,7 @@ items 각 항목(실제 생성된 요약만, 재사용·스킵은 제외):
 ## 요약이 하는 일 (평가 기준)
 이 요약은 (1) 사람이 스레드 맥락을 빨리 파악하고, (2) 개입 분류기(haiku)에 스레드
 히스토리 근거로 들어간다. 따라서 좋은 요약은:
-- 미결 사항(내 결정/응답 대기), 요청·기한, 최근 상태를 보존한다.
+- 미결 사항(결정·회신 필요), 요청·기한, 최근 상태를 보존한다.
 - 사실에 충실(환각·과장 없음). 원문에 없는 단정 금지.
 - 간결(불필요한 인사·수사 제거). out_chars 가 in_chars 에 육박하면 압축 실패.
 
