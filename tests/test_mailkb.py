@@ -4784,6 +4784,13 @@ class TestFeatureGating(unittest.TestCase):
         f = self._f("가능하면 검토해 주시면 감사하겠습니다.")
         self.assertEqual((f["has_strong_request"], f["has_weak_request"]), (0, 1))
 
+    def test_evidence_uses_same_sentence_gate(self):
+        # 근거 문장 추출도 판정과 같은 게이트(sentence_gate) — 완료·과거 문장이
+        # 근거로 표시되면 안 된다(리뷰 반영)
+        body = "검토 요청 건을 완료했습니다.\n다른 안건은 언제 가능할까요?"
+        self.assertEqual(actions.evidence_from_body(body),
+                         "다른 안건은 언제 가능할까요?")
+
     def test_deadline_vocabulary(self):
         for s in ("금주 내로 검토 부탁드립니다.", "오늘 중으로 부탁드립니다.",
                   "3일 내로 회신 부탁드립니다.", "가능한 빨리 회신 주세요.",
@@ -4933,6 +4940,49 @@ class TestActionFold(unittest.TestCase):
         rebuilt = {r["thread_id"]: tuple(r[c] for c in cols)
                    for r in self.store.db.execute(q)}
         self.assertEqual(after, rebuilt)
+
+    def test_hard_noise_does_not_touch_action_state(self):
+        # 자동회신·시스템 알림이 열린 요청을 오염시키면 안 된다(리뷰 반영):
+        # (a) source 탈취 → L3 hard_noise → 실제 요청이 조용히 소멸
+        # (b) 시스템 '완료' 문구 → completion_after_action 강등
+        cfg = Config(home=Path(self.tmp.name), my_addresses=[ME],
+                     my_names=["김도현"], ignore_senders=["noreply", "jira@"])
+        path = Path(self.tmp.name) / "n.sqlite"
+        st = Store(path, [ME], ["김도현"], noise=cfg)
+        self.addCleanup(st.close)
+        st.ingest([
+            self._r("h1", "kim@corp.example", [ME], "설계 검토",
+                    "2026-07-16T09:00:00", "내일까지 검토 부탁드립니다."),
+            self._r("h2", "noreply@corp.example", [ME], "RE: 설계 검토",
+                    "2026-07-16T09:01:00",
+                    "자동 회신: 부재중입니다. 7월 20일까지 부재이며, "
+                    "급한 건은 김대리에게 부탁드립니다.", reply_to="h1"),
+            self._r("h3", "jira@corp.example", [ME], "RE: 설계 검토",
+                    "2026-07-16T09:02:00", "[JIRA] 빌드가 완료됐습니다.",
+                    reply_to="h1"),
+        ])
+        tid = st.db.execute(
+            "SELECT thread_id FROM messages WHERE message_id='<h1@t>'").fetchone()[0]
+        row = st.db.execute(
+            "SELECT action_source_id, completion_after_action FROM thread_state "
+            "WHERE thread_id=?", (tid,)).fetchone()
+        src = st.db.execute("SELECT message_id FROM messages WHERE id=?",
+                            (row["action_source_id"],)).fetchone()[0]
+        self.assertEqual(src, "<h1@t>")                       # source 유지
+        self.assertEqual(row["completion_after_action"], 0)   # 강등 없음
+        from mailkb import actions as actions_mod
+        self.assertEqual(actions_mod.evaluate_thread(st, cfg, tid).level,
+                         "required")
+        # 노이즈 설정 변경(차단 추가) → derived_version 변경 → 재접기 백필
+        st.close()
+        cfg2 = Config(home=Path(self.tmp.name), my_addresses=[ME],
+                      my_names=["김도현"],
+                      ignore_senders=["noreply", "jira@", "kim@corp.example"])
+        st2 = Store(path, [ME], ["김도현"], noise=cfg2)
+        self.addCleanup(st2.close)
+        self.assertEqual(st2.db.execute(
+            "SELECT action_source_id FROM thread_state WHERE thread_id=?",
+            (tid,)).fetchone()[0], 0)     # 발신자 차단 → 그 요청도 사라짐
 
     def test_name_config_change_triggers_backfill(self):
         st = self.store

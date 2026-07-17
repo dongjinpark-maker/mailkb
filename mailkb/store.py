@@ -285,7 +285,7 @@ def fold_action(state: dict, msg) -> dict:
 
 class Store:
     def __init__(self, db_path: Path, my_addresses: list[str],
-                 my_names: list[str] | tuple = ()):
+                 my_names: list[str] | tuple = (), noise=None):
         self.db_path = db_path
         self.my_addresses = {a.lower() for a in my_addresses}
         # 본문 '나 지목' 판정용 이름 — 설정 이름 + 내 주소 로컬파트(설정 의존이라
@@ -293,6 +293,12 @@ class Store:
         self.my_names = sorted({n.strip().lower() for n in my_names if n.strip()})
         self._signal_names = tuple(self.my_names) + tuple(
             a.split("@")[0] for a in sorted(self.my_addresses))
+        # 확실한 노이즈(hard) 판정자 — 보통 Config. 액션 fold 가 노이즈 메시지를
+        # 무시하는 데 쓴다: 자동회신·시스템 알림이 열린 요청의 source 를 탈취하거나
+        # ('7월 20일까지 부재…부탁드립니다') 완료 문구로 강등시키는 것 방지.
+        # 판정 표면(ignore/blocked/subject_strong)은 _derived_version 에 포함 —
+        # 노이즈 설정이 바뀌면 자동 백필로 접힌 상태를 재계산한다.
+        self._noise = noise
         self.db = sqlite3.connect(db_path)
         self.db.row_factory = sqlite3.Row
         # incremental vacuum: 이미지 프룬이 지운 공간을 조각 단위로 회수 —
@@ -327,12 +333,27 @@ class Store:
     def close(self) -> None:
         self.db.close()
 
+    def _is_hard_noise(self, sender: str, subject: str) -> bool:
+        """액션 fold 가 무시할 확실한 노이즈 메시지인가 (판정자 없으면 항상 False)."""
+        return bool(self._noise) and (
+            self._noise.is_noise_sender_hard(sender or "")
+            or self._noise.is_noise_subject_strong(subject or ""))
+
     def _derived_version(self) -> str:
         # my_names 포함 — mentions_me 가 저장 비트라 이름이 바뀌면 백필해야
-        # 낡은 지목 판정이 남지 않는다.
+        # 낡은 지목 판정이 남지 않는다. hard 노이즈 표면 포함 — fold 가 노이즈
+        # 메시지를 건너뛰므로 차단 목록·강한 제목이 바뀌면 재접기가 필요하다.
+        noise_sig = ""
+        if self._noise is not None:
+            noise_sig = "\0".join(
+                "\1".join(str(p) for p in lst) for lst in (
+                    sorted(self._noise.ignore_senders),
+                    sorted(self._noise.blocked_senders),
+                    sorted(self._noise.subject_noise_strong)))
         cfg_sig = hashlib.sha256(
             ("\0".join(sorted(self.my_addresses))
-             + "\1" + "\0".join(self.my_names)).encode("utf-8")
+             + "\1" + "\0".join(self.my_names)
+             + "\2" + noise_sig).encode("utf-8")
         ).hexdigest()[:12]
         return f"{FEATURE_VERSION}:{cfg_sig}"
 
@@ -414,9 +435,11 @@ class Store:
                    GROUP BY t.id"""
             )
             # 액션 상태 — 스레드별 시간순 fold. 한 번의 정렬 스캔으로 전 스레드를
-            # 접는다(스레드 경계에서 플러시). 증분 경로와 같은 fold_action.
+            # 접는다(스레드 경계에서 플러시). 증분 경로와 같은 fold_action,
+            # hard 노이즈 메시지 스킵도 동일.
             rows = self.db.execute(
-                """SELECT m.thread_id, m.id AS id, m.is_sent, f.*
+                """SELECT m.thread_id, m.id AS id, m.is_sent,
+                          m.sender_addr, m.subject, f.*
                    FROM messages m JOIN message_features f ON f.message_id=m.id
                    ORDER BY m.thread_id, m.sent_on, m.id""").fetchall()
             cur_tid, state = None, dict(_EMPTY_ACTION)
@@ -425,6 +448,8 @@ class Store:
                     if cur_tid is not None and state != _EMPTY_ACTION:
                         self._write_action_state(cur_tid, state)
                     cur_tid, state = m["thread_id"], dict(_EMPTY_ACTION)
+                if self._is_hard_noise(m["sender_addr"], m["subject"]):
+                    continue
                 state = fold_action(state, m)
             if cur_tid is not None and state != _EMPTY_ACTION:
                 self._write_action_state(cur_tid, state)
@@ -536,7 +561,8 @@ class Store:
         self.db.execute(_FTS_SYNC, (cur.lastrowid, rec.subject, new_content))
         self._touch_thread(thread_id, rec.sent_on)
         self._update_thread_state(
-            thread_id, cur.lastrowid, rec.sent_on, is_sent, feats)
+            thread_id, cur.lastrowid, rec.sent_on, is_sent, feats,
+            hard_noise=self._is_hard_noise(rec.sender_addr, rec.subject))
         # 새 수신 메일이 숨긴 스레드에 오면 자동 숨김 해제 — "지금은 조용히,
         # 새 소식 오면 다시" (구 추적제외의 자동 복귀를 숨김이 흡수, 2026-07-12).
         # 내가 보낸 답장(is_sent=1)으로는 해제하지 않음 — "처리 중인데 다시
@@ -603,7 +629,8 @@ class Store:
         )
 
     def _update_thread_state(self, thread_id: int, message_id: int,
-                             sent_on: str, is_sent: int, feats: dict) -> None:
+                             sent_on: str, is_sent: int, feats: dict,
+                             hard_noise: bool = False) -> None:
         """Apply one appended message to its thread's persistent aggregate."""
         received = 0 if is_sent else 1
         addressed = feats["addressed_to_me"]
@@ -650,11 +677,15 @@ class Store:
         # 액션 상태기계 — 이 메시지가 최신이면 증분 전이, 역순 삽입(Outlook 이
         # 오래된 메일을 늦게 줌)이면 이 스레드만 재접기. 두 경로가 같은
         # fold_action 을 쓰므로 결과는 정의상 등가(드리프트 테스트가 가드).
+        # hard 노이즈 메시지는 전이 대상이 아님 — 자동회신이 열린 요청의 source 를
+        # 탈취하거나 시스템 '완료' 문구가 강등시키지 않게(리뷰 반영, 2026-07-17).
         row = self.db.execute(
             "SELECT latest_message_id, action_source_id, action_strength, "
             "action_kind, action_has_deadline, completion_after_action "
             "FROM thread_state WHERE thread_id=?", (thread_id,)).fetchone()
         if row["latest_message_id"] == message_id:
+            if hard_noise:
+                return
             msg = dict(feats)
             msg["id"] = message_id
             msg["is_sent"] = is_sent
@@ -667,13 +698,17 @@ class Store:
     def _refold_thread_actions(self, thread_id: int) -> None:
         """스레드의 액션 상태를 시간순 전체 재계산 — 역순 삽입 보정.
 
-        비용은 이 스레드 크기에 비례(전체 DB 재계산 아님)."""
+        비용은 이 스레드 크기에 비례(전체 DB 재계산 아님). 증분 경로와
+        동일하게 hard 노이즈 메시지는 건너뛴다."""
         state = dict(_EMPTY_ACTION)
         for m in self.db.execute(
-                """SELECT m.id AS id, m.is_sent, f.* FROM messages m
+                """SELECT m.id AS id, m.is_sent, m.sender_addr, m.subject, f.*
+                   FROM messages m
                    JOIN message_features f ON f.message_id=m.id
                    WHERE m.thread_id=? ORDER BY m.sent_on, m.id""",
                 (thread_id,)):
+            if self._is_hard_noise(m["sender_addr"], m["subject"]):
+                continue
             state = fold_action(state, m)
         self._write_action_state(thread_id, state)
 

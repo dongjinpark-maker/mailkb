@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 
 from .clean import strip_preserved
 from .features import (DEADLINE_RX, DECISION_RX, STRONG_REQUEST_RX,
-                       WEAK_REQUEST_RX, split_sentences)
+                       WEAK_REQUEST_RX, sentence_gate, split_sentences)
 
 REQUIRED = "required"   # 명시적인 응답·결정·처리 필요
 MAYBE = "maybe"         # 액션 가능성 있으나 모호 — 접힌 확인 후보
@@ -178,8 +178,13 @@ def evaluate(row, cfg, me: set) -> Action:
         reasons.append("broadcast")
     if cfg.is_noise_external(row["sender_addr"]) and not named:
         if level == REQUIRED:
+            # 강한 증거는 확인 후보로 남긴다(협력사 누락 방지 — allowlist 등록 전)
             level = MAYBE
-        reasons.append("external")
+            reasons.append("external")
+        else:
+            # 외부 + 약신호 = 뉴스레터·광고("오늘까지 신청…") — 제외.
+            # 진짜 협력사는 filters.external_allowlist 로 이 분기를 안 탄다.
+            return Action(NONE, reasons=reasons + ["external"])
 
     return Action(
         level=level,
@@ -217,12 +222,17 @@ def evaluate_thread(store, cfg, thread_id: int) -> Action:
 
 
 def evidence_from_body(body: str) -> str:
-    """정제 본문에서 판정 근거 문장 1개 — 첫 매치 문장, 없으면 질문, 없으면 첫 줄."""
+    """정제 본문에서 판정 근거 문장 1개 — 첫 매치 문장, 없으면 질문, 없으면 첫 줄.
+
+    저장 비트와 같은 문장 게이트(features.sentence_gate)를 쓴다 — 게이트에 걸린
+    "검토 요청 건을 완료했습니다" 류가 근거로 표시되는 불일치 방지.
+    """
+    live = [s for s in split_sentences(body) if not sentence_gate(s)[2]]
     for rx in (DECISION_RX, STRONG_REQUEST_RX, DEADLINE_RX, WEAK_REQUEST_RX):
-        for s in split_sentences(body):
+        for s in live:
             if rx.search(s):
                 return s.strip()
-    for s in split_sentences(body):
+    for s in live:
         if "?" in s or "？" in s:
             return s.strip()
     lines = [ln.strip() for ln in body.splitlines() if ln.strip()]

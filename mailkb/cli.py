@@ -20,7 +20,7 @@ from .store import Store
 
 
 def _store(cfg) -> Store:
-    return Store(cfg.db_path, cfg.my_addresses, cfg.my_names)
+    return Store(cfg.db_path, cfg.my_addresses, cfg.my_names, noise=cfg)
 
 
 def _fmt_row(m) -> str:

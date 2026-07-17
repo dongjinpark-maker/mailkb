@@ -187,14 +187,9 @@ def deadline_signals(store: Store, cfg: Config, date_iso: str) -> list[tuple[str
         # 적용("금요일까지 완료했습니다" 같은 완료 문맥 기한 제외 — L1 과 동일 기준)
         body = strip_preserved(m["new_content"])
         for s in features.split_sentences(body):
-            if not DEADLINE_RX.search(s):
-                continue
-            if ((features.COMPLETION_RX.search(s)
-                 or features.HISTORICAL_RX.search(s))
-                    and not features.REMIND_RX.search(s)):
-                continue
-            signals.append((m["subject"], s.strip()))
-            break
+            if DEADLINE_RX.search(s) and not features.sentence_gate(s)[2]:
+                signals.append((m["subject"], s.strip()))
+                break
     return signals
 
 

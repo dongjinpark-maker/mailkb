@@ -199,6 +199,21 @@ def is_trivial_msg(text: str) -> bool:
 REQUEST_RX = WEAK_REQUEST_RX
 
 
+def sentence_gate(s: str) -> tuple[bool, bool, bool]:
+    """(철회 문장인가, 완료 문맥인가, 신호 무효 문장인가).
+
+    classify_message(저장 비트)와 actions.evidence_from_body(근거 표시)가
+    같은 게이트를 쓴다 — 갈라지면 '완료했습니다' 문장이 근거로 표시되는
+    식의 불일치가 생긴다. 규칙 변경은 여기 한 곳에.
+    """
+    if WITHDRAWAL_RX.search(s):
+        return True, False, True          # 철회 문장 자체는 요청이 아님
+    comp = COMPLETION_RX.search(s) is not None
+    hist = HISTORICAL_RX.search(s) is not None
+    blocked = (comp or hist) and not REMIND_RX.search(s)
+    return False, comp, blocked
+
+
 def classify_message(content: str, subject: str = "",
                      names: tuple | list = ()) -> dict:
     """메시지 한 통의 저장 신호 — message_features 한 행 값.
@@ -210,14 +225,13 @@ def classify_message(content: str, subject: str = "",
     strong = weak = question = deadline = decision = 0
     completion = withdrawal = 0
     for s in split_sentences(body):
-        if WITHDRAWAL_RX.search(s):
+        wd, comp, blocked = sentence_gate(s)
+        if wd:
             withdrawal = 1
-            continue                      # 철회 문장 자체는 요청이 아님
-        comp = COMPLETION_RX.search(s) is not None
-        hist = HISTORICAL_RX.search(s) is not None
+            continue
         if comp:
             completion = 1
-        if (comp or hist) and not REMIND_RX.search(s):
+        if blocked:
             continue                      # 완료·과거 문맥 문장은 신호 무효
         if STRONG_REQUEST_RX.search(s):
             if HEDGE_RX.search(s):

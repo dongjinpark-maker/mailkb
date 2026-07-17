@@ -1645,7 +1645,7 @@ def _job_progress(msg: str) -> None:
 def _run_review_job(cfg, ai: bool, today: str) -> None:
     from . import notes
     try:
-        store = Store(cfg.db_path, cfg.my_addresses, cfg.my_names)
+        store = Store(cfg.db_path, cfg.my_addresses, cfg.my_names, noise=cfg)
         try:
             det = review.deterministic(store, cfg, today)
             ai_text = note = None
@@ -1705,7 +1705,7 @@ def _run_sync_job(cfg) -> None:
         com = False
     msg, n = "", 0
     try:
-        store = Store(cfg.db_path, cfg.my_addresses, cfg.my_names)
+        store = Store(cfg.db_path, cfg.my_addresses, cfg.my_names, noise=cfg)
         try:
             msg, n = _do_sync(store, cfg)
         finally:
@@ -2803,7 +2803,7 @@ def _aisearch_progress(stage: str, payload=None) -> None:
 
 def _run_aisearch_job(cfg, query: str, today: str, use_cache: bool) -> None:
     try:
-        store = Store(cfg.db_path, cfg.my_addresses, cfg.my_names)
+        store = Store(cfg.db_path, cfg.my_addresses, cfg.my_names, noise=cfg)
         try:
             res = review.ai_search(store, cfg, query, today,
                                    use_cache=use_cache, progress=_aisearch_progress)
@@ -3411,7 +3411,7 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/latest":             # 표시 최신화 토큰 — DB 변경(새 메일) 감지용(가벼움)
             # MAX(rowid) 만으로 충분 — messages 는 삭제 없이 append-only 라 새 메일이면
             # 반드시 증가. COUNT(*) 는 대형 DB 에서 매 폴링(60s)마다 전수 스캔이라 제거.
-            st = Store(self.cfg.db_path, self.cfg.my_addresses, self.cfg.my_names)
+            st = Store(self.cfg.db_path, self.cfg.my_addresses, self.cfg.my_names, noise=self.cfg)
             try:
                 row = st.db.execute(
                     "SELECT COALESCE(MAX(rowid), 0) FROM messages").fetchone()
@@ -3426,7 +3426,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
         frag = (qs.get("frag") or [""])[0] == "1"
         today = date.today().isoformat()
-        store = Store(self.cfg.db_path, self.cfg.my_addresses, self.cfg.my_names)
+        store = Store(self.cfg.db_path, self.cfg.my_addresses, self.cfg.my_names, noise=self.cfg)
         try:
             if path == "/stats":
                 # 통계 분석 — 좌/우 셸 대신 전폭 단일 컬럼이되, 상단 nav 셸은
@@ -3511,7 +3511,7 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         today = date.today().isoformat()
-        store = Store(self.cfg.db_path, self.cfg.my_addresses, self.cfg.my_names)
+        store = Store(self.cfg.db_path, self.cfg.my_addresses, self.cfg.my_names, noise=self.cfg)
         try:
             if path in ("/refine", "/lens/intervene/refine"):  # AI 정리 = 홈 인라인 렌더(200 직접)
                 note = (form.get("note") or [""])[0].strip()
@@ -3633,7 +3633,7 @@ def serve(cfg, port: int = 8765,
     # 서버 수명 동안 idle 읽기 연결 하나를 상시 열어두면 요청 close 가 마지막이
     # 아니게 되어 체크포인트 폭주를 막는다(결과 불변 — 그냥 유휴 연결).
     try:
-        _keepalive = Store(cfg.db_path, cfg.my_addresses, cfg.my_names)
+        _keepalive = Store(cfg.db_path, cfg.my_addresses, cfg.my_names, noise=cfg)
     except Exception:
         _keepalive = None
     import os
