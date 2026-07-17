@@ -219,7 +219,7 @@ def classify_message(content: str, subject: str = "",
     """메시지 한 통의 저장 신호 — message_features 한 행 값.
 
     보존 인용(mid-join)을 뺀 신규 작성분만 문장 단위로 판정한다. names(내 이름·
-    호칭)는 설정 의존 — 바뀌면 store._derived_version 이 백필을 트리거한다.
+    호칭)는 설정 의존 — 바뀌면 store._feature_version 이 백필을 트리거한다.
     """
     body = strip_preserved(content or "")
     strong = weak = question = deadline = decision = 0

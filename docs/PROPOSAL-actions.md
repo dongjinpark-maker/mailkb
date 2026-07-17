@@ -82,11 +82,28 @@ L3 actions.py         열린 슬롯 × 수신 대상 × 노이즈 → REQUIRED/M
 
 ## 4. 배포·무재싱크
 
-`FEATURE_VERSION=2` + `_derived_version` 에 **my_names 해시 추가**(이름이 저장
-비트 `mentions_me` 의 입력이 됐으므로). 버전 불일치 시 파생 테이블을
-**drop+재생성**(SQLite ADD COLUMN IF NOT EXISTS 부재 우회 — 파생 테이블은
-messages 에서 재구축 가능) 후 1회 백필. Outlook 재수집·DB 삭제 불필요 —
-`git pull` 후 서버 시작 시 자동.
+`FEATURE_VERSION=2` + 파생 버전에 **my_names 해시 추가**(이름이 저장 비트
+`mentions_me` 의 입력이 됐으므로). 버전 불일치 시 파생 테이블을 **drop+재생성**
+(SQLite ADD COLUMN IF NOT EXISTS 부재 우회 — 파생 테이블은 messages 에서 재구축
+가능) 후 1회 백필. Outlook 재수집·DB 삭제 불필요 — `git pull` 후 서버 시작 시 자동.
+
+**파생 버전 분리 (2026-07-17).** 하나였던 파생 버전을 둘로 나눴다. 이유: 발신자
+차단은 "이 메시지를 액션 계산에서 뺄지"만 바꾸지, 본문에서 뽑은 사실(요청·기한·
+완료 문장)은 바꾸지 않는데, 예전엔 하나의 버전이라 차단 한 번에 전 메일을 재분류해
+1만 통에서 서버가 ~9초 멈췄다.
+
+- `_feature_version` = `FEATURE_VERSION` + 내 주소 + 내 이름 (`classify_message`
+  가 읽는 것). 불일치 → 기존 전체 백필(재분류 + 집계 + fold).
+- `_action_version` = `ignore_senders` + `blocked_senders` + `subject_noise_strong`
+  (`_is_hard_noise` 가 읽는 것). 불일치 → 재분류 없이 **액션 상태만 재접기**
+  (`_refold_all_actions`). 본문을 안 읽어 크기 무관, 1만 통 ~9s → **~90ms**.
+- `external_allowlist` 는 fold 가 아니라 질의 시점(`actions.evaluate`)에만 쓰여
+  어느 버전에도 없다 — 바꿔도 백필·재접기가 없다.
+- 판정 기준(새 설정이 어느 쪽인가): **누가 그 값을 읽는가.** `classify_message`
+  가 읽으면 feature, `_is_hard_noise` 가 읽으면 action, 둘 다 아니면 어느 쪽도 아님.
+- 함정: 액션 전용 재접기는 빈 상태(열린 액션 없음)도 **반드시 써야** 한다 —
+  전체 백필은 테이블이 새것이라 건너뛰어도 됐지만, 제자리 경로에서 건너뛰면
+  차단으로 사라져야 할 옛 액션이 남는다(`_fold_all_actions` 가 무조건 기록).
 
 ## 5. 측정 (합성 수치는 방향 지표 — 실측은 audit 라벨로)
 
@@ -118,8 +135,8 @@ messages 에서 재구축 가능) 후 1회 백필. Outlook 재수집·DB 삭제 
    이 열린 요청의 source 를 탈취해 L3 hard_noise → NONE 으로 만들거나, 시스템
    "완료" 문구가 completion_after_action 강등을 일으켰다(재현 후 수정). fold 의
    세 경로(증분·refold·백필) 모두 hard 노이즈 메시지를 전이 대상에서 제외하고,
-   노이즈 표면(ignore/blocked/subject_strong)을 `_derived_version` 에 포함해
-   차단 목록 변경 시 자동 재접기한다. Store 는 noise 판정자(Config)를 주입받는다.
+   노이즈 표면(ignore/blocked/subject_strong)을 파생 버전에 포함해 차단 목록
+   변경 시 자동 재접기한다. Store 는 noise 판정자(Config)를 주입받는다.
 2. **근거 추출의 게이트 불일치** — `sentence_gate()` 를 features 로 분리해
    classify(저장 비트)·evidence(근거 표시)·deadline_signals(데일리)가 같은
    게이트를 쓴다. "검토 요청 건을 완료했습니다"가 근거 문장으로 표시되지 않는다.

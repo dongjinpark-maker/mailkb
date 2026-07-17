@@ -300,15 +300,15 @@ class Store:
         self.db_path = db_path
         self.my_addresses = {a.lower() for a in my_addresses}
         # 본문 '나 지목' 판정용 이름 — 설정 이름 + 내 주소 로컬파트(설정 의존이라
-        # _derived_version 해시에 포함, 바뀌면 message_features 백필).
+        # _feature_version 해시에 포함, 바뀌면 message_features 백필).
         self.my_names = sorted({n.strip().lower() for n in my_names if n.strip()})
         self._signal_names = tuple(self.my_names) + tuple(
             a.split("@")[0] for a in sorted(self.my_addresses))
         # 확실한 노이즈(hard) 판정자 — 보통 Config. 액션 fold 가 노이즈 메시지를
         # 무시하는 데 쓴다: 자동회신·시스템 알림이 열린 요청의 source 를 탈취하거나
         # ('7월 20일까지 부재…부탁드립니다') 완료 문구로 강등시키는 것 방지.
-        # 판정 표면(ignore/blocked/subject_strong)은 _derived_version 에 포함 —
-        # 노이즈 설정이 바뀌면 자동 백필로 접힌 상태를 재계산한다.
+        # 판정 표면(ignore/blocked/subject_strong)은 _action_version 에 포함 —
+        # 노이즈 설정이 바뀌면 본문 재분류 없이 액션만 재접기(_refold_all_actions).
         self._noise = noise
         self.db = sqlite3.connect(db_path)
         self.db.row_factory = sqlite3.Row
@@ -350,23 +350,41 @@ class Store:
             self._noise.is_noise_sender_hard(sender or "")
             or self._noise.is_noise_subject_strong(subject or ""))
 
-    def _derived_version(self) -> str:
-        # my_names 포함 — mentions_me 가 저장 비트라 이름이 바뀌면 백필해야
-        # 낡은 지목 판정이 남지 않는다. hard 노이즈 표면 포함 — fold 가 노이즈
-        # 메시지를 건너뛰므로 차단 목록·강한 제목이 바뀌면 재접기가 필요하다.
-        noise_sig = ""
-        if self._noise is not None:
-            noise_sig = "\0".join(
-                "\1".join(str(p) for p in lst) for lst in (
-                    sorted(self._noise.ignore_senders),
-                    sorted(self._noise.blocked_senders),
-                    sorted(self._noise.subject_noise_strong)))
-        cfg_sig = hashlib.sha256(
+    # 파생 캐시의 수명주기는 둘로 나뉜다(2026-07-17). 새 설정을 추가할 때 어느
+    # 쪽인지는 **누가 그 값을 읽는가**로 정한다:
+    #   classify_message 가 읽는다  → _feature_version (본문 재분류 필요)
+    #   _is_hard_noise 가 읽는다    → _action_version  (재접기만 필요)
+    # 둘 다 아니면(질의 시점에만 쓰이면) 어느 버전에도 넣지 않는다 —
+    # external_allowlist 가 그 예로, actions.evaluate 가 매번 새로 판정한다.
+    def _feature_version(self) -> str:
+        """본문 사실 캐시(message_features)와 스레드 집계의 버전.
+
+        입력 = classify_message 가 읽는 것: 규칙 버전 + 내 주소(addressed_to_me)
+        + 내 이름(mentions_me — 저장 비트라 이름이 바뀌면 낡은 지목 판정이 남는다).
+        노이즈 설정은 여기 없다 — 발신자를 차단해도 본문에서 뽑은 사실(요청·기한·
+        완료 문장)은 그대로다.
+        """
+        sig = hashlib.sha256(
             ("\0".join(sorted(self.my_addresses))
-             + "\1" + "\0".join(self.my_names)
-             + "\2" + noise_sig).encode("utf-8")
+             + "\1" + "\0".join(self.my_names)).encode("utf-8")
         ).hexdigest()[:12]
-        return f"{FEATURE_VERSION}:{cfg_sig}"
+        return f"{FEATURE_VERSION}:{sig}"
+
+    def _action_version(self) -> str:
+        """액션 상태(thread_state 의 action_* 컬럼)의 버전.
+
+        입력 = _is_hard_noise 가 읽는 것뿐 — fold 가 노이즈 메시지를 건너뛰므로
+        차단 목록·자동발송 패턴·강한 제목이 바뀌면 재접기가 필요하다. 본문 재분류는
+        불필요: 저장된 신호로 다시 접기만 하면 된다(1만 통 기준 ~9s → ~85ms).
+        """
+        if self._noise is None:
+            return "-"
+        return hashlib.sha256("\0".join(
+            "\1".join(str(p) for p in lst) for lst in (
+                sorted(self._noise.ignore_senders),
+                sorted(self._noise.blocked_senders),
+                sorted(self._noise.subject_noise_strong))
+        ).encode("utf-8")).hexdigest()[:12]
 
     def _addressed_to_me(self, to_addrs: str, cc_addrs: str) -> int:
         addrs = {a.lower() for a in (to_addrs + ";" + cc_addrs).split(";") if a}
@@ -389,18 +407,65 @@ class Store:
              st["action_has_deadline"], st["completion_after_action"], thread_id),
         )
 
-    def _ensure_derived_state(self) -> None:
-        """파생 행을 기능/설정 버전당 1회 백필.
+    def _fold_all_actions(self) -> None:
+        """전 스레드의 액션 상태를 시간순 fold 로 재계산 (호출자가 트랜잭션 보유).
 
-        버전이 다르면 파생 테이블을 drop+재생성해 스키마 변경까지 흡수한다
-        (재구축 가능한 테이블이므로 안전 — Outlook 재수집·DB 삭제 불필요).
+        한 번의 정렬 스캔으로 전 스레드를 접는다(스레드 경계에서 플러시). 증분
+        경로와 같은 fold_action, hard 노이즈 스킵도 동일.
+
+        빈 상태(열린 액션 없음)도 **반드시 쓴다** — 액션 전용 재접기는 테이블이
+        새것이 아니라, 건너뛰면 차단으로 사라져야 할 옛 액션이 그대로 남는다.
+        """
+        rows = self.db.execute(
+            """SELECT m.thread_id, m.id AS id, m.is_sent,
+                      m.sender_addr, m.subject, f.*
+               FROM messages m JOIN message_features f ON f.message_id=m.id
+               ORDER BY m.thread_id, m.sent_on, m.id""").fetchall()
+        cur_tid, state = None, dict(_EMPTY_ACTION)
+        for m in rows:
+            if m["thread_id"] != cur_tid:
+                if cur_tid is not None:
+                    self._write_action_state(cur_tid, state)
+                cur_tid, state = m["thread_id"], dict(_EMPTY_ACTION)
+            if self._is_hard_noise(m["sender_addr"], m["subject"]):
+                continue
+            state = fold_action(state, m)
+        if cur_tid is not None:
+            self._write_action_state(cur_tid, state)
+
+    def _refold_all_actions(self, version: str) -> None:
+        """노이즈 설정만 바뀐 경우 — 저장된 신호로 액션 상태만 제자리 재계산.
+
+        본문을 읽지 않으므로 본문 크기와 무관하게 빠르다(전체 백필의 1/25 이하).
+        message_features·집계 컬럼은 손대지 않는다 — 차단은 '이 메시지를 액션
+        계산에서 뺄지'만 바꾸지 본문의 사실을 바꾸지 않기 때문.
+        """
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            self._fold_all_actions()
+            self.db.execute(
+                "INSERT INTO sync_state(key, value) VALUES('action_version', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (version,))
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def _ensure_derived_state(self) -> None:
+        """파생 행을 버전당 1회 백필 — 무거운 쪽과 가벼운 쪽을 분리해 판정.
+
+        feature 불일치 → 파생 테이블 drop+재생성 + 전 메일 재분류(스키마 변경까지
+        흡수. 재구축 가능한 테이블이라 안전 — Outlook 재수집·DB 삭제 불필요).
+        action 만 불일치 → 재분류 없이 액션 상태만 재접기.
         executescript 는 진행 중 트랜잭션을 커밋해 버리므로 여기선 execute 만.
         """
-        expected = self._derived_version()
-        row = self.db.execute(
-            "SELECT value FROM sync_state WHERE key='derived_version'"
-        ).fetchone()
-        if row and row["value"] == expected:
+        fv, av = self._feature_version(), self._action_version()
+        have = {r["key"]: r["value"] for r in self.db.execute(
+            "SELECT key, value FROM sync_state "
+            "WHERE key IN ('feature_version', 'action_version')")}
+        if have.get("feature_version") == fv:
+            if have.get("action_version") != av:
+                self._refold_all_actions(av)
             return
 
         self.db.execute("BEGIN IMMEDIATE")
@@ -445,30 +510,12 @@ class Store:
                    JOIN message_features f ON f.message_id=m.id
                    GROUP BY t.id"""
             )
-            # 액션 상태 — 스레드별 시간순 fold. 한 번의 정렬 스캔으로 전 스레드를
-            # 접는다(스레드 경계에서 플러시). 증분 경로와 같은 fold_action,
-            # hard 노이즈 메시지 스킵도 동일.
-            rows = self.db.execute(
-                """SELECT m.thread_id, m.id AS id, m.is_sent,
-                          m.sender_addr, m.subject, f.*
-                   FROM messages m JOIN message_features f ON f.message_id=m.id
-                   ORDER BY m.thread_id, m.sent_on, m.id""").fetchall()
-            cur_tid, state = None, dict(_EMPTY_ACTION)
-            for m in rows:
-                if m["thread_id"] != cur_tid:
-                    if cur_tid is not None and state != _EMPTY_ACTION:
-                        self._write_action_state(cur_tid, state)
-                    cur_tid, state = m["thread_id"], dict(_EMPTY_ACTION)
-                if self._is_hard_noise(m["sender_addr"], m["subject"]):
-                    continue
-                state = fold_action(state, m)
-            if cur_tid is not None and state != _EMPTY_ACTION:
-                self._write_action_state(cur_tid, state)
-            self.db.execute(
-                "INSERT INTO sync_state(key, value) VALUES('derived_version', ?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (expected,),
-            )
+            self._fold_all_actions()      # 액션 상태 — 액션 전용 경로와 같은 함수
+            for key, value in (("feature_version", fv), ("action_version", av)):
+                self.db.execute(
+                    "INSERT INTO sync_state(key, value) VALUES(?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, value))
             self.db.commit()
         except Exception:
             self.db.rollback()

@@ -636,7 +636,7 @@ class TestStore(unittest.TestCase):
         path = self.store.db_path
         self.store.db.execute("DELETE FROM message_features")
         self.store.db.execute("DELETE FROM thread_state")
-        self.store.db.execute("DELETE FROM sync_state WHERE key='derived_version'")
+        self.store.db.execute("DELETE FROM sync_state WHERE key='feature_version'")
         self.store.db.commit()
         self.store.close()
         self.store = Store(path, [ME])
@@ -5121,7 +5121,7 @@ class TestActionFold(unittest.TestCase):
         self.assertEqual(before, after)
         # 백필(버전 리셋 → 재오픈) ≡ 증분
         path = self.store.db_path
-        self.store.db.execute("DELETE FROM sync_state WHERE key='derived_version'")
+        self.store.db.execute("DELETE FROM sync_state WHERE key='feature_version'")
         self.store.db.commit()
         self.store.close()
         self.store = Store(path, [ME], ["김도현"])
@@ -5161,7 +5161,7 @@ class TestActionFold(unittest.TestCase):
         from mailkb import actions as actions_mod
         self.assertEqual(actions_mod.evaluate_thread(st, cfg, tid).level,
                          "required")
-        # 노이즈 설정 변경(차단 추가) → derived_version 변경 → 재접기 백필
+        # 노이즈 설정 변경(차단 추가) → action_version 변경 → 액션만 재접기
         st.close()
         cfg2 = Config(home=Path(self.tmp.name), my_addresses=[ME],
                       my_names=["김도현"],
@@ -5185,7 +5185,7 @@ class TestActionFold(unittest.TestCase):
             (mid,)).fetchone()[0], 0)
         path = st.db_path
         st.close()
-        # 이름 추가 → derived_version 변경 → 자동 백필로 mentions_me 갱신
+        # 이름 추가 → feature_version 변경 → 자동 백필로 mentions_me 갱신
         self.store = Store(path, [ME], ["김도현", "박부장"])
         self.assertEqual(self.store.db.execute(
             "SELECT mentions_me FROM message_features WHERE message_id=?",
@@ -5225,6 +5225,135 @@ class TestActionFold(unittest.TestCase):
                    self._r("cu4", ME, ["kim@corp.example"], "RE: 요청건2",
                            "2026-07-03T10:00:00", "++박수석", reply_to="cu3")])
         self.assertEqual(st.action_closed_by_me_on("2026-07-03"), [])
+
+
+class TestDerivedVersionSplit(unittest.TestCase):
+    """파생 캐시 수명주기 분리(2026-07-17) — 노이즈 설정 변경이 본문 재분류를
+    유발하지 않는다. 차단 1회에 전 메일을 재분류하던 정지(1만 통 ~9s)를 없앤 것."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.path = self.home / "v.sqlite"
+        self.cfg = Config(home=self.home, my_addresses=[ME], my_names=["김도현"],
+                          internal_domains=["corp.example"])
+        st = Store(self.path, [ME], ["김도현"], noise=self.cfg)
+        st.ingest([
+            # 사람의 실제 요청 → 액션 열림
+            _rec("v1", "kim@corp.example", [ME], "설계 검토",
+                 "2026-07-16T09:00:00", body="내일까지 검토 부탁드립니다."),
+            # 나중에 차단할 광고 — 같은 스레드에서 요청 신호를 덮는다
+            _rec("v2", "promo@ads.example", [ME], "RE: 설계 검토",
+                 "2026-07-16T10:00:00", body="지금 신청 부탁드립니다. 오늘까지!"),
+        ])
+        self.tid = st.db.execute(
+            "SELECT thread_id FROM messages WHERE message_id='<v1@t>'").fetchone()[0]
+        st.close()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _sentinel(self):
+        """message_features 가 재생성됐는지 알아내는 표식 — 재분류되면 지워진다."""
+        st = Store(self.path, [ME], ["김도현"], noise=self.cfg)
+        st.db.execute("UPDATE message_features SET has_question=9")
+        st.db.commit()
+        st.close()
+
+    def _sentinel_alive(self, store) -> bool:
+        return bool(store.db.execute(
+            "SELECT COUNT(*) FROM message_features WHERE has_question=9"
+        ).fetchone()[0])
+
+    def _blocked_cfg(self, *pats):
+        return Config(home=self.home, my_addresses=[ME], my_names=["김도현"],
+                      internal_domains=["corp.example"], blocked_senders=list(pats))
+
+    def test_block_refolds_actions_without_reclassifying_bodies(self):
+        self._sentinel()
+        cfg2 = self._blocked_cfg("promo@ads.example")
+        st = Store(self.path, [ME], ["김도현"], noise=cfg2)
+        self.addCleanup(st.close)
+        # 본문 사실 캐시는 그대로 — 차단은 '액션 계산에서 뺄지'만 바꾼다
+        self.assertTrue(self._sentinel_alive(st))
+        # 액션은 다시 접혔다 — 광고가 뺏었던 source 가 사람의 요청으로 복귀
+        src = st.db.execute(
+            "SELECT message_id FROM messages WHERE id=("
+            " SELECT action_source_id FROM thread_state WHERE thread_id=?)",
+            (self.tid,)).fetchone()[0]
+        self.assertEqual(src, "<v1@t>")
+
+    def test_name_change_still_reclassifies(self):
+        self._sentinel()
+        # 이름 변경은 mentions_me(저장 비트)를 바꾸므로 전체 백필이 맞다
+        st = Store(self.path, [ME], ["김도현", "박부장"], noise=self.cfg)
+        self.addCleanup(st.close)
+        self.assertFalse(self._sentinel_alive(st))
+
+    def test_unblock_restores_blocked_senders_action(self):
+        only_ad = Store(self.path, [ME], ["김도현"],
+                        noise=self._blocked_cfg("kim@corp.example"))
+        # 사람을 차단하면 그 요청이 사라지고 광고 요청만 남는다
+        src = only_ad.db.execute(
+            "SELECT message_id FROM messages WHERE id=("
+            " SELECT action_source_id FROM thread_state WHERE thread_id=?)",
+            (self.tid,)).fetchone()[0]
+        self.assertEqual(src, "<v2@t>")
+        only_ad.close()
+        # 차단 해제 → 원래 액션 복원
+        st = Store(self.path, [ME], ["김도현"], noise=self.cfg)
+        self.addCleanup(st.close)
+        src = st.db.execute(
+            "SELECT message_id FROM messages WHERE id=("
+            " SELECT action_source_id FROM thread_state WHERE thread_id=?)",
+            (self.tid,)).fetchone()[0]
+        self.assertEqual(src, "<v2@t>")   # 아무도 차단 안 됨 → 최신 요청이 source
+
+    def test_block_clears_action_when_nothing_left(self):
+        # 빈 상태 미기록 함정: 전체 백필은 테이블이 새것이라 안 써도 됐지만,
+        # 제자리 재접기는 반드시 지워야 한다 — 안 그러면 옛 액션이 남는다.
+        st = Store(self.path, [ME], ["김도현"],
+                   noise=self._blocked_cfg("kim@corp.example", "promo@ads.example"))
+        self.addCleanup(st.close)
+        row = st.db.execute(
+            "SELECT action_source_id, action_strength, action_has_deadline "
+            "FROM thread_state WHERE thread_id=?", (self.tid,)).fetchone()
+        self.assertEqual(tuple(row), (0, "", 0))
+
+    def test_unrelated_thread_untouched_and_version_recorded(self):
+        st0 = Store(self.path, [ME], ["김도현"], noise=self.cfg)
+        st0.ingest([_rec("v9", "park@corp.example", [ME], "무관건",
+                         "2026-07-16T11:00:00", body="회신 부탁드립니다.")])
+        other = st0.db.execute(
+            "SELECT thread_id FROM messages WHERE message_id='<v9@t>'").fetchone()[0]
+        cols = ("action_source_id", "action_strength", "action_kind",
+                "action_has_deadline", "completion_after_action")
+        q = f"SELECT {','.join(cols)} FROM thread_state WHERE thread_id=?"
+        before = tuple(st0.db.execute(q, (other,)).fetchone())
+        st0.close()
+        st = Store(self.path, [ME], ["김도현"],
+                   noise=self._blocked_cfg("promo@ads.example"))
+        self.addCleanup(st.close)
+        self.assertEqual(tuple(st.db.execute(q, (other,)).fetchone()), before)
+        # 버전 두 개가 기록돼 다음 열기는 아무 일도 하지 않는다
+        keys = dict(st.db.execute(
+            "SELECT key, value FROM sync_state WHERE key LIKE '%_version'"))
+        self.assertEqual(set(keys), {"feature_version", "action_version"})
+
+    def test_allowlist_change_triggers_nothing(self):
+        # external_allowlist 는 fold 가 아니라 질의 시점(actions.evaluate)에만
+        # 쓰인다 → 어느 버전에도 없어야 한다(백필·재접기 모두 불필요)
+        st0 = Store(self.path, [ME], ["김도현"], noise=self.cfg)
+        v0 = dict(st0.db.execute(
+            "SELECT key, value FROM sync_state WHERE key LIKE '%_version'"))
+        st0.close()
+        cfg2 = Config(home=self.home, my_addresses=[ME], my_names=["김도현"],
+                      internal_domains=["corp.example"],
+                      raw={"filters": {"external_allowlist": ["partner.example"]}})
+        st = Store(self.path, [ME], ["김도현"], noise=cfg2)
+        self.addCleanup(st.close)
+        self.assertEqual(dict(st.db.execute(
+            "SELECT key, value FROM sync_state WHERE key LIKE '%_version'")), v0)
 
 
 class TestActionLadder(unittest.TestCase):
@@ -5410,7 +5539,7 @@ class TestSignalDismiss(unittest.TestCase):
         tid = self._seed()
         self.store.dismiss_signal(tid, "action")
         path = self.store.db_path
-        self.store.db.execute("DELETE FROM sync_state WHERE key='derived_version'")
+        self.store.db.execute("DELETE FROM sync_state WHERE key='feature_version'")
         self.store.db.commit()
         self.store.close()
         self.store = Store(path, [ME], ["김도현"], noise=self.cfg)  # 백필 재구축
