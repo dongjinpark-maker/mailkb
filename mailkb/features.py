@@ -1,4 +1,8 @@
-"""Stable message features computed once during ingestion."""
+"""수집 시 한 번 계산하는 메시지 신호 — 본문만 보는 순수 함수(설정 무관).
+
+정규식이 수집 쓰기 트랜잭션 안에서 돈다(store._insert) — 느려지면 sync 가 락을 쥔
+채 멈춘다. 저장 비트는 review 개입 큐의 게이트라, 낡으면 조용한 신호 누락이 된다.
+"""
 
 from __future__ import annotations
 
@@ -7,9 +11,11 @@ import re
 from .clean import strip_preserved
 
 
-# Bump when the derived schema or a rule changes so local rows rebuild once.
+# 규칙·파생 스키마를 바꾸면 올린다 → 기존 DB 1회 백필. clean.strip_preserved 도 포함.
 FEATURE_VERSION = "1"
 
+# "까지"는 시간어가 선행해야 기한 — "현재까지 진행중" 류 배제. 줄 전체를 감싸는
+# lazy 래퍼([^\n]*?…[^\n]*)는 수만 자 본문에서 백트래킹 폭발 → 금지.
 _TIME_WORD = (
     r"(?:오늘|금일|내일|명일|익일|모레|이번\s*주|금주|다음\s*주|차주|내주|주말|월말|"
     r"(?:월|화|수|목|금|토|일)요일|오전|오후|아침|저녁|자정|정오|"
@@ -22,6 +28,7 @@ DEADLINE_RX = re.compile(
     re.IGNORECASE,
 )
 
+# 요청 앵커드 — "승인 올리겠습니다" 류 서술이 안 잡히게 승인류 뒤에 부탁/요청이 와야.
 DECISION_RX = re.compile(
     r"("
     r"(승인|결재|재가|컨펌|approve|confirm)\s*(을|를|해)?\s*"
@@ -34,6 +41,8 @@ DECISION_RX = re.compile(
     r")"
 )
 
+# '바랍/주세요'는 행동 동사 뒤에서만 — "참고 바랍니다"(FYI)·종결 인사 오탐 방지.
+# (report.REQUEST_RX 는 '증발한 요청' 전용의 더 좁은 별개 정의 — 합치지 말 것)
 REQUEST_RX = re.compile(
     r"("
     r"(회신|답변|답장|검토|의견|판단|결정|승인|재가|컨펌|처리|확답)"
@@ -50,7 +59,11 @@ REQUEST_RX = re.compile(
 
 
 def classify_content(content: str) -> tuple[int, int, int, int]:
-    """Return deadline/decision/request/question flags for authored content."""
+    """(기한, 결정, 요청, 질문) — 보존 인용(mid-join) 뺀 신규 작성분만.
+
+    review 가 같은 strip_preserved 본문에 정규식을 다시 돌린다(비트=게이트) —
+    두 변환이 어긋나면 신호가 조용히 빠진다.
+    """
     body = strip_preserved(content or "")
     return (
         int(bool(DEADLINE_RX.search(body))),

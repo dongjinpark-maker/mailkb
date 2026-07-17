@@ -3314,7 +3314,11 @@ class _Handler(BaseHTTPRequestHandler):
         좌측은 상단 메뉴 콘텐츠(홈/메일함/스레드/검색/기록), 우측은
         스레드·메일 상세를 여는 읽기 영역. 데일리도 좌측 메뉴라 우측 기본은
         데일리가 아니라 안내 문구(이전엔 우측 기본이 데일리라 데일리 메뉴가
-        좌우 중복이 됐음)."""
+        좌우 중복이 됐음).
+
+        예외 — `/thread/N` 전체 로드(F5·북마크)의 좌측은 홈이 아니라 스레드 목록.
+        app.js 의 `leftCur` 부트스트랩과 짝을 맞출 것(어긋나면 표시 최신화가 왼쪽을
+        딴 화면으로 바꿔치기)."""
         if pane == "left":
             return inner, _READING_HINT
         if path.startswith("/thread/"):
