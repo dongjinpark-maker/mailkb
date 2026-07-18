@@ -205,6 +205,18 @@ table.settbl input, table.settbl select { font-size: 13px; padding: 2px 4px; }
 .listtabs { display: flex; justify-content: space-between; align-items: baseline;
     gap: 10px; margin: 2px 0 8px; font-size: 13px; flex-wrap: wrap; }
 .listtabs .ltabs a { color: var(--accent); } .listtabs .ltabs b { color: var(--ink); }
+/* 필터 바 오른쪽 (i) 키보드 도움말 — 순수 CSS 호버/포커스 팝오버 */
+.kbdhelp { position: relative; color: var(--ink-3); cursor: help; flex: none;
+    font-size: 14px; line-height: 1; outline: none; }
+.kbdhelp:hover, .kbdhelp:focus { color: var(--accent); }
+.kbdpop { display: none; position: absolute; right: 0; top: 130%; z-index: 20;
+    white-space: nowrap; background: var(--surface); color: var(--ink-2);
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 11px;
+    font-size: 12.5px; line-height: 1.7; box-shadow: 0 2px 10px rgba(0,0,0,.14);
+    text-align: left; font-weight: 400; }
+.kbdpop b { color: var(--ink); }
+.kbdhelp:hover .kbdpop, .kbdhelp:focus .kbdpop, .kbdhelp:focus-within .kbdpop {
+    display: block; }
 .backlink { font-size: 13px; }
 /* 플래그 버튼: 다른 버튼과 같은 박스(패딩·높이), 글리프만 조금 크게 */
 button.iconbtn { font-size: 15px; padding: 6px 12px; }
@@ -1695,6 +1707,42 @@ _APP_JS = r"""
       : (el.querySelector ? el.querySelector("a[href^='/']") : null);
     if (a) a.click();                   /* 위임 클릭 핸들러가 load + 낙관적 읽음까지 처리 */
   }
+  /* ---- 목록 단축키(x 신호 · f 플래그 · h 숨김): 서버가 상태 토글, 결과 토큰으로
+     상태명 토스트 + 좌측 목록 갱신 후 커서 복원(살아있으면 머무름, 사라졌으면 다음 행) ---- */
+  function tokenToast(tok) {
+    return { "flag:on": "🚩 플래그", "flag:off": "플래그 해제",
+             "hide:on": "🙈 숨김", "hide:off": "숨김 해제",
+             "signal:off": "신호 껐어요 · 새 요청 오면 자동 복귀",
+             "signal:on": "신호 복원", "signal:none": "끌 신호 없음" }[tok] || "";
+  }
+  function restoreKbd(tid, i) {
+    var rows = navRows(); if (!rows.length) return;
+    var el = left ? left.querySelector("a[href*='/thread/" + tid + "']") : null;
+    var row = el && el.closest ? el.closest(".mrow, .item, .digest") : null;
+    var j = (row && rows.indexOf(row) >= 0) ? rows.indexOf(row)   /* 남았으면 그 행 */
+          : Math.max(0, Math.min(i, rows.length - 1));            /* 사라졌으면 다음(끝이면 이전) */
+    for (var a = 0; a < rows.length; a++) rows[a].classList.remove("kbd");
+    rows[j].classList.add("kbd");
+    if (rows[j].scrollIntoView) rows[j].scrollIntoView({ block: "nearest" });
+  }
+  function toggleRow(kind) {
+    var rows = navRows(); if (!rows.length) return false;
+    var i = curIdx(rows); if (i < 0) return false;   /* 커서/열린 항목 없으면 무동작 */
+    var a = rows[i].querySelector("a[href^='/thread/']");
+    var m = a && a.getAttribute("href").match(/\/thread\/(\d+)/);
+    if (!m) return false;
+    var tid = m[1];
+    fetch("/thread/" + tid + "/" + kind + "-toggle",
+          { method: "POST", headers: { "X-Requested-With": "fetch" } })
+      .then(function (r) { return r.text(); })
+      .then(function (tok) {
+        toast(tokenToast(tok));
+        var cur = leftCur || (location.pathname + (location.search || ""));
+        load(cur, "left", false).then(function () { restoreKbd(tid, i); })
+          .catch(function () {});
+      }).catch(function () {});
+    return true;
+  }
   document.addEventListener("keydown", function (e) {
     if (e.ctrlKey || e.metaKey || e.altKey) return;
     var t = e.target;
@@ -1714,21 +1762,12 @@ _APP_JS = r"""
       rows = navRows(); if (!rows.length) return;
       e.preventDefault(); i = curIdx(rows);
       focusRow(rows, i < 0 ? rows.length - 1 : Math.max(i - 1, 0));
-    } else if (k === "s") {        /* 's' → 선택 행의 신호 끄기(전체) — 목록에서 바로 */
-      rows = navRows(); if (!rows.length) return;
-      i = curIdx(rows); if (i < 0) return;         /* 커서/열린 항목 없으면 무동작 */
-      var sa = rows[i].querySelector("a[href^='/thread/']");
-      var sm = sa && sa.getAttribute("href").match(/\/thread\/(\d+)/);
-      if (!sm) return;
-      e.preventDefault();
-      fetch("/thread/" + sm[1] + "/signal-off", {
-        method: "POST",
-        headers: { "X-Requested-With": "fetch",
-                   "Content-Type": "application/x-www-form-urlencoded" },
-        body: "kind=action", redirect: "manual"    /* 303 안 따라감 — DB 처리만 */
-      }).then(function () { toast("신호 껐어요 · 새 요청 오면 자동 복귀");
-                            refreshDisplay(); })    /* 좌측 목록 in-place 갱신 */
-        .catch(function () {});
+    } else if (k === "x") {        /* 신호 토글(끄기/복원) */
+      if (toggleRow("signal")) e.preventDefault();
+    } else if (k === "f") {        /* 플래그 토글 */
+      if (toggleRow("flag")) e.preventDefault();
+    } else if (k === "h") {        /* 숨김 토글 */
+      if (toggleRow("hide")) e.preventDefault();
     }
   });
 
@@ -2195,10 +2234,14 @@ def _list_filter_bar(base: str, active: str, counts: dict) -> str:
         else:
             href = base + (f"?{key}=1" if key else "")
             parts.append(f"<a href='{href}'>{esc(lbl)}</a>")
-    # j/k 키보드 이동은 유지하되 안내 문구는 감춤(app.js 가 동작 담당).
+    # 오른쪽 끝 (i) — 키보드 단축키 안내(순수 CSS 호버/포커스 팝오버, CSP 준수).
+    help = ("<span class='kbdhelp' tabindex='0' aria-label='키보드 단축키'>ⓘ"
+            "<span class='kbdpop'>"
+            "<b>키보드</b><br>j / k 이동<br>x 신호 끄기·복원<br>"
+            "f 플래그<br>h 숨김<br>/ 검색</span></span>")
     return ("<div class='listtabs'><span class='ltabs'>"
             + " · ".join(parts)
-            + "</span></div>")
+            + "</span>" + help + "</div>")
 
 
 # 노이즈는 설정 의존이라 DB에 고정하지 않는다. 설정이 같으면 새 rowid 이후만 분류하고,
@@ -3658,6 +3701,33 @@ def render_records(store, cfg, qs, today: str) -> str:
 
 # ─────────────────────────────────────────────────── 조작(POST) 동작
 
+def _toggle_thread(store, cfg, tid: int, kind: str) -> str:
+    """목록 단축키(x/f/h)용 상태 토글 — DB 현재값을 뒤집고 결과 토큰을 돌려준다.
+    버튼(flag/unflag·hide/unhide·signal-off/-on)과 달리 클라이언트가 상태를 몰라도
+    되게 서버가 판정한다. 토큰(예: 'flag:on')을 app.js 가 상태명 토스트로 매핑."""
+    if kind == "flag":
+        cur = store.thread(tid)
+        on = not (cur and cur["flagged"])
+        store.set_flag(tid, on)
+        return "flag:on" if on else "flag:off"
+    if kind == "hide":
+        cur = store.thread(tid)
+        on = not (cur and cur["hidden"])
+        store.hide_thread(tid, on)
+        return "hide:on" if on else "hide:off"
+    if kind == "signal":
+        # 단일 스레드 판정(=_signal_chips 와 동일). 해제됨이면 복원, 활성이면 끄기.
+        a = actions.evaluate_thread(store, cfg, tid)
+        if "user_dismissed" in a.reasons:
+            store.restore_signal(tid)
+            return "signal:on"
+        if a.level != actions.NONE:
+            store.dismiss_signal(tid, "action")
+            return "signal:off"
+        return "signal:none"                 # 끌 신호 없음
+    return ""
+
+
 def perform_action(store, cfg, path: str, form: dict) -> str:
     """상태 변경 동작 실행 → 리다이렉트할 위치(?msg= 포함) 반환. 소켓 무관(테스트 대상).
 
@@ -4035,6 +4105,16 @@ class _Handler(BaseHTTPRequestHandler):
         today = date.today().isoformat()
         store = Store(self.cfg.db_path, self.cfg.my_addresses, self.cfg.my_names, noise=self.cfg)
         try:
+            tog = re.match(r"^/thread/(\d+)/(flag|hide|signal)-toggle$", path)
+            if tog:                                   # 목록 단축키(x/f/h) — 상태 토큰 200
+                token = _toggle_thread(store, self.cfg, int(tog.group(1)), tog.group(2))
+                body = token.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return                                # finally 가 store.close()
             if path == "/review":                     # 데일리 생성(백그라운드)
                 ai = bool((form.get("ai") or [""])[0])
                 _start_review(self.cfg, ai, today)

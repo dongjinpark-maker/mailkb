@@ -3980,7 +3980,11 @@ class TestWeb(unittest.TestCase):
                         "🚩 플래그", "🙈 숨김"):
                 self.assertIn(lbl, out)
             self.assertNotIn("추적제외", out)
-            self.assertNotIn("j/k 이동", out)   # 동작은 유지, 안내 문구는 숨김
+            # 오른쪽 끝 (i) 키보드 도움말 — 기본은 CSS 로 숨김(호버/포커스 시 노출)
+            self.assertIn("class='kbdhelp'", out)
+            self.assertIn("x 신호", out)        # 팝오버 내용
+        self.assertIn(".kbdpop", self.web._CSS)          # 도움말 팝오버 스타일
+        self.assertIn("display: none", self.web._CSS)
         # 메일함 설명문 삭제 · 스레드 미답변 제거
         self.assertNotIn("노이즈 제외 수신 메일", self.web.render_mail(self.store, self.cfg))
         self.assertNotIn("미답변", self.web.render_threads(self.store, self.cfg))
@@ -4163,13 +4167,17 @@ class TestWeb(unittest.TestCase):
         # 스레드 상태 변경(플래그·숨김·신호 해제/복원) 시 왼쪽 목록 즉시 갱신
         self.assertIn("flag|unflag|hide|unhide|signal-off|signal-on", js)
 
-    def test_appjs_s_key_dismisses_signal(self):
-        # 's' 키 = 선택 행의 신호 끄기(j/k 와 같은 커서 기준). 서버 변경 없이 기존
-        # /thread/N/signal-off(kind=action) 엔드포인트를 호출한다.
+    def test_appjs_xfh_toggle_keys(self):
+        # x 신호 · f 플래그 · h 숨김 = 선택 행 상태 토글(j/k 커서 기준).
+        # 서버 -toggle 엔드포인트 호출 + 커서 복원(restoreKbd).
         js = self.web._APP_JS
-        self.assertIn('k === "s"', js)                  # 's' 분기 존재
-        self.assertIn("/signal-off", js)               # 신호 끄기 엔드포인트 호출
-        self.assertIn("kind=action", js)               # 전체 신호 끄기
+        self.assertNotIn('k === "s"', js)              # 구 's' 분기 제거
+        self.assertIn('k === "x"', js)
+        self.assertIn('k === "f"', js)
+        self.assertIn('k === "h"', js)
+        self.assertIn('"-toggle"', js)                 # /thread/N/<kind>-toggle 호출
+        self.assertIn("restoreKbd", js)                # 커서 복원(머무름/다음 행)
+        self.assertIn("tokenToast", js)                # 상태명 토스트 매핑
 
     def test_nav_active_underline(self):
         # 현재 위치한 최상위 메뉴에 밑줄(active) 표시
@@ -6041,6 +6049,42 @@ class TestSignalDismiss(unittest.TestCase):
                            f"/thread/{tid}/signal-on", {})
         self.assertIn("↩ 회신 필요",
                       web.render_thread(self.store, self.cfg, tid))
+
+    def test_toggle_signal_flip(self):
+        # x 키용 서버 토글: 활성→off(해제), 다시 누르면 on(복원)
+        tid = self._seed()
+        self.assertEqual(web._toggle_thread(self.store, self.cfg, tid, "signal"),
+                         "signal:off")
+        self.assertEqual(
+            actions.evaluate_thread(self.store, self.cfg, tid).reasons,
+            ["user_dismissed"])
+        self.assertEqual(web._toggle_thread(self.store, self.cfg, tid, "signal"),
+                         "signal:on")
+        self.assertEqual(
+            actions.evaluate_thread(self.store, self.cfg, tid).level, "required")
+
+    def test_toggle_signal_none_when_no_action(self):
+        self.store.ingest([self._r("n1", "kim@corp.example", "공유건",
+                                   "자료 공유드립니다.", "2026-07-15T09:00:00")])
+        tid = self.store.db.execute(
+            "SELECT thread_id FROM messages WHERE message_id='<n1@t>'").fetchone()[0]
+        self.assertEqual(web._toggle_thread(self.store, self.cfg, tid, "signal"),
+                         "signal:none")
+
+    def test_toggle_flag_and_hide_flip(self):
+        tid = self._seed()
+        self.assertEqual(web._toggle_thread(self.store, self.cfg, tid, "flag"),
+                         "flag:on")
+        self.assertEqual(self.store.thread(tid)["flagged"], 1)
+        self.assertEqual(web._toggle_thread(self.store, self.cfg, tid, "flag"),
+                         "flag:off")
+        self.assertEqual(self.store.thread(tid)["flagged"], 0)
+        self.assertEqual(web._toggle_thread(self.store, self.cfg, tid, "hide"),
+                         "hide:on")
+        self.assertEqual(self.store.thread(tid)["hidden"], 1)
+        self.assertEqual(web._toggle_thread(self.store, self.cfg, tid, "hide"),
+                         "hide:off")
+        self.assertEqual(self.store.thread(tid)["hidden"], 0)
 
 
 class TestNoisePolicy(unittest.TestCase):
