@@ -259,18 +259,25 @@ h1 { font-size: 20px; } h2 { font-size: 17px; margin-top: 22px; }
 .dcard ul { margin: 6px 0; padding-left: 18px; }
 .dcard li { margin: 4px 0; line-height: 1.5; }
 .dcard p { color: var(--ink-2); line-height: 1.6; }
-.wcloud { display: flex; flex-wrap: wrap; gap: 3px 12px; align-items: baseline;
-    line-height: 2; padding: 4px 0 2px; }
-.wcloud .wc { white-space: nowrap; }
-.wcloud .wc.hi { color: var(--ink); font-weight: 700; }
-.wcloud .wc.mid { color: var(--ink-2); }
-.wcloud .wc.lo { color: var(--ink-3); }
+.wcloud { display: flex; flex-wrap: wrap; gap: 6px 7px; align-items: center;
+    padding: 6px 0 2px; }
+.wcloud .wc { display: inline-block; padding: 2px 9px; border-radius: 999px;
+    background: var(--surface-3); color: var(--ink-2); line-height: 1.35;
+    white-space: nowrap; }
+.wcloud .wc.hi { background: var(--sel-bg); color: var(--accent-strong);
+    font-weight: 600; }
+.wcloud .wc.mid { color: var(--ink); }
+.wcloud .wc.lo { background: var(--surface-2); color: var(--ink-3); }
 .wcloud .wc:hover { color: var(--accent); }
-.dcard.aidoss { background: var(--sel-bg); border-color: var(--splitter); }
+.dcap { color: var(--ink-3); font-size: 12px; margin: 6px 0 0; }
+.dcard.aidoss { background: var(--sel-bg); border-color: var(--splitter);
+    border-left: 3px solid var(--accent); }
 .dcard.aidoss .aitag { font-size: 11px; font-weight: 600; color: var(--accent);
     border: 1px solid var(--splitter); border-radius: 4px; padding: 0 5px;
     vertical-align: 2px; }
-.dcard .dsec { font-weight: 700; color: var(--ink-2); margin: 8px 0 2px; font-size: 13px; }
+.dcard .dsec { font-weight: 700; color: var(--ink-2); margin: 10px 0 2px;
+    font-size: 12px; letter-spacing: .02em; }
+.dcard .dsec:first-of-type { margin-top: 4px; }
 .dcard .dclaim { color: var(--ink); line-height: 1.55; margin: 2px 0; }
 .prow .prole { color: var(--ink-3); font-size: 12.5px; font-weight: 400;
     margin-left: 6px; }
@@ -2904,20 +2911,21 @@ def render_people_page(store, cfg) -> str:
 
 
 def _wordcloud_html(words, n_mails: int) -> str:
-    """빈도 태그 클라우드 — 글자 크기(연속)와 농도(3단계)로 직관화. 단어가 여러
-    스레드에 걸쳐 v1 은 단어별 근거 링크 없이 발신 통수만 표기한다."""
+    """빈도 태그 클라우드(키워드 칩) — 크기·농도로 빈도를 직관화. 빈도 폭이 좁거나
+    균일하면 중간값으로 두어 납작해지지 않게 한다. 단어별 근거 링크는 여러 스레드에
+    걸쳐 v1 생략, 발신 통수만 표기."""
     counts = [c for _, c in words]
     lo, hi = min(counts), max(counts)
-    span = (hi - lo) or 1
+    span = hi - lo
     tags = []
     for w, c in words:
-        r = (c - lo) / span                       # 0..1
-        size = round(13 + r * 13)                 # 13..26px
+        r = 0.5 if span == 0 else (c - lo) / span   # 0..1 (균일하면 중간)
+        size = round(14 + r * 12)                   # 14..26px (읽히는 하한)
         tier = "hi" if r >= 0.66 else ("mid" if r >= 0.33 else "lo")
         tags.append(f"<span class='wc {tier}' style='font-size:{size}px' "
                     f"title='{c}회'>{esc(w)}</span>")
     return (f"<div class='wcloud'>{' '.join(tags)}</div>"
-            f"<p class='dim'>발신 {n_mails}통 기준 · 인용·상투어 제외</p>")
+            f"<p class='dcap'>발신 {n_mails}통 기준 · 인용·상투어 제외</p>")
 
 
 def _dossier_ai_card(dz) -> str:
@@ -2933,7 +2941,7 @@ def _dossier_ai_card(dz) -> str:
     upd = (dz["updated"] or "")[:10]
     return ("<div class='dcard aidoss'><h2>요약 <span class='aitag'>AI 추정</span></h2>"
             + "".join(body)
-            + f"<p class='dim'>{esc(upd)} 갱신 · 근거 #스레드로 확인</p></div>")
+            + f"<p class='dcap'>{esc(upd)} 갱신 · 근거는 #스레드로 확인</p></div>")
 
 
 def render_dossier(store, cfg, addr: str) -> str:
