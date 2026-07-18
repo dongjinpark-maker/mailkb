@@ -1249,6 +1249,56 @@ class Store:
             (addr, like, like, limit),
         ).fetchall()
 
+    def person_thread_ids(self, addr: str) -> set[int]:
+        """이 주소가 참여한 스레드 id 집합(양방향). 이름 매칭 카드의 동명이인
+        방지용 — 이름이 같아도 이 사람과 실제 오간 스레드로 교집합한다."""
+        addr = (addr or "").lower()
+        like = f"%;{addr};%"
+        return {r["thread_id"] for r in self.db.execute(
+            """SELECT DISTINCT thread_id FROM messages
+               WHERE sender_addr = ?
+                  OR (is_sent = 1 AND (
+                       (';' || to_addrs || ';') LIKE ?
+                       OR (';' || cc_addrs || ';') LIKE ?))""",
+            (addr, like, like))}
+
+    def person_window_counts(self, window_weeks: int = 13) -> list[dict]:
+        """최근 window_weeks 주 창 안 addr별 (recv, sent, last_seen) 집계 —
+        인물 랜딩 순위 재료. 창은 DB 최신 메일(asof) 기준 상대(결정론·테스트 안정).
+        점수 공식은 report._intensity 로 분리 — 여기선 원자료만 만든다."""
+        row = self.db.execute(
+            "SELECT MAX(sent_on) m FROM messages WHERE sent_on != ''").fetchone()
+        if not row or not row["m"]:
+            return []
+        since = self.db.execute(
+            "SELECT date(?, ?)", (row["m"], f"-{window_weeks * 7} days")
+        ).fetchone()[0]
+        agg: dict[str, list] = {}   # addr -> [recv, sent, last_seen]
+        for r in self.db.execute(
+                "SELECT sender_addr, sent_on FROM messages "
+                "WHERE is_sent=0 AND sent_on >= ?", (since,)):
+            a = (r["sender_addr"] or "").lower()
+            if not a or a in self.my_addresses:
+                continue
+            e = agg.setdefault(a, [0, 0, ""])
+            e[0] += 1
+            e[2] = max(e[2], r["sent_on"])
+        for r in self.db.execute(
+                "SELECT to_addrs, sent_on FROM messages "
+                "WHERE is_sent=1 AND sent_on >= ?", (since,)):
+            for a in (r["to_addrs"] or "").split(";"):
+                a = a.strip().lower()
+                if not a or a in self.my_addresses:
+                    continue
+                e = agg.setdefault(a, [0, 0, ""])
+                e[1] += 1
+                e[2] = max(e[2], r["sent_on"])
+        names = {r["addr"]: r["name"] for r in
+                 self.db.execute("SELECT addr, name FROM people") if r["name"]}
+        return [{"addr": a, "name": names.get(a, ""),
+                 "recv": v[0], "sent": v[1], "last_seen": v[2]}
+                for a, v in agg.items()]
+
     def person_name(self, addr: str) -> str:
         """이 주소의 표시 이름(people 우선, 없으면 메일 발신명). 없으면 ''."""
         addr = (addr or "").lower()
@@ -1378,6 +1428,46 @@ class Store:
                VALUES (?,?,?,?,?,?,datetime('now'))""",
             (date_iso, kind, who or "", thread_id, signal or "", quote or ""))
         self.db.commit()
+
+    def person_signals(self, addr: str, name: str = "",
+                       limit: int = 20) -> list[sqlite3.Row]:
+        """이 사람의 축적된 인물 신호(역할·담당 변경 등) — 도시에 '최근 변화'.
+
+        수확이 distill_signals 에 쌓지만 읽는 곳이 없던 것을 여기서 처음 소비한다.
+        동명이인 방지: 이 addr 참여 스레드로 교집합(+ 이름 매치 보조)."""
+        tids = self.person_thread_ids(addr)
+        if not tids:
+            return []
+        marks = ",".join("?" * len(tids))
+        args = list(tids)
+        name_cond = ""
+        if name:
+            name_cond = " AND who LIKE ?"
+            args.append(f"%{name}%")
+        args.append(limit)
+        return self.db.execute(
+            f"SELECT * FROM distill_signals WHERE kind='person' "
+            f"AND thread_id IN ({marks}){name_cond} "
+            f"ORDER BY date DESC, id DESC LIMIT ?", args).fetchall()
+
+    def person_decisions(self, addr: str, name: str = "",
+                         limit: int = 20) -> list[sqlite3.Row]:
+        """이 사람이 결정자인 장기기억 항목 — 도시에 '관여한 결정'.
+
+        decider 이름 매치를 이 addr 참여 스레드로 교집합(동명이인 방지).
+        반려(rejected) 제외 — 살아있는 결정만."""
+        if not name:
+            return []
+        tids = self.person_thread_ids(addr)
+        if not tids:
+            return []
+        marks = ",".join("?" * len(tids))
+        args = [f"%{name}%", *tids, limit]
+        return self.db.execute(
+            f"SELECT * FROM decisions WHERE decider LIKE ? "
+            f"AND status IN ('candidate','confirmed') "
+            f"AND thread_id IN ({marks}) "
+            f"ORDER BY decided_on DESC, id DESC LIMIT ?", args).fetchall()
 
     # ------------------------------------------ 본문 HTML 수명주기 (이미지 프룬)
     # docs/PROPOSAL-images.md: retain_days 경과 시 표시용 HTML 을 텍스트 수준으로

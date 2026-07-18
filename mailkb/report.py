@@ -382,6 +382,80 @@ def sig_volume(d: dict, days: int) -> dict:
             "days": days}
 
 
+# ------------------------------------------------------------ 인물 도시에 (v1)
+# 랜딩 순위 = 교류 강도. 데이터 수집(store.person_window_counts)과 점수 공식
+# (_intensity)을 분리 — 정렬 기준을 바꾸려면 _intensity 한 곳만 고친다.
+
+def _intensity(recv: int, sent: int, last_seen: str, today: str) -> float:
+    """교류 강도 — v1: 수신 빈도 위주(사용자 지정). 최근성·상호성 가중 등으로
+    튜닝하려면 이 순수 함수만 교체한다. last_seen/today 는 향후 최근성 가중용."""
+    return recv * 1.0 + sent * 0.5
+
+
+def rank_people(store, cfg, window_weeks: int = 13, limit: int = 50) -> list[dict]:
+    """인물 랜딩 — 최근 window_weeks 주 교류 강도순. 봇·자동발송(ignore/blocked)만
+    제외하고 외부 협력사는 남긴다(도시에 대상). 각 원소: addr·name·recv·sent·
+    last_seen·score."""
+    rows = store.person_window_counts(window_weeks)
+    today = max((r["last_seen"] for r in rows), default="")
+    out = []
+    for r in rows:
+        if cfg.is_noise_sender_hard(r["addr"]):
+            continue
+        score = _intensity(r["recv"], r["sent"], r["last_seen"], today)
+        if score <= 0:
+            continue
+        out.append({**r, "score": score})
+    out.sort(key=lambda x: (-x["score"], x["addr"]))
+    return out[:limit]
+
+
+def _addr_in_to(m: dict, addr: str) -> bool:
+    """내 발신 메일 m 의 To 에 addr 가 있나 (load 는 cc_addrs 를 안 싣는다)."""
+    return addr in {a.strip().lower()
+                    for a in (m.get("to_addrs") or "").split(";") if a.strip()}
+
+
+def person_metrics(store, cfg, addr: str, weeks: int = 13) -> dict | None:
+    """단일 인물의 결정론 지표 — 관계 수치·진행중·미결(내 대기). 전원 대상
+    report.load 를 한 번 로드해 이 addr 로 좁힌다(→ /stats 수치와 정의상 일치)."""
+    extra_me = {a.lower() for a in getattr(cfg, "my_addresses", []) or []}
+    extra_me |= {str(a).lower()
+                 for a in (cfg.opt("report", "extra_me", default=[]) or [])}
+    d = load(store.db, weeks, extra_me)
+    if d is None:
+        return None
+    addr = addr.lower()
+    pthreads: set[int] = set()
+    recv = sent = 0
+    last = ""
+    for tid, ms in d["threads"].items():
+        here = False
+        for m in ms:
+            if (m["sender_addr"] or "").lower() == addr:
+                here = True
+                recv += 1
+                last = max(last, m["sent_on"])
+            elif m["is_sent"] and _addr_in_to(m, addr):
+                here = True
+                sent += 1
+                last = max(last, m["sent_on"])
+        if here:
+            pthreads.add(tid)
+    mine = [p[2] for p in _reply_pairs(d) if p[0] == addr]    # 내가 이 사람에게 답한 시간
+    theirs = [p[2] for p in _their_pairs(d) if p[0] == addr]  # 이 사람이 내게 답한 시간
+    return {
+        "addr": addr, "recv": recv, "sent": sent, "last_seen": last,
+        "my_median_h": statistics.median(mine) if mine else None,
+        "their_median_h": statistics.median(theirs) if theirs else None,
+        "pingpong": [pp for pp in sig_pingpong(d, cfg)
+                     if pp["thread_id"] in pthreads],
+        "waiting": [ev for ev in sig_evaporated(d)
+                    if ev["thread_id"] in pthreads],
+        "asof": d["asof"], "weeks": d["n_weeks"],
+    }
+
+
 def sig_offhours(d: dict) -> dict:
     """§4 주별 야간·주말 발신 비율."""
     tot = [0] * d["n_weeks"]

@@ -13,7 +13,7 @@ from urllib.parse import unquote as urllib_unquote
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from mailkb import actions, distill, notes, review, web
+from mailkb import actions, distill, notes, report, review, web
 from mailkb import search as search_mod
 from mailkb.features import classify_message
 from mailkb.clean import (
@@ -1878,6 +1878,110 @@ class TestDailyRender(unittest.TestCase):
         self.assertIn("- 내 회신으로 종결된 요청 (1건): [#4] D요청", md)
 
 
+class TestPeopleDossier(unittest.TestCase):
+    """인물 도시에 v1 — 교류 강도 순위·5카드·동명이인 스코프."""
+
+    KIM, LEE, JIRA = "kim@corp.example", "lee@corp.example", "jira@corp.example"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.cfg = Config(home=self.home, my_addresses=[ME], my_names=["김도현"],
+                          internal_domains=["corp.example"], ignore_senders=["jira@"])
+        self.store = Store(self.home / "p.sqlite", [ME], ["김도현"], noise=self.cfg)
+        self.store.ingest([
+            # kim ↔ 나 : 받은 2 / 보낸 1 (마지막이 kim 요청 → 미결)
+            _rec("k1", self.KIM, [ME], "설계 검토", "2026-07-01T09:00:00", "검토 부탁드립니다."),
+            _rec("k2", ME, [self.KIM], "RE: 설계 검토", "2026-07-01T13:00:00", "의견 드립니다."),
+            _rec("k3", self.KIM, [ME], "RE: 설계 검토", "2026-07-02T09:00:00", "추가 검토 부탁드립니다."),
+            # lee ↔ 나 : 받은 1 / 보낸 2 (마지막이 내 감사 → 미결 아님)
+            _rec("l1", ME, [self.LEE], "일정 문의", "2026-07-03T09:00:00", "일정 알려주세요."),
+            _rec("l2", self.LEE, [ME], "RE: 일정 문의", "2026-07-03T15:00:00", "확인했습니다."),
+            _rec("l3", ME, [self.LEE], "RE: 일정 문의", "2026-07-04T09:00:00", "감사합니다."),
+            # jira : 노이즈 (받은 3)
+            _rec("j1", self.JIRA, [ME], "[JIRA] NPX-1", "2026-07-02T10:00:00", "이슈 갱신."),
+            _rec("j2", self.JIRA, [ME], "[JIRA] NPX-2", "2026-07-03T10:00:00", "이슈 갱신."),
+            _rec("j3", self.JIRA, [ME], "[JIRA] NPX-3", "2026-07-04T10:00:00", "이슈 갱신."),
+        ])
+        self.ktid = self._tid("k1")
+        self.ltid = self._tid("l1")
+
+    def _tid(self, mid):
+        return self.store.db.execute(
+            "SELECT thread_id FROM messages WHERE message_id=?",
+            (f"<{mid}@t>",)).fetchone()[0]
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_window_counts_excludes_me(self):
+        counts = {c["addr"]: c for c in self.store.person_window_counts()}
+        self.assertNotIn(ME, counts)                      # 내 주소 제외
+        self.assertEqual((counts[self.KIM]["recv"], counts[self.KIM]["sent"]), (2, 1))
+        self.assertEqual((counts[self.LEE]["recv"], counts[self.LEE]["sent"]), (1, 2))
+
+    def test_rank_excludes_noise_and_orders_by_intensity(self):
+        addrs = [r["addr"] for r in report.rank_people(self.store, self.cfg)]
+        self.assertNotIn(self.JIRA, addrs)                # 노이즈 발신 제외
+        self.assertNotIn(ME, addrs)
+        # kim(2+1*0.5=2.5) > lee(1+2*0.5=2.0)
+        self.assertEqual(addrs, [self.KIM, self.LEE])
+
+    def test_intensity_is_a_separable_pure_function(self):
+        self.assertEqual(report._intensity(2, 1, "", ""), 2.5)
+        # 수신 위주(사용자 지정) — 같은 총량이면 받은 쪽이 높다
+        self.assertGreater(report._intensity(3, 0, "", ""),
+                           report._intensity(0, 3, "", ""))
+
+    def test_landing_lists_ordered_with_badge(self):
+        page = web.render_people_page(self.store, self.cfg)
+        self.assertIn("<h1>인물</h1>", page)
+        self.assertIn("/people?addr=kim%40corp.example", page)
+        self.assertNotIn("jira@corp.example", page)       # 노이즈 미표시
+        self.assertLess(page.index("kim%40corp"), page.index("lee%40corp"))
+        self.assertIn("pbadge", page)                     # kim 미결 배지
+
+    def test_dossier_relationship_and_mutual_cards(self):
+        d = web.render_dossier(self.store, self.cfg, self.KIM)
+        self.assertIn("관계 수치", d)
+        self.assertIn("받은 2", d)
+        self.assertIn("보낸 1", d)
+        self.assertIn("서로의 미결", d)
+        self.assertIn("이 사람 → 나", d)                  # kim 의 열린 요청
+        self.assertRegex(d, r"/thread/\d+'>#\d+")         # 근거 링크
+
+    def test_decisions_and_signals_scoped_by_participation(self):
+        # 동명이인 방지: 이름이 같아도 이 사람 참여 스레드의 것만
+        self.store.add_decision(self.ktid, "2026-07-02", "B안 채택",
+                                decider="kim", status="confirmed")
+        self.store.add_decision(self.ltid, "2026-07-03", "남의 결정",
+                                decider="kim", status="confirmed")   # kim 미참여
+        self.store.add_signal("2026-07-02", "person", "kim", self.ktid, "ECN 담당 이관")
+        self.store.add_signal("2026-07-03", "person", "kim", self.ltid, "남의 신호")
+        dec = {r["title"] for r in self.store.person_decisions(self.KIM, "kim")}
+        sig = {r["signal"] for r in self.store.person_signals(self.KIM, "kim")}
+        self.assertEqual(dec, {"B안 채택"})
+        self.assertEqual(sig, {"ECN 담당 이관"})
+        # 도시에에 두 카드 노출 + 근거
+        d = web.render_dossier(self.store, self.cfg, self.KIM)
+        self.assertIn("관여한 결정", d)
+        self.assertIn("B안 채택", d)
+        self.assertIn("최근 변화", d)
+        self.assertIn("ECN 담당 이관", d)
+
+    def test_empty_cards_not_drawn(self):
+        d = web.render_dossier(self.store, self.cfg, self.LEE)
+        self.assertNotIn("관여한 결정", d)                # lee 결정 없음
+        self.assertNotIn("최근 변화", d)                  # lee 신호 없음
+
+    def test_route_people_landing_and_dossier(self):
+        page = web.render_people_page(self.store, self.cfg)
+        self.assertIn("교류 강도순", page)
+        # nav 에 '인물' 링크
+        self.assertIn('href="/people"', web._NAV)
+
+
 class TestDecisionRegex(unittest.TestCase):
     def test_matches_requests(self):
         for s in ["재시험 여부 판단 부탁드립니다.", "설비 가부 회신 부탁드립니다.",
@@ -3664,10 +3768,10 @@ class TestWeb(unittest.TestCase):
         self.assertIn("답장", subs)             # 보낸 것
         self.assertEqual(len(rows), 2)
 
-    def test_thread_sender_name_links_to_person(self):
-        # 참여자(수신 발신자) 이름 클릭 → 주소별 메일
+    def test_thread_sender_name_links_to_dossier(self):
+        # 참여자(수신 발신자) 이름 클릭 → 그 사람 도시에(/people, 2026-07-18 승격)
         out = self.web.render_thread(self.store, self.cfg, self.store.message("1")["thread_id"])
-        self.assertIn("<a href='/person?addr=kim%40corp.example'", out)
+        self.assertIn("<a href='/people?addr=kim%40corp.example'", out)
 
     def test_render_person_page_mailbox_style(self):
         page = self.web.render_person(self.store, self.cfg, "kim@corp.example")

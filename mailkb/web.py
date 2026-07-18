@@ -239,6 +239,26 @@ h1 { font-size: 20px; } h2 { font-size: 17px; margin-top: 22px; }
 .item .who { color: var(--ink-2); } .item .day { color: var(--ink-3); font-size: 13px; }
 .item .snip { color: var(--ink-2); font-size: 13px; display: block; margin-top: 2px; }
 .star { color: var(--accent2); font-weight: 700; }
+/* 인물 도시에 — 랜딩 목록 + 도시에 카드 */
+.plist { display: flex; flex-direction: column; margin-top: 8px; }
+.prow { display: flex; justify-content: space-between; align-items: baseline;
+    gap: 12px; padding: 8px 10px; border-bottom: 1px solid var(--border);
+    text-decoration: none; color: var(--ink); }
+.prow:hover { background: var(--hover-bg); }
+.prow .pnm { font-weight: 600; }
+.prow .pmeta { color: var(--ink-3); font-size: 13px; display: flex; gap: 10px;
+    align-items: baseline; white-space: nowrap; }
+.prow .pago { color: var(--muted); }
+.pbadge { color: var(--warn); background: var(--warn-bg);
+    border: 1px solid var(--warn-border); border-radius: 4px;
+    padding: 0 6px; font-size: 12px; }
+.dcard { background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 4px 16px 12px; margin: 12px 0; }
+.dcard h2 { font-size: 15px; margin: 12px 0 6px;
+    border-bottom: 1px solid var(--border); padding-bottom: 5px; }
+.dcard ul { margin: 6px 0; padding-left: 18px; }
+.dcard li { margin: 4px 0; line-height: 1.5; }
+.dcard p { color: var(--ink-2); line-height: 1.6; }
 .dim { color: var(--ink-3); }
 /* 홈 '지금 할 일' 배너 + 접이식 개입 + 컴팩트 렌즈 (개입 페이지 흡수) */
 .banner { background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
@@ -991,7 +1011,7 @@ def format_detail(store, cfg, thread_id: int) -> dict:
 # 바로 검색. 값은 app.js syncNavSearch 가 /search 일 때 URL 의 q 로 채운다.
 _NAV = ('<nav><a href="/">홈</a>'
         '<a href="/mail">메일함</a><a href="/threads">스레드</a>'
-        '<a href="/records">기억</a><a href="/stats">통계</a>'
+        '<a href="/people">인물</a><a href="/records">기억</a><a href="/stats">통계</a>'
         "<form class='navsearch' method='get' action='/search' role='search'>"
         "<input name='q' placeholder='🔍 검색' aria-label='검색' autocomplete='off'>"
         "</form>"
@@ -1116,7 +1136,8 @@ _APP_JS = r"""
     if (path === "/" || path === "/mail" || path === "/threads" ||
         path === "/search" || path === "/records" || path === "/daily" ||
         path === "/settings") return "left";
-    if (path === "/lens/intervene" || path === "/person") return "left";
+    if (path === "/lens/intervene" || path === "/person" ||
+        path === "/people") return "left";
     return "right";
   }
   function paneEl(p) { return p === "left" ? left : right; }
@@ -1307,7 +1328,7 @@ _APP_JS = r"""
     path = (path || "/").replace(/\/+$/, "") || "/";
     if (path === "/") return "/";
     if (path === "/daily") return "/records";   /* 구 데일리 경로 → 기억 메뉴 */
-    var tops = ["/mail", "/threads", "/search", "/records", "/stats", "/settings"];
+    var tops = ["/mail", "/threads", "/people", "/search", "/records", "/stats", "/settings"];
     for (var i = 0; i < tops.length; i++) {
       if (path === tops[i] || path.indexOf(tops[i] + "/") === 0) return tops[i];
     }
@@ -2476,10 +2497,10 @@ def render_thread(store, cfg, tid: int) -> str:
         sent = " sent" if blk["is_sent"] else ""
         arrow = "→" if blk["is_sent"] else ""
         att = f" 📎{esc(blk['attach'])}" if blk["attach"] else ""
-        # 참여자(발신자) 이름 클릭 → 그 주소와 주고받은 메일 전체(왼쪽). 내 발신은 링크 없음.
+        # 참여자(발신자) 이름 클릭 → 그 사람 도시에(왼쪽). 내 발신은 링크 없음.
         if not blk["is_sent"] and blk.get("sender_addr"):
-            who = (f"<a href='/person?addr={_q(blk['sender_addr'])}' "
-                   f"title='이 사람과 주고받은 메일'>{esc(blk['sender'])}</a>")
+            who = (f"<a href='/people?addr={_q(blk['sender_addr'])}' "
+                   f"title='이 사람 도시에'>{esc(blk['sender'])}</a>")
         else:
             who = esc(blk["sender"])
         out.append(f"<div class='msg' id='msg-{blk['id']}'>")
@@ -2793,6 +2814,152 @@ def render_person(store, cfg, addr: str) -> str:
             f"<span class='mdate'>{esc(_fmt_when(r['sent_on']))}</span></span>"
             f"<span class='msubj'>{esc(sub_who)}</span></a>")
     out.append(f"<div class='mlist'>{''.join(items)}</div>")
+    return "\n".join(out)
+
+
+# ─────────────────────────────────────────────────────────── 인물 도시에 (v1)
+# 이미 추출된 메일·액션·결정·신호를 사람 중심으로 재조립한 결정론 화면.
+# 정체성 기준 = 이메일 주소(동명이인 자동 분리). 이름 매칭 카드(결정·변화)는
+# store 가 참여 스레드로 교집합해 동명이인 오염을 막는다. 모든 항목에 근거 링크.
+
+def _days_ago(iso: str, ref: str) -> str:
+    """last_seen → 'N일 전' 상대 표기(기준 ref 대비)."""
+    if not iso:
+        return ""
+    try:
+        d0 = date.fromisoformat(iso[:10])
+        d1 = date.fromisoformat((ref or iso)[:10])
+    except ValueError:
+        return ""
+    n = (d1 - d0).days
+    if n <= 0:
+        return "오늘"
+    if n == 1:
+        return "어제"
+    if n < 14:
+        return f"{n}일 전"
+    if n < 60:
+        return f"{n // 7}주 전"
+    return f"{n // 30}개월 전"
+
+
+def render_people_page(store, cfg) -> str:
+    """'인물' 랜딩 — 최근 N개월 교류 강도순 목록. 순위는 report.rank_people
+    (계산 분리), 미결 배지는 액션 큐를 발신자별 집계."""
+    win = int(cfg.opt("dossier", "window_weeks", default=13) or 13)
+    ranked = report.rank_people(store, cfg, window_weeks=win)
+    out = ["<h1>인물</h1>",
+           f"<p class='dim'>최근 {max(1, win // 4)}개월 · 교류 강도순 · "
+           f"{len(ranked)}명</p>"]
+    if not ranked:
+        out.append("<p class='empty'>교류 기록이 없습니다 — 먼저 동기화하세요.</p>")
+        return "\n".join(out)
+    # 미결 배지 — REQUIRED 를 발신자 addr 별로 1회 집계(홈 큐 재사용)
+    open_by_addr: dict[str, int] = {}
+    for a in actions.classify_threads(store, cfg).values():
+        if a.level == actions.REQUIRED and a.sender_addr:
+            k = a.sender_addr.lower()
+            open_by_addr[k] = open_by_addr.get(k, 0) + 1
+    # 동명(표시 이름 충돌) → 도메인 접미사로 구분
+    name_counts: dict[str, int] = {}
+    for r in ranked:
+        nm = r["name"] or r["addr"]
+        name_counts[nm] = name_counts.get(nm, 0) + 1
+    now = max((r["last_seen"] for r in ranked), default="")
+    rows = []
+    for r in ranked:
+        nm = r["name"] or r["addr"]
+        label = esc(nm)
+        if name_counts.get(nm, 0) > 1:
+            label += f" <span class='dim'>({esc(r['addr'].split('@')[-1])})</span>"
+        pend = open_by_addr.get(r["addr"], 0)
+        badge = f"<span class='pbadge'>미결 {pend}</span>" if pend else ""
+        rows.append(
+            f"<a class='prow' href='/people?addr={_q(r['addr'])}'>"
+            f"<span class='pnm'>{label}</span>"
+            f"<span class='pmeta'>↓{r['recv']} ↑{r['sent']}{badge}"
+            f"<span class='pago'>{esc(_days_ago(r['last_seen'], now))}</span>"
+            f"</span></a>")
+    out.append(f"<div class='plist'>{''.join(rows)}</div>")
+    return "\n".join(out)
+
+
+def render_dossier(store, cfg, addr: str) -> str:
+    """단일 인물 도시에 — 결정론 5카드. 재료 없는 카드는 그리지 않는다."""
+    addr = (addr or "").strip().lower()
+    if not addr:
+        return "<h1>인물</h1><p class='empty'>주소가 없습니다</p>"
+    name = store.person_name(addr) or addr
+    win = int(cfg.opt("dossier", "window_weeks", default=13) or 13)
+    m = report.person_metrics(store, cfg, addr, weeks=win)
+    out = ["<div class='personhead'><a href='/people' class='backlink'>← 인물</a>"
+           f"<span class='ptitle'>{esc(name)}</span>"
+           f"<span class='pright'><a href='/person?addr={_q(addr)}'>"
+           "전체 왕래 메일 →</a></span></div>",
+           f"<p class='dim'><span class='mono'>{esc(addr)}</span></p>"]
+
+    cards: list[tuple[str, str]] = []
+
+    # 1. 관계 수치
+    if m:
+        bits = [f"최근 {max(1, win // 4)}개월 · 받은 {m['recv']} · 보낸 {m['sent']}"]
+        if m["last_seen"]:
+            bits.append("최근 접촉 " + _days_ago(m["last_seen"], m["asof"].isoformat()))
+        resp = []
+        if m["their_median_h"] is not None:
+            resp.append(f"이 사람 응답 {report._fmt_h(m['their_median_h'])}")
+        if m["my_median_h"] is not None:
+            resp.append(f"내 응답 {report._fmt_h(m['my_median_h'])}")
+        body = " · ".join(bits) + (("<br>" + " · ".join(resp)) if resp else "")
+        cards.append(("관계 수치", f"<p>{body}</p>"))
+
+    # 2. 진행 중 (왕복 잦은 스레드)
+    if m and m["pingpong"]:
+        lis = "".join(
+            f"<li>{esc(pp['subject'])} <span class='dim'>· {pp['turns']}왕복</span> "
+            f"<a href='/thread/{pp['thread_id']}'>#{pp['thread_id']}</a></li>"
+            for pp in m["pingpong"][:6])
+        cards.append(("진행 중", f"<ul>{lis}</ul>"))
+
+    # 3. 서로의 미결
+    acts = actions.classify_threads(store, cfg)
+    they_ask = [(tid, a) for tid, a in acts.items()
+                if a.level == actions.REQUIRED and (a.sender_addr or "").lower() == addr]
+    waiting = m["waiting"] if m else []
+    if they_ask or waiting:
+        lis = []
+        for tid, a in they_ask:
+            lis.append(f"<li><b>이 사람 → 나</b> {esc(a.subject or '(제목 없음)')} "
+                       f"<a href='/thread/{tid}'>#{tid}</a></li>")
+        for ev in waiting:
+            lis.append(f"<li><b>나 → 이 사람</b> {esc(ev['subject'])} "
+                       f"<span class='dim'>· {ev['days']}일 대기</span> "
+                       f"<a href='/thread/{ev['thread_id']}'>#{ev['thread_id']}</a></li>")
+        cards.append(("서로의 미결", f"<ul>{''.join(lis)}</ul>"))
+
+    # 4. 관여한 결정 (결정자=이 사람, 참여 스레드 교집합)
+    decs = store.person_decisions(addr, name)
+    if decs:
+        lis = "".join(
+            f"<li>{esc(d['title'])} "
+            f"<a href='/thread/{d['thread_id']}'>#{d['thread_id']}</a></li>"
+            for d in decs[:8])
+        cards.append(("관여한 결정", f"<ul>{lis}</ul>"))
+
+    # 5. 최근 변화 (축적된 인물 신호 — distill_signals 첫 소비처)
+    sigs = store.person_signals(addr, name)
+    if sigs:
+        lis = "".join(
+            f"<li>{esc(s['signal'])} "
+            f"<a href='/thread/{s['thread_id']}'>#{s['thread_id']}</a> "
+            f"<span class='dim'>· {esc(s['date'])}</span></li>"
+            for s in sigs[:8])
+        cards.append(("최근 변화", f"<ul>{lis}</ul>"))
+
+    if not cards:
+        out.append("<p class='empty'>아직 이 사람에 대한 도시에 재료가 없습니다.</p>")
+    for title, body in cards:
+        out.append(f"<div class='dcard'><h2>{esc(title)}</h2>{body}</div>")
     return "\n".join(out)
 
 
@@ -3405,8 +3572,14 @@ def route(store, cfg, path, qs, today):
         return "메일함", render_mail(store, cfg, _offset(qs), _list_flt(qs)), 200, "left"
     if path == "/threads":
         return "스레드", render_threads(store, cfg, _offset(qs), _list_flt(qs)), 200, "left"
+    if path == "/people":
+        # 인물 도시에. addr 있으면 그 사람 도시에, 없으면 랜딩 목록.
+        addr = (qs.get("addr") or [""])[0]
+        inner = (render_dossier(store, cfg, addr) if addr
+                 else render_people_page(store, cfg))
+        return "인물", inner, 200, "left"
     if path == "/person":
-        # 스레드에서 이름 클릭 → 주소별 메일(왼쪽 목록 프레임). 발신자 차단도 여기.
+        # 도시에의 '전체 왕래 메일 →'로 도달. 발신자 차단도 여기.
         return "주소별 메일", render_person(store, cfg, (qs.get("addr") or [""])[0]), 200, "left"
     if path == "/search":
         return "검색", render_search(store, cfg, qs, today), 200, "left"
