@@ -1717,7 +1717,7 @@ _APP_JS = r"""
   }
   function restoreKbd(tid, i) {
     var rows = navRows(); if (!rows.length) return;
-    var el = left ? left.querySelector("a[href*='/thread/" + tid + "']") : null;
+    var el = left ? left.querySelector("a[href='/thread/" + tid + "']") : null;
     var row = el && el.closest ? el.closest(".mrow, .item, .digest") : null;
     var j = (row && rows.indexOf(row) >= 0) ? rows.indexOf(row)   /* 남았으면 그 행 */
           : Math.max(0, Math.min(i, rows.length - 1));            /* 사라졌으면 다음(끝이면 이전) */
@@ -1728,7 +1728,9 @@ _APP_JS = r"""
   function toggleRow(kind) {
     var rows = navRows(); if (!rows.length) return false;
     var i = curIdx(rows); if (i < 0) return false;   /* 커서/열린 항목 없으면 무동작 */
-    var a = rows[i].querySelector("a[href^='/thread/']");
+    var row = rows[i];                                /* .mrow 는 행 자체가 <a> (focusRow 와 동일 처리) */
+    var a = (row.matches && row.matches("a[href^='/thread/']")) ? row
+          : (row.querySelector ? row.querySelector("a[href^='/thread/']") : null);
     var m = a && a.getAttribute("href").match(/\/thread\/(\d+)/);
     if (!m) return false;
     var tid = m[1];

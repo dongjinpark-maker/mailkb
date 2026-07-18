@@ -4178,6 +4178,8 @@ class TestWeb(unittest.TestCase):
         self.assertIn('"-toggle"', js)                 # /thread/N/<kind>-toggle 호출
         self.assertIn("restoreKbd", js)                # 커서 복원(머무름/다음 행)
         self.assertIn("tokenToast", js)                # 상태명 토스트 매핑
+        # .mrow 는 행 자체가 <a> — 자식만 찾으면 목록에서 무동작(회귀 가드)
+        self.assertIn("row.matches", js)
 
     def test_nav_active_underline(self):
         # 현재 위치한 최상위 메뉴에 밑줄(active) 표시
