@@ -847,14 +847,18 @@ def _cell_align(delim_cell: str) -> str:
 def _render_table(heads: list[str], aligns: list[str], rows: list[list[str]]) -> str:
     ncol = len(heads)
 
+    def _cell(val: str) -> str:
+        # 표 셀의 <br>(GFM 셀 줄바꿈 관례 — 셀 안 <pre> 를 인라인화한 결과)는 실제
+        # 줄바꿈으로 살리고, 나머지는 escape 후 인라인 마크다운 적용.
+        return "<br>".join(_mail_md_inline(esc(seg)) for seg in val.split("<br>"))
+
     def _row(cells: list[str], tag: str) -> str:
         parts = []
         for j in range(ncol):
             val = cells[j] if j < len(cells) else ""          # 부족한 셀은 빈칸
             al = aligns[j] if j < len(aligns) else ""
             sty = " style='text-align:%s'" % al if al else ""
-            parts.append("<%s%s>%s</%s>"
-                         % (tag, sty, _mail_md_inline(esc(val)), tag))
+            parts.append("<%s%s>%s</%s>" % (tag, sty, _cell(val), tag))
         return "<tr>" + "".join(parts) + "</tr>"
 
     thead = "<thead>" + _row(heads, "th") + "</thead>"

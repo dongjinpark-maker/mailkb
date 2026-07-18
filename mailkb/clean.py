@@ -125,6 +125,9 @@ class _MarkdownConverter(HTMLParser):
         self._in_pre = False
         self._pre_parts: list[str] = []
         self._pre_store: list[str] = []
+        # 데이터 표 셀 안의 <pre> 인덱스 — 멀티라인 펜스는 표 행(한 줄)을 깨므로
+        # 인라인(줄=<br>)으로 복원한다. 표 밖은 종전대로 펜스.
+        self._pre_inline: set[int] = set()
 
     def _sink(self) -> list[str]:
         return self._cell if self._cell is not None else self._out
@@ -291,8 +294,13 @@ class _MarkdownConverter(HTMLParser):
             raw = "".join(self._pre_parts).strip("\n")
             self._in_pre = False
             if raw.strip():
+                idx = len(self._pre_store)
                 self._pre_store.append(raw)
-                self._emit("\n\n\x01%d\x01\n\n" % (len(self._pre_store) - 1))
+                if self._cell is not None:        # 데이터 표 셀 안 — 한 줄 유지(인라인)
+                    self._pre_inline.add(idx)
+                    self._emit("\x01%d\x01" % idx)              # 주변 개행 없이
+                else:
+                    self._emit("\n\n\x01%d\x01\n\n" % idx)      # 표 밖 — 블록 펜스
             return
         if tag == "p" or tag in _HEADING:
             self._emit("\n\n")
@@ -382,9 +390,18 @@ class _MarkdownConverter(HTMLParser):
             if new == text:
                 break
             text = new
-        # <pre> 원문을 코드펜스로 복원 (위 공백 정리에서 들여쓰기 보호됨)
+        # <pre> 복원 — 표 밖은 코드펜스, 표 셀 안은 인라인(줄=<br>, 코드=백틱)으로
+        # 해서 표 행이 한 줄로 유지되게 한다(멀티라인 펜스는 GFM 표 셀에 못 담음).
         def _restore_pre(m):
-            return "```\n" + self._pre_store[int(m.group(1))] + "\n```"
+            idx = int(m.group(1))
+            raw = self._pre_store[idx]
+            if idx in self._pre_inline:
+                segs = []
+                for ln in raw.split("\n"):
+                    ln = ln.replace("|", "\\|")           # 표 구분자 보호
+                    segs.append("`" + ln + "`" if ln.strip() and "`" not in ln else ln)
+                return "<br>".join(segs)
+            return "```\n" + raw + "\n```"
         text = re.sub(r"\x01(\d+)\x01", _restore_pre, text)
         return text.strip()
 

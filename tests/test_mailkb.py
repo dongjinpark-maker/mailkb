@@ -1022,6 +1022,27 @@ class TestInlineImages(unittest.TestCase):
         self.assertIn("<table class='md-table'>", out)
         self.assertIn("<td>GDS</td>", out)
 
+    def test_pre_in_table_cell_does_not_break_table(self):
+        # 표 셀 안 <pre>(코드)는 멀티라인 펜스 대신 인라인(줄=<br>)으로 → 표 행이
+        # 한 줄로 유지되어 표가 깨지거나 뒤 내용이 코드박스로 새지 않는다.
+        from mailkb.clean import html_to_markdown
+        from mailkb.web import _mail_md_to_html
+        md = html_to_markdown(
+            "<table><tr><th>설명</th><th>예시</th></tr>"
+            "<tr><td>함수</td><td><pre>a = 1\nb = 2</pre></td></tr>"
+            "<tr><td>다음</td><td>끝</td></tr></table>"
+            "<pre>바깥\n코드</pre>")
+        row = [ln for ln in md.splitlines() if ln.startswith("| 함수")][0]
+        self.assertIn("<br>", row)                  # 코드 줄 구분
+        self.assertNotIn("```", row)                # 셀 안엔 펜스 없음(행 안 깨짐)
+        self.assertIn("```\n바깥\n코드\n```", md)     # 표 밖 <pre> 는 종전대로 펜스
+        out = _mail_md_to_html(md)
+        self.assertIn("<table class='md-table'>", out)
+        self.assertIn("<code>a = 1</code>", out)
+        self.assertIn("<code>b = 2</code>", out)
+        self.assertIn("<td>끝</td>", out)            # 뒤 내용이 코드박스로 안 샘
+        self.assertEqual(out.count("md-code"), 1)    # 표 밖 펜스 1개만 코드박스
+
     def test_hr_preserved_through_pipeline(self):
         # <hr> → '---' → 렌더 <hr> — 섹션 구분 가독성 보존, 서명 절단('--')과 무충돌
         from mailkb.clean import extract_new_content, html_to_markdown
