@@ -270,6 +270,33 @@ h1 { font-size: 20px; } h2 { font-size: 17px; margin-top: 22px; }
 .wcloud .wc.lo { background: var(--surface-2); color: var(--ink-3); }
 .wcloud .wc:hover { color: var(--accent); }
 .dcap { color: var(--ink-3); font-size: 12px; margin: 6px 0 0; }
+/* 관계 수치 시각화 — 자족적(팔레트 토큰만, report.CSS 불필요) */
+.relbal { display: flex; align-items: center; gap: 10px; margin: 10px 0 2px; }
+.relbal .rlbl { font-size: 13px; color: var(--ink-2); white-space: nowrap;
+    font-variant-numeric: tabular-nums; display: inline-flex; align-items: center; gap: 5px; }
+.relbal .sw { width: 8px; height: 8px; border-radius: 2px; flex: none; }
+.relbal .sw.recv { background: var(--accent); }
+.relbal .sw.sent { background: var(--accent2); }
+.relbar { flex: 1; display: flex; height: 9px; border-radius: 999px; overflow: hidden;
+    background: var(--surface-3); min-width: 60px; }
+.relseg { height: 100%; }
+.relseg.recv { background: var(--accent); }
+.relseg.sent { background: var(--accent2); }
+.rsblock { margin: 12px 0 2px; }
+.rsrow { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+.rsrow .rsname { width: 46px; font-size: 12.5px; color: var(--ink-2); flex: none; }
+.rstrack { flex: 1; height: 8px; border-radius: 999px; background: var(--surface-3);
+    overflow: hidden; }
+.rsfill { height: 100%; border-radius: 999px; background: var(--accent); }
+.rsrow .rsval { width: 44px; font-size: 12.5px; color: var(--ink-2); text-align: right;
+    flex: none; font-variant-numeric: tabular-nums; }
+.relfoot { display: flex; align-items: center; justify-content: space-between;
+    gap: 10px; margin-top: 12px; }
+.relfoot .sparkwrap { display: inline-flex; align-items: center; gap: 8px; }
+.relfoot .sparklbl { font-size: 12px; color: var(--ink-3); }
+svg.rspark { display: block; height: 22px; width: 120px; }
+.relfoot .rlast { font-size: 13px; color: var(--ink-3); white-space: nowrap;
+    font-variant-numeric: tabular-nums; }
 .dcard.aidoss { background: var(--sel-bg); border-color: var(--splitter);
     border-left: 3px solid var(--accent); }
 .dcard.aidoss .aitag { font-size: 11px; font-weight: 600; color: var(--accent);
@@ -2928,6 +2955,86 @@ def _wordcloud_html(words, n_mails: int) -> str:
             f"<p class='dcap'>발신 {n_mails}통 기준 · 인용·상투어 제외</p>")
 
 
+def _spark_svg(series, w: int = 120, h: int = 22) -> str:
+    """주별 총량 스파크라인 — 자족적 인라인 SVG polyline(팔레트 토큰 스트로크).
+    마지막 점 강조. 값이 3주 미만이거나 전부 0이면 빈 문자열."""
+    s = [max(0, int(v)) for v in (series or [])]
+    if len(s) < 3 or sum(s) == 0:
+        return ""
+    pad = 2.0
+    n = len(s)
+    mx = max(s) or 1
+    def xs(i): return pad + i * (w - 2 * pad) / (n - 1)
+    def ys(v): return h - pad - (v / mx) * (h - 2 * pad)
+    pts = " ".join(f"{xs(i):.1f},{ys(v):.1f}" for i, v in enumerate(s))
+    lx, ly = xs(n - 1), ys(s[-1])
+    return (f"<svg class='rspark' viewBox='0 0 {w} {h}' "
+            f"role='img' aria-label='주별 교신 추세'>"
+            f"<polyline points='{pts}' fill='none' stroke='var(--accent)' "
+            "stroke-width='1.6' stroke-linejoin='round' stroke-linecap='round'/>"
+            f"<circle cx='{lx:.1f}' cy='{ly:.1f}' r='2.1' fill='var(--accent)'/></svg>")
+
+
+def _relmetrics_html(m, months: int = 3) -> str:
+    """관계 수치 카드 본문 — ① 주고받기 균형 막대 ② 회신 속도 비교 ③ 주별 교신
+    스파크 + 최근 접촉. 재료 없는 요소는 생략(graceful). 관찰 가능한 사실만."""
+    recv, sent = m["recv"], m["sent"]
+    parts = []
+
+    # ① 주고받기 균형 막대 — 받은/보낸 비율. 둘 다 0이면 생략.
+    if recv + sent > 0:
+        parts.append(f"<p class='dcap' style='margin:8px 0 0'>최근 {months}개월</p>")
+        segs = ""
+        if recv:
+            segs += f"<div class='relseg recv' style='flex:{recv}'></div>"
+        if sent:
+            segs += f"<div class='relseg sent' style='flex:{sent}'></div>"
+        parts.append(
+            "<div class='relbal'>"
+            f"<span class='rlbl'><span class='sw recv'></span>받은 {recv}</span>"
+            f"<div class='relbar'>{segs}</div>"
+            f"<span class='rlbl'><span class='sw sent'></span>보낸 {sent}</span></div>")
+
+    # ② 회신 속도 비교 — 공통 스케일 막대. 둘 다 None 이면 블록 생략.
+    their, mine = m["their_median_h"], m["my_median_h"]
+    if their is not None or mine is not None:
+        mx = max(v for v in (their, mine) if v is not None) or 1
+        rows = []
+        if their is not None:
+            rows.append(
+                f"<div class='rsrow'><span class='rsname'>이 사람</span>"
+                f"<div class='rstrack'><div class='rsfill' style='width:{their / mx * 100:.0f}%'>"
+                f"</div></div><span class='rsval'>{report._fmt_h(their)}</span></div>")
+        if mine is not None:
+            rows.append(
+                f"<div class='rsrow'><span class='rsname'>나</span>"
+                f"<div class='rstrack'><div class='rsfill' style='width:{mine / mx * 100:.0f}%'>"
+                f"</div></div><span class='rsval'>{report._fmt_h(mine)}</span></div>")
+        cap = "회신까지 걸린 시간(중앙값) · 막대 길수록 느림"
+        if their is None:
+            cap = "회신까지 걸린 시간(중앙값) · 이 사람 회신 표본 없음"
+        elif mine is None:
+            cap = "회신까지 걸린 시간(중앙값) · 내 회신 표본 없음"
+        parts.append(f"<div class='rsblock'>{''.join(rows)}"
+                     f"<p class='dcap'>{cap}</p></div>")
+
+    # ③ 주별 교신 스파크 + 최근 접촉 (한 줄)
+    series = [a + b for a, b in zip(m["recv_series"], m["sent_series"])]
+    spark = _spark_svg(series)
+    last = ""
+    if m["last_seen"]:
+        last = ("최근 접촉 " + _days_ago(m["last_seen"], m["asof"].isoformat()))
+    foot = ""
+    if spark:
+        foot += f"<span class='sparkwrap'><span class='sparklbl'>주별 교신</span>{spark}</span>"
+    if last:
+        foot += f"<span class='rlast'>{last}</span>"
+    if foot:
+        parts.append(f"<div class='relfoot'>{foot}</div>")
+
+    return "".join(parts)
+
+
 def _dossier_ai_card(dz) -> str:
     """AI 요약 카드 — 캐시된 dossier_md(## 섹션 + '- [#N] 서술') 렌더. 각 줄에
     근거 스레드 링크, 하단에 갱신일·추정 안내. 근거 검증은 생성 시(distill) 완료."""
@@ -2966,18 +3073,11 @@ def render_dossier(store, cfg, addr: str) -> str:
 
     cards: list[tuple[str, str]] = []
 
-    # 1. 관계 수치
+    # 1. 관계 수치 — 시각화(균형 막대·회신 비교·주별 스파크). 재료 있을 때만.
     if m:
-        bits = [f"최근 {max(1, win // 4)}개월 · 받은 {m['recv']} · 보낸 {m['sent']}"]
-        if m["last_seen"]:
-            bits.append("최근 접촉 " + _days_ago(m["last_seen"], m["asof"].isoformat()))
-        resp = []
-        if m["their_median_h"] is not None:
-            resp.append(f"이 사람 응답 {report._fmt_h(m['their_median_h'])}")
-        if m["my_median_h"] is not None:
-            resp.append(f"내 응답 {report._fmt_h(m['my_median_h'])}")
-        body = " · ".join(bits) + (("<br>" + " · ".join(resp)) if resp else "")
-        cards.append(("관계 수치", f"<p>{body}</p>"))
+        viz = _relmetrics_html(m, months=max(1, win // 4))
+        if viz:
+            cards.append(("관계 수치", viz))
 
     # 2. 진행 중 (왕복 잦은 스레드)
     if m and m["pingpong"]:

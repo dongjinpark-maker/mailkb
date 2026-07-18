@@ -426,6 +426,9 @@ def person_metrics(store, cfg, addr: str, weeks: int = 13) -> dict | None:
     if d is None:
         return None
     addr = addr.lower()
+    nw = d["n_weeks"]
+    recv_series = [0] * nw           # 주별 수신 (스파크라인용)
+    sent_series = [0] * nw           # 주별 발신
     pthreads: set[int] = set()
     recv = sent = 0
     last = ""
@@ -436,10 +439,16 @@ def person_metrics(store, cfg, addr: str, weeks: int = 13) -> dict | None:
                 here = True
                 recv += 1
                 last = max(last, m["sent_on"])
+                wi = d["wk"](_dt(m["sent_on"]))
+                if wi is not None:
+                    recv_series[wi] += 1
             elif m["is_sent"] and _addr_in_to(m, addr):
                 here = True
                 sent += 1
                 last = max(last, m["sent_on"])
+                wi = d["wk"](_dt(m["sent_on"]))
+                if wi is not None:
+                    sent_series[wi] += 1
         if here:
             pthreads.add(tid)
     mine = [p[2] for p in _reply_pairs(d) if p[0] == addr]    # 내가 이 사람에게 답한 시간
@@ -452,6 +461,7 @@ def person_metrics(store, cfg, addr: str, weeks: int = 13) -> dict | None:
                      if pp["thread_id"] in pthreads],
         "waiting": [ev for ev in sig_evaporated(d)
                     if ev["thread_id"] in pthreads],
+        "recv_series": recv_series, "sent_series": sent_series,
         "asof": d["asof"], "weeks": d["n_weeks"],
     }
 

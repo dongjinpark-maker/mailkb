@@ -1981,6 +1981,72 @@ class TestPeopleDossier(unittest.TestCase):
         # nav 에 '인물' 링크
         self.assertIn('href="/people"', web._NAV)
 
+    def test_relmetrics_card_visualized(self):
+        # 관계 수치 카드 = 균형 막대(스와치·세그먼트) + 회신 비교(rsfill 막대)
+        d = web.render_dossier(self.store, self.cfg, self.KIM)
+        self.assertIn("class='relbar'", d)                # 균형 막대
+        self.assertIn("class='sw recv'", d)               # 색 스와치
+        self.assertIn("class='sw sent'", d)
+        self.assertIn("받은 2", d)
+        self.assertIn("보낸 1", d)
+        self.assertIn("class='rsfill'", d)                # 회신 속도 막대
+        self.assertIn("이 사람", d)
+        self.assertIn("최근 3개월", d)                    # 기간 캡션
+        # 짧은 기간(한 주) → 스파크라인 생략(graceful)
+        self.assertNotIn("class='rspark'", d)
+
+
+class TestRelMetricsViz(unittest.TestCase):
+    """관계 수치 시각화 — 주별 시계열·스파크라인·graceful 생략."""
+
+    AMY = "amy@corp.example"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = Config(home=Path(self.tmp.name), my_addresses=[ME],
+                          my_names=["나"], internal_domains=["corp.example"])
+        self.store = Store(Path(self.tmp.name) / "r.sqlite", [ME], ["나"],
+                           noise=self.cfg)
+        # 5개 서로 다른 주에 걸친 교신 (수신 5 / 발신 2)
+        self.store.ingest([
+            _rec("a1", self.AMY, [ME], "논의", "2026-06-08T09:00:00", "검토 부탁."),
+            _rec("a2", self.AMY, [ME], "논의", "2026-06-15T09:00:00", "추가 검토."),
+            _rec("a3", ME, [self.AMY], "RE: 논의", "2026-06-16T09:00:00", "의견 드립니다."),
+            _rec("a4", self.AMY, [ME], "논의", "2026-06-22T09:00:00", "재확인 부탁."),
+            _rec("a5", self.AMY, [ME], "논의", "2026-06-29T09:00:00", "일정 공유."),
+            _rec("a6", ME, [self.AMY], "RE: 논의", "2026-06-30T09:00:00", "확인했습니다."),
+            _rec("a7", self.AMY, [ME], "논의", "2026-07-06T09:00:00", "마무리 요청."),
+        ])
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_weekly_series_lengths_and_sums(self):
+        m = report.person_metrics(self.store, self.cfg, self.AMY, weeks=13)
+        self.assertEqual(len(m["recv_series"]), m["weeks"])
+        self.assertEqual(len(m["sent_series"]), m["weeks"])
+        # 창 안 데이터라 주별 합 = 스칼라 총량
+        self.assertEqual(sum(m["recv_series"]), m["recv"])
+        self.assertEqual(sum(m["sent_series"]), m["sent"])
+        self.assertEqual(m["recv"], 5)
+        self.assertEqual(m["sent"], 2)
+
+    def test_absent_addr_series_all_zero(self):
+        m = report.person_metrics(self.store, self.cfg, "nobody@corp.example")
+        self.assertEqual(sum(m["recv_series"]) + sum(m["sent_series"]), 0)
+
+    def test_sparkline_shown_across_weeks(self):
+        d = web.render_dossier(self.store, self.cfg, self.AMY)
+        self.assertIn("class='rspark'", d)                # 3주+ → 스파크 표시
+        self.assertIn("<polyline", d)
+        self.assertIn("주별 교신", d)
+
+    def test_spark_svg_empty_when_flat_or_short(self):
+        self.assertEqual(web._spark_svg([0, 0, 0, 0]), "")   # 전부 0
+        self.assertEqual(web._spark_svg([3, 1]), "")         # 3주 미만
+        self.assertIn("<polyline", web._spark_svg([1, 2, 3, 2]))
+
 
 class TestPeopleDossierAI(unittest.TestCase):
     """인물 도시에 v2 — AI 요약 캐시·근거 검증·증분 갱신 가드."""

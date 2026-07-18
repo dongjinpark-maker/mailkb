@@ -28,7 +28,7 @@
 
   | 카드 | 원천 |
   |---|---|
-  | 관계 수치 | 창 내 recv/sent·최근 접촉 + `report._reply_pairs`/`_their_pairs` addr 필터 중앙값 |
+  | 관계 수치 | **시각화**: ① 주고받기 균형 막대(recv/sent 비율) ② 회신 속도 비교 막대(이 사람/나 중앙값) ③ 주별 교신 스파크라인 + 최근 접촉. `report.person_metrics`(recv/sent·`_reply_pairs`/`_their_pairs` 중앙값 + 주별 시계열) |
   | 진행 중 | `report.sig_pingpong` 를 이 addr 참여 스레드로 필터 |
   | 서로의 미결 | ① `actions.classify_threads` source 발신자=이 사람·REQUIRED ② `report.sig_evaporated` addr 필터 |
   | 관여한 결정 | `store.person_decisions(addr,name)` — decider 매치를 참여 스레드로 교집합 |
@@ -38,6 +38,24 @@
 - 모든 항목에 **근거 스레드 링크 `[#nnn]`**. 도시에 하단 "전체 왕래 메일 →" 로
   기존 `/person` 메일 목록에 도달. 스레드 상세의 이름 클릭도 `/person` → `/people`
   (도시에)로 승격.
+
+### 관계 수치 시각화
+
+숫자를 읽지 않아도 관계의 모양이 보이도록 카드 본문을 작은 시각화 3요소로 한다
+(`web._relmetrics_html`). 재료 없는 요소는 생략(graceful) — 셋 다 비면 카드 자체가
+안 나온다.
+
+- **① 주고받기 균형 막대**: 받은/보낸을 한 pill 막대의 두 색 세그먼트(받은=accent,
+  보낸=accent2)로 비율 표시 → "누가 더 보내나"가 즉시.
+- **② 회신 속도 비교**: 이 사람 vs 나 응답 중앙값을 공통 스케일 막대로. 길수록
+  느림 → 병목이 보인다. 표본 한쪽만 있으면 그 행만.
+- **③ 주별 교신 스파크라인**: 주별 (recv+sent) 총량을 자족적 인라인 SVG polyline
+  (`web._spark_svg`, 3주 미만·전부 0이면 생략)로 → 달아오르나 식나. 옆에 최근 접촉.
+- **데이터**: `report.person_metrics` 가 스칼라(recv/sent·응답 중앙값·최근 접촉)에
+  더해 **주별 시계열**(`recv_series`/`sent_series`)을 준다 — 기존 주 축(`d["wk"]`)
+  재사용이라 추가 비용 거의 0. 새 테이블·쿼리 없음.
+- **자족적 마크업**: web.py 팔레트 토큰만 쓰고 report.py 차트 CSS(`/stats` 전용)에
+  의존하지 않아 라이트/다크 자동 대응. 관찰 가능한 사실만(평가·추정 없음).
 
 ### 주요 어휘 (관찰 가능한 관여 영역)
 
