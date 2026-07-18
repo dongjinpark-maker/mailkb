@@ -329,10 +329,10 @@ def cmd_review(args) -> None:
         print(f"review --ai · {d} · 요약 {cfg.ai_summary_backend} / 분류 "
               f"{cfg.ai_classify_backend}", file=sys.stderr, flush=True)
         # graceful — AI 가 실패해도 결정론 리뷰는 항상 출력·저장 (#10)
-        # run_ai_layer 은 6개 작업 단계(요약·수확·디제스트·분류·정리·하루요약) 후 '완료'.
+        # run_ai_layer 은 7개 작업 단계(요약·수확·디제스트·분류·정리·하루요약·도시에) 후 '완료'.
         ai_text, note = review.run_ai_layer(
             store, cfg, det, backend=args.backend, persist_date=d,
-            progress=_StageProgress(6),
+            progress=_StageProgress(7),
         )
         if note:
             print(note, file=sys.stderr, flush=True)

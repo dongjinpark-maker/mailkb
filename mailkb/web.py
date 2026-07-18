@@ -28,7 +28,7 @@ from .store import Store, image_cutoff_for
 
 # 데일리 생성 백그라운드 잡(단일) — 웹은 단일 스레드라 리뷰(수 초~수십 초)는 별 스레드로
 # step: 진행 단계(1~total, 0=미상/비-AI) — 대기 화면 프로그레스 바 재료
-_review_job = {"running": False, "msg": "", "step": 0, "total": 6}
+_review_job = {"running": False, "msg": "", "step": 0, "total": 7}
 _review_lock = threading.Lock()
 
 # AI 검색 백그라운드 잡(단일) — 번역·본문심사에 수십 초 걸려 요청 스레드에서 돌리면
@@ -266,6 +266,14 @@ h1 { font-size: 20px; } h2 { font-size: 17px; margin-top: 22px; }
 .wcloud .wc.mid { color: var(--ink-2); }
 .wcloud .wc.lo { color: var(--ink-3); }
 .wcloud .wc:hover { color: var(--accent); }
+.dcard.aidoss { background: var(--sel-bg); border-color: var(--splitter); }
+.dcard.aidoss .aitag { font-size: 11px; font-weight: 600; color: var(--accent);
+    border: 1px solid var(--splitter); border-radius: 4px; padding: 0 5px;
+    vertical-align: 2px; }
+.dcard .dsec { font-weight: 700; color: var(--ink-2); margin: 8px 0 2px; font-size: 13px; }
+.dcard .dclaim { color: var(--ink); line-height: 1.55; margin: 2px 0; }
+.prow .prole { color: var(--ink-3); font-size: 12.5px; font-weight: 400;
+    margin-left: 6px; }
 .dim { color: var(--ink-3); }
 /* 홈 '지금 할 일' 배너 + 접이식 개입 + 컴팩트 렌즈 (개입 페이지 흡수) */
 .banner { background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
@@ -2873,12 +2881,16 @@ def render_people_page(store, cfg) -> str:
         nm = r["name"] or r["addr"]
         name_counts[nm] = name_counts.get(nm, 0) + 1
     now = max((r["last_seen"] for r in ranked), default="")
+    roles = store.dossier_roles()          # addr → 캐시된 역할 한 줄(있으면)
     rows = []
     for r in ranked:
         nm = r["name"] or r["addr"]
         label = esc(nm)
         if name_counts.get(nm, 0) > 1:
             label += f" <span class='dim'>({esc(r['addr'].split('@')[-1])})</span>"
+        role = roles.get(r["addr"])
+        if role:
+            label += f"<span class='prole'>{esc(role)}</span>"
         pend = open_by_addr.get(r["addr"], 0)
         badge = f"<span class='pbadge'>미결 {pend}</span>" if pend else ""
         rows.append(
@@ -2908,8 +2920,24 @@ def _wordcloud_html(words, n_mails: int) -> str:
             f"<p class='dim'>발신 {n_mails}통 기준 · 인용·상투어 제외</p>")
 
 
+def _dossier_ai_card(dz) -> str:
+    """AI 요약 카드 — 캐시된 dossier_md(## 섹션 + '- [#N] 서술') 렌더. 각 줄에
+    근거 스레드 링크, 하단에 갱신일·추정 안내. 근거 검증은 생성 시(distill) 완료."""
+    body = []
+    for raw in (dz["dossier_md"] or "").splitlines():
+        s = raw.strip()
+        if s.startswith("## "):
+            body.append(f"<div class='dsec'>{esc(s[3:].strip())}</div>")
+        elif s.startswith("- "):
+            body.append(f"<div class='dclaim'>{_md_inline(s[2:].strip())}</div>")
+    upd = (dz["updated"] or "")[:10]
+    return ("<div class='dcard aidoss'><h2>요약 <span class='aitag'>AI 추정</span></h2>"
+            + "".join(body)
+            + f"<p class='dim'>{esc(upd)} 갱신 · 근거 #스레드로 확인</p></div>")
+
+
 def render_dossier(store, cfg, addr: str) -> str:
-    """단일 인물 도시에 — 결정론 카드. 재료 없는 카드는 그리지 않는다."""
+    """단일 인물 도시에 — AI 요약(있으면 맨 위) + 결정론 카드. 빈 카드는 생략."""
     addr = (addr or "").strip().lower()
     if not addr:
         return "<h1>인물</h1><p class='empty'>주소가 없습니다</p>"
@@ -2921,6 +2949,12 @@ def render_dossier(store, cfg, addr: str) -> str:
            f"<span class='pright'><a href='/person?addr={_q(addr)}'>"
            "전체 왕래 메일 →</a></span></div>",
            f"<p class='dim'><span class='mono'>{esc(addr)}</span></p>"]
+
+    # AI 요약(v2) — 결정론 카드 위에 얹는다. 캐시 없으면 생략(graceful).
+    dz = store.people_dossier(addr)
+    has_ai = bool(dz and (dz["dossier_md"] or "").strip())
+    if has_ai:
+        out.append(_dossier_ai_card(dz))
 
     cards: list[tuple[str, str]] = []
 
@@ -2996,7 +3030,7 @@ def render_dossier(store, cfg, addr: str) -> str:
         if words:
             cards.append(("주요 어휘", _wordcloud_html(words, len(texts))))
 
-    if not cards:
+    if not cards and not has_ai:
         out.append("<p class='empty'>아직 이 사람에 대한 도시에 재료가 없습니다.</p>")
     for title, body in cards:
         out.append(f"<div class='dcard'><h2>{esc(title)}</h2>{body}</div>")

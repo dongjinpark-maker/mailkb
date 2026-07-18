@@ -180,6 +180,17 @@ CREATE TABLE IF NOT EXISTS distill_signals (
     created   TEXT DEFAULT ''
 );
 
+-- 인물 도시에 AI 요약 캐시 (v2) — addr당 1행. 결정론 카드 위에 얹는 AI 카드의 원천.
+-- 파생 테이블 아님(AI 산출물이라 재구축 불가) → 백필/버전 변경에도 살아남는다.
+-- basis_msg_count = 마지막 생성 시점의 그 사람 관련 메시지 수. 증분 갱신 가드 —
+-- 이 값보다 메시지가 늘어난 사람만 주간 재생성해 비용을 통제한다(요약 캐시와 동일 패턴).
+CREATE TABLE IF NOT EXISTS people_dossier (
+    addr            TEXT PRIMARY KEY,
+    dossier_md      TEXT DEFAULT '',    -- 근거 검증 통과한 요약(마크다운)
+    updated         TEXT DEFAULT '',
+    basis_msg_count INTEGER DEFAULT 0
+);
+
 -- AI 검색 결과 캐시 (Phase 2) — 질의별 지속 저장. 뒤로가기·반복 질의 재과금 방지 +
 -- '최근 AI 검색' 목록. q = 정규화된 자연어 질의(소문자·공백 정리).
 CREATE TABLE IF NOT EXISTS ai_search (
@@ -1310,6 +1321,75 @@ class Store:
             "SELECT new_content FROM messages "
             "WHERE is_sent=0 AND LOWER(sender_addr)=? "
             "ORDER BY sent_on DESC LIMIT ?", (addr, limit))]
+
+    def person_msg_count(self, addr: str) -> int:
+        """이 사람 관련 메시지 수(양방향) — 도시에 증분 갱신 가드(basis)용."""
+        addr = (addr or "").lower()
+        like = f"%;{addr};%"
+        return self.db.execute(
+            "SELECT COUNT(*) FROM messages WHERE sender_addr=? "
+            "OR (is_sent=1 AND ((';'||to_addrs||';') LIKE ? "
+            "OR (';'||cc_addrs||';') LIKE ?))", (addr, like, like)).fetchone()[0]
+
+    def person_thread_context(self, addr: str, limit: int = 8) -> list[dict]:
+        """도시에 AI 재료 — 이 사람 참여 스레드의 (제목·롤링요약·최신 발췌), 최근순.
+
+        요약은 문맥, 발췌는 인용 근거용(AI 가 발췌에서만 인용하게). 원문 전체가
+        아니라 발췌 상한이라 토큰이 바운드된다."""
+        tids = self.person_thread_ids(addr)
+        if not tids:
+            return []
+        marks = ",".join("?" * len(tids))
+        rows = self.db.execute(
+            f"SELECT id, rolling_summary FROM threads WHERE id IN ({marks}) "
+            f"ORDER BY last_date DESC LIMIT ?", [*tids, limit]).fetchall()
+        out = []
+        for r in rows:
+            msgs = self.thread_messages(r["id"])
+            if not msgs:
+                continue
+            subject = msgs[0]["subject"] or "(제목 없음)"
+            excerpt = (msgs[-1]["new_content"] or "").strip()
+            out.append({"thread_id": r["id"], "subject": subject,
+                        "summary": (r["rolling_summary"] or "").strip(),
+                        "excerpt": excerpt})
+        return out
+
+    def people_dossier(self, addr: str) -> sqlite3.Row | None:
+        return self.db.execute(
+            "SELECT * FROM people_dossier WHERE addr=?",
+            ((addr or "").lower(),)).fetchone()
+
+    def save_people_dossier(self, addr: str, dossier_md: str,
+                            basis_msg_count: int) -> None:
+        self.db.execute(
+            """INSERT INTO people_dossier (addr, dossier_md, updated, basis_msg_count)
+               VALUES (?,?,datetime('now'),?)
+               ON CONFLICT(addr) DO UPDATE SET
+                 dossier_md=excluded.dossier_md, updated=excluded.updated,
+                 basis_msg_count=excluded.basis_msg_count""",
+            ((addr or "").lower(), dossier_md or "", basis_msg_count))
+        self.db.commit()
+
+    def dossier_roles(self) -> dict[str, str]:
+        """addr → 역할 한 줄(첫 불릿 주장의 서술) — 랜딩 목록 표시용.
+        '## 역할' 헤더는 건너뛰고 그 아래 첫 '- [#N] 서술'의 서술만 뽑는다."""
+        out = {}
+        for r in self.db.execute(
+                "SELECT addr, dossier_md FROM people_dossier WHERE dossier_md!=''"):
+            for ln in (r["dossier_md"] or "").splitlines():
+                s = ln.strip()
+                if not s or s.startswith("##"):
+                    continue
+                s = s.lstrip("-* ").strip()
+                if s.startswith("[#"):
+                    j = s.find("] ")
+                    if j != -1:
+                        s = s[j + 2:].strip()
+                if s:
+                    out[r["addr"]] = s[:60]
+                    break
+        return out
 
     def person_name(self, addr: str) -> str:
         """이 주소의 표시 이름(people 우선, 없으면 메일 발신명). 없으면 ''."""

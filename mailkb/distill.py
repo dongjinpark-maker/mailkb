@@ -381,3 +381,121 @@ def harvest(store: Store, cfg: Config, det: dict,
             "dropped": dropped,
         })
     return result
+
+
+# ───────────────────────────────────────────── 인물 도시에 AI 요약 (v2)
+# v1 결정론 카드 위에 얹는 AI 카드. harvest 와 같은 근거 검증(_QuoteChecker)으로
+# 환각을 차단 — 인용이 실제 스레드 본문에 없으면 그 줄을 버린다. graceful:
+# 백엔드 미설정·실패·근거 0줄이면 None(카드 미표시, v1 카드는 항상 살아남음).
+# 백엔드는 요약용(사내/로컬) — 회사 메일 발췌가 외부로 나가면 안 된다.
+
+DOSSIER = """당신은 담당자의 동료 한 사람에 대한 짧은 업무 카드를 쓴다. 아래 재료(이미 추출된 것)만 근거로, 관찰 가능한 업무 사실만 적어라.
+
+규칙 (한국어):
+- 성격·태도·역량·성과 '평가' 금지. "무엇을 맡고 있고 무엇이 진행 중인가"라는 사실만.
+- 각 줄은 정확히 `- [#번호] 서술 · 인용: "발췌에서 그대로 옮긴 한 조각"` 형식.
+  인용은 아래 '발췌'에 실제로 있는 문장의 일부여야 한다(요약이 아니라 발췌에서 그대로).
+- 재료에 없는 번호·사실을 만들지 마라. 근거(발췌 인용)가 없으면 그 줄을 쓰지 마라.
+- 섹션은 아래 셋. 해당 사실이 없으면 그 섹션째 생략. 전체 3~6줄.
+
+## 역할
+- (조직·담당 추정 한 줄)
+## 지금 함께 하는 일
+- (진행 중인 일 1~3줄)
+## 병목
+- (제3자·의존 때문에 막힌 것이 있으면. 없으면 이 섹션 생략)
+
+[참여 스레드]
+{threads}
+
+[관여한 결정]
+{decisions}
+
+[인물 신호]
+{signals}
+
+[주요 어휘] {words}
+
+[기존 요약 — 새 재료로 갱신, 없으면 새로 작성]
+{prev}
+
+위 형식대로 카드만 출력하라:"""
+
+
+def _dossier_materials(store: Store, cfg: Config, addr: str, name: str) -> dict:
+    ctx = store.person_thread_context(addr, limit=8)
+    threads = "\n".join(
+        f"[#{c['thread_id']}] {c['subject']}\n"
+        f"  요약: {(c['summary'] or '(없음)')[:300].replace(chr(10), ' ')}\n"
+        f"  발췌: {(c['excerpt'] or '(없음)')[:400].replace(chr(10), ' ')}"
+        for c in ctx) or "(없음)"
+    decs = store.person_decisions(addr, name)
+    decisions = "\n".join(f"[#{d['thread_id']}] {d['title']}"
+                          for d in decs[:6]) or "(없음)"
+    sigs = store.person_signals(addr, name)
+    signals = "\n".join(f"[#{s['thread_id']}] {s['signal']}"
+                        for s in sigs[:6]) or "(없음)"
+    from . import report                       # 지연 임포트(순환 방지)
+    texts = [t for t in store.person_sent_texts(addr, limit=200) if t.strip()]
+    words = ", ".join(w for w, _ in report.top_words(texts, limit=12)) or "(부족)"
+    return {"threads": threads, "decisions": decisions,
+            "signals": signals, "words": words}
+
+
+def _sanitize_dossier(raw: str, checker: "_QuoteChecker") -> str:
+    """근거(발췌 인용) 검증 통과한 줄만 남긴 마크다운. 인용 꼬리는 표시부에서 제거,
+    서술 + #스레드참조만 남긴다(참조는 근거 링크로 렌더된다)."""
+    out: list[str] = []
+    for sec, lines in _sections(raw).items():
+        kept = []
+        for ln in lines:
+            tid, quote = _parse_line_common(ln)
+            if tid is None or not checker.ok(tid, quote):
+                continue
+            claim = _QUOTE_RX.sub("", ln).rstrip(" ·-").strip()
+            if claim:
+                kept.append(f"- {claim}")
+        if kept:
+            out.append(f"## {sec}")
+            out.extend(kept)
+    return "\n".join(out)
+
+
+def _gen_dossier(store: Store, cfg: Config, cmd, addr: str,
+                 name: str, prev_md: str) -> str | None:
+    prompt = DOSSIER.format(prev=(prev_md or "(없음)"),
+                            **_dossier_materials(store, cfg, addr, name))
+    try:
+        raw = review.ai_run(cmd, prompt)
+    except review.AIError:
+        return None
+    return _sanitize_dossier(raw, _QuoteChecker(store)) or None
+
+
+def refresh_people_dossiers(store: Store, cfg: Config, backend: str | None = None,
+                            max_n: int = 6, top: int = 15) -> int:
+    """상위 인물 중 basis 이후 메시지가 늘어난 사람만 도시에 재생성(증분·비용통제).
+    활동 증가분이 큰 순으로 최대 max_n 명. 반환 갱신 건수 — 백엔드 미설정이면 0."""
+    try:
+        cmd = cfg.ai_cmd(backend)
+    except SystemExit:
+        return 0
+    from . import report
+    stale = []
+    for r in report.rank_people(store, cfg)[:top]:
+        addr = r["addr"]
+        cnt = store.person_msg_count(addr)
+        row = store.people_dossier(addr)
+        basis = row["basis_msg_count"] if row else 0
+        if cnt > basis:
+            stale.append((cnt - basis, addr,
+                          r.get("name") or store.person_name(addr) or addr, cnt,
+                          row["dossier_md"] if row else ""))
+    stale.sort(key=lambda x: -x[0])
+    n = 0
+    for _, addr, name, cnt, prev in stale[:max_n]:
+        md = _gen_dossier(store, cfg, cmd, addr, name, prev)
+        if md:
+            store.save_people_dossier(addr, md, cnt)
+            n += 1
+    return n

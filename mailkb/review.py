@@ -1281,6 +1281,16 @@ def run_ai_layer(
         progress("하루 요약 작성 중…")
     det["exec_summary"] = ai_exec_summary(store, cfg, det,
                                           backend=summary_backend)
+    # 인물 도시에 갱신(v2) — basis 이후 메시지 늘어난 상위 인물만 증분 재생성. sonnet.
+    # 자체 graceful(백엔드 미설정·실패 시 0). run 당 상한으로 비용 통제.
+    if progress:
+        progress("인물 도시에 갱신 중…")
+    try:
+        n = int(cfg.opt("dossier", "refresh_max_per_run", default=6) or 6)
+        det["dossiers_updated"] = distill.refresh_people_dossiers(
+            store, cfg, backend=summary_backend, max_n=n)
+    except Exception:                          # 도시에 실패가 데일리를 막지 않음
+        det["dossiers_updated"] = 0
     if progress:
         progress("완료")
     return ai_text, note

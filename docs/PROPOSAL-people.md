@@ -76,20 +76,39 @@
 - 원 설계(`PROPOSAL-distill.md` 3-D)는 도시에를 `/person` 상단 카드로 뒀으나,
   이번엔 **새 최상위 메뉴**로 간다(의식적 divergence).
 
-## v2 (다음)
+## v2 코어 (구현됨)
 
-v1 결정론 5카드는 토대로 남고 위에 AI 계층이 얹힌다(실패·노후여도 v1 카드는 항상
+v1 결정론 카드는 토대로 남고 위에 AI 계층이 얹힌다(실패·노후여도 v1 카드는 항상
 표시 — graceful).
 
-1. **AI 도시에 요약 카드**(최상단): 역할·조직 추정 + "지금 함께 하는 일" + **제3자
-   병목**. `people_dossier` 캐시에서 읽음.
-2. **캐시 + 증분 갱신**: `people_dossier(addr PK, dossier_md, updated,
-   basis_msg_count)`(PROPOSAL-distill.md:137-139). 주간 잡이 메시지 늘어난 상위
-   ~15명만 재생성 → 비용 통제. 데일리 잡의 백그라운드+폴링 패턴 재사용.
-3. **AI 출력은 구조화 주장으로 제한**: `{claim, confidence, thread_ids, quote}`
-   (장기기억·액션 분류기와 같은 환각 차단). **사내/로컬 백엔드만**.
-4. 랜딩에 캐시된 역할 한 줄. 최근 변화 → AI 서술(+`distill_signals.consumed`).
-5. 타임라인 카드. 사용자 수정 보호(AI 재생성이 덮지 않음).
+- **AI 도시에 요약 카드**(도시에 최상단): `## 역할`·`## 지금 함께 하는 일`·`## 병목`.
+  `people_dossier` 캐시에서 읽어 렌더. 없으면 카드 미표시(v1 카드만).
+  `web._dossier_ai_card`.
+- **캐시 테이블**: `people_dossier(addr PK, dossier_md, updated, basis_msg_count)`.
+  파생 아님(AI 산출물) → 백필/버전 변경에도 살아남고, 스키마는 `CREATE TABLE IF NOT
+  EXISTS` 라 `git pull` 후 재싱크 불필요.
+- **근거 검증으로 환각 차단**: AI 출력의 각 줄은 `- [#N] 서술 · 인용: "발췌"` 형식.
+  harvest 의 `_QuoteChecker` 를 재사용해 **인용이 그 스레드 본문에 실제로 있을 때만**
+  줄을 채택 — 날조 스레드번호·오귀속·근거 없는 주장은 버린다. 표시부엔 인용 꼬리를
+  떼고 서술+`#N`(근거 링크)만 남긴다. `distill._gen_dossier`/`_sanitize_dossier`.
+- **증분 갱신(비용 통제)**: `distill.refresh_people_dossiers` — 상위 ~15명 중
+  `person_msg_count` 가 basis 이후 늘어난 사람만, 활동 증가분 큰 순 최대
+  `cfg.opt("dossier","refresh_max_per_run",default=6)` 명. **데일리 AI 계층의 7번째
+  단계**로 실행(별도 스케줄러 없이 자동). 새 메일 없으면 콜 자체가 없음.
+- **랜딩 역할 한 줄**: `store.dossier_roles()` — 캐시된 `## 역할` 첫 서술을 인물
+  목록 각 행에 표시(생성 아니라 캐시 읽기라 비용 0).
+- **백엔드**: 요약용(`ai_summary_backend`, 사내/로컬) — 회사 메일 발췌가 외부로
+  나가면 안 됨.
+
+## v2.1 (미룸)
+
+- **최근 변화 → AI 서술** + `distill_signals.consumed` 소비 완성(현재 v1 은 원문
+  나열).
+- **타임라인 카드**(역할·담당 변화 시계열).
+- **사용자 수정 보호**: 사람이 고친 줄은 AI 재생성이 덮지 않음(장기기억 원장의
+  confirmed 수명주기 패턴). 현재 코어는 재생성 시 캐시 전체 교체.
+- **엄격한 구조화 주장 JSON**(`{claim, confidence, thread_ids, quote}`): 코어는
+  마크다운 + 인용 검증으로 등가 효과를 내되, `confidence` 필드는 아직 없음.
 
 **가드레일**: 관찰 가능한 업무 사실 + 메일 근거만. 성격 평가·감정 추정·성과 점수
 같은 감시성 정보 제외. 도시에 ≠ 인물 업무 브리핑(3-G, on-demand 심층 문서).

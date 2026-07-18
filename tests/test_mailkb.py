@@ -1982,6 +1982,89 @@ class TestPeopleDossier(unittest.TestCase):
         self.assertIn('href="/people"', web._NAV)
 
 
+class TestPeopleDossierAI(unittest.TestCase):
+    """인물 도시에 v2 — AI 요약 캐시·근거 검증·증분 갱신 가드."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = Config(home=Path(self.tmp.name), my_addresses=[ME],
+                          my_names=["나"], internal_domains=["corp.example"],
+                          ai_default="internal",
+                          ai_backends={"internal": {"cmd": ["echo"]}},
+                          raw={"ai": {"summary_min_msgs": 1}})
+        self.store = Store(Path(self.tmp.name) / "d.sqlite", [ME], ["나"],
+                           noise=self.cfg)
+        self.KIM = "kim@corp.example"
+        self.store.ingest([
+            _rec("k1", self.KIM, [ME], "NPX-200 타이밍 클로저",
+                 "2026-07-01T09:00:00", "B0 타이밍 hold 위반 재현됩니다. 재검증 필요."),
+            _rec("k2", ME, [self.KIM], "RE", "2026-07-01T13:00:00", "확인했습니다."),
+            _rec("k3", self.KIM, [ME], "RE", "2026-07-02T09:00:00",
+                 "LEC 스크립트 점검 완료했습니다. 16일 슬롯 문제없습니다."),
+        ])
+        self.t1 = self._tid("k1")
+
+    def _tid(self, mid):
+        return self.store.db.execute(
+            "SELECT thread_id FROM messages WHERE message_id=?",
+            (f"<{mid}@t>",)).fetchone()[0]
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _run(self, fake):
+        with mock.patch.object(review, "ai_run", return_value=fake):
+            return distill.refresh_people_dossiers(self.store, self.cfg,
+                                                   backend="internal")
+
+    def test_generates_and_verifies_grounding(self):
+        # 근거 인용이 실제 본문에 있는 줄만 살아남는다(환각·오귀속·근거없음 제거)
+        fake = (f"## 역할\n- [#{self.t1}] 타이밍 클로저 담당 · 인용: "
+                f'"B0 타이밍 hold 위반 재현됩니다"\n'
+                f"## 지금 함께 하는 일\n"
+                f'- [#999] 없는 스레드 · 인용: "존재하지 않는 인용문 열두자이상"\n'
+                f'- [#{self.t1}] 근거 없음 · 인용: "본문에 전혀 없는 문장 열두자이상"')
+        self.assertEqual(self._run(fake), 1)
+        md = self.store.people_dossier(self.KIM)["dossier_md"]
+        self.assertIn("타이밍 클로저 담당", md)     # 검증 통과
+        self.assertNotIn("#999", md)               # 날조 스레드 제거
+        self.assertNotIn("근거 없음", md)           # 미검증 인용 제거
+        self.assertNotIn("인용:", md)              # 표시부엔 인용 꼬리 없음
+        self.assertNotIn("지금 함께 하는 일", md)   # 살아남은 줄 없으면 섹션째 제거
+
+    def test_incremental_basis_guard(self):
+        fake = f'## 역할\n- [#{self.t1}] 담당 · 인용: "B0 타이밍 hold 위반 재현됩니다"'
+        self.assertEqual(self._run(fake), 1)
+        self.assertEqual(self.store.people_dossier(self.KIM)["basis_msg_count"], 3)
+        # 새 메시지 없음 → basis 그대로 → 재생성 안 함(비용 통제)
+        self.assertEqual(self._run(fake), 0)
+        # 새 메시지 도착 → 다시 갱신
+        self.store.ingest([_rec("k4", self.KIM, [ME], "RE", "2026-07-03T09:00:00",
+                                "추가 재현됩니다.")])
+        self.assertEqual(self._run(fake), 1)
+        self.assertEqual(self.store.people_dossier(self.KIM)["basis_msg_count"], 4)
+
+    def test_ai_card_and_landing_role(self):
+        self._run(f'## 역할\n- [#{self.t1}] 타이밍 클로저 담당 · 인용: '
+                  f'"B0 타이밍 hold 위반 재현됩니다"')
+        d = web.render_dossier(self.store, self.cfg, self.KIM)
+        self.assertIn("AI 추정", d)                 # AI 카드
+        self.assertIn("타이밍 클로저 담당", d)
+        self.assertIn(f"/thread/{self.t1}", d)      # 근거 링크
+        self.assertEqual(self.store.dossier_roles().get(self.KIM),
+                         "타이밍 클로저 담당")       # 랜딩 역할줄(헤더 아님)
+
+    def test_graceful_without_backend(self):
+        cfg = Config(home=Path(self.tmp.name), my_addresses=[ME],
+                     ai_summary_backend="ghost")
+        self.assertEqual(
+            distill.refresh_people_dossiers(self.store, cfg, backend="ghost"), 0)
+        # 도시에 없으면 AI 카드 없이 결정론 카드만(graceful)
+        d = web.render_dossier(self.store, self.cfg, self.KIM)
+        self.assertNotIn("AI 추정", d)
+
+
 class TestWordCloud(unittest.TestCase):
     """도시에 '주요 어휘' — 본인 발신어 빈도. 조사 스트립·과잉절단 방지·불용어·임계."""
 
@@ -2710,6 +2793,7 @@ class TestAILayer(unittest.TestCase):
         self.assertIn("개입 큐 AI 분류 중…", stages)       # 분류(haiku)
         self.assertIn("개입 큐 우선순위 정리 중…", stages)   # 정제(haiku)
         self.assertIn("하루 요약 작성 중…", stages)         # Executive Summary
+        self.assertIn("인물 도시에 갱신 중…", stages)        # 도시에 v2
 
     def test_run_ai_layer_routes_summary_and_classify_backends(self):
         # 요약/회고 → summary 백엔드(sonnet), 개입 분류/정제 → classify 백엔드(haiku)
@@ -4045,16 +4129,16 @@ class TestWeb(unittest.TestCase):
         self.assertIn("libscene", inner)                  # 사서 애니메이션 씬
         self.assertIn("rvfill indet", inner)
         self.assertNotIn("단계", inner)
-        # 단계 진행(_job_progress): step 증가 → 채워지는 바 + '단계 2/6'
+        # 단계 진행(_job_progress): step 증가 → 채워지는 바 + '단계 2/7'
         w._job_progress("누적 요약 갱신 중…")
         w._job_progress("결정·신호 수확 중…")
         inner2, _ = w.render_review_status(self.store)
-        self.assertIn("단계 2/6", inner2)
-        self.assertIn("width:33%", inner2)                # 2/6 = 33%
+        self.assertIn("단계 2/7", inner2)
+        self.assertIn("width:29%", inner2)                # 2/7 ≈ 29%
         self.assertIn("결정·신호 수확 중…", inner2)
         self.assertIn("id='rv-stage'", inner2)            # app.js 패치 타깃
         w._job_progress("완료")
-        self.assertEqual(w._review_job["step"], 6)
+        self.assertEqual(w._review_job["step"], 7)
         w._review_job.update(running=False, msg="", step=0)
 
     def test_appjs_polls_patch_not_replace(self):
