@@ -1982,6 +1982,92 @@ class TestPeopleDossier(unittest.TestCase):
         self.assertIn('href="/people"', web._NAV)
 
 
+class TestWordCloud(unittest.TestCase):
+    """도시에 '주요 어휘' — 본인 발신어 빈도. 조사 스트립·과잉절단 방지·불용어·임계."""
+
+    def test_josa_strip_without_overcut(self):
+        f = report._strip_josa
+        self.assertEqual(f("검토를"), "검토")       # 조사 제거
+        self.assertEqual(f("결과가"), "결과")
+        self.assertEqual(f("양자화의"), "양자화")
+        self.assertEqual(f("타이밍을"), "타이밍")
+        # 어간이 1자로 줄면 과잉절단이므로 원형 유지 (결과·회의·성과 보존)
+        self.assertEqual(f("결과"), "결과")
+        self.assertEqual(f("회의"), "회의")
+        self.assertEqual(f("성과"), "성과")
+        self.assertEqual(f("data"), "data")          # 영문은 조사 무관
+
+    def test_top_words_stopwords_and_domain_terms(self):
+        texts = [
+            "타이밍 클로저 검토를 진행했습니다. 감사합니다.",
+            "타이밍 마진 결과 공유드립니다. 확인 부탁드립니다.",
+            "양자화 QAT 방식 확정. 양자화 회귀 해결.",
+        ]
+        words = dict(report.top_words(texts, limit=20))
+        self.assertIn("타이밍", words)               # 도메인어 잔존
+        self.assertIn("양자화", words)
+        self.assertEqual(words["타이밍"], 2)
+        # 상투어·업무동사는 제외
+        for stop in ("감사합니다", "부탁드립니다", "검토", "진행", "확인", "공유"):
+            self.assertNotIn(stop, words)
+        # 1회성 단어(min_count 미만) 제외 — 클로저/마진/QAT 는 1회
+        self.assertNotIn("클로저", words)
+
+    def test_top_words_extra_stop(self):
+        texts = ["김도현 타이밍 검토", "김도현 타이밍 회의", "타이밍 마진 김도현"]
+        words = dict(report.top_words(texts, extra_stop=["김도현"]))
+        self.assertNotIn("김도현", words)             # 내 이름 제외
+        self.assertIn("타이밍", words)
+
+    def _seed_sent(self, addr, n, body):
+        recs = [_rec(f"wc{i}", addr, [ME], "건", f"2026-07-{i+1:02d}T09:00:00",
+                     body=body) for i in range(n)]
+        self.store.ingest(recs)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = Config(home=Path(self.tmp.name), my_addresses=[ME],
+                          my_names=["김도현"], internal_domains=["corp.example"],
+                          ignore_senders=["jira@"])
+        self.store = Store(Path(self.tmp.name) / "w.sqlite", [ME], ["김도현"],
+                           noise=self.cfg)
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_card_hidden_below_threshold(self):
+        # 발신 5통(<8) → 카드 없음
+        self._seed_sent("kim@corp.example", 5, "타이밍 클로저 마진 검증 진행")
+        d = web.render_dossier(self.store, self.cfg, "kim@corp.example")
+        self.assertNotIn("주요 어휘", d)
+
+    def test_card_shows_cloud_above_threshold(self):
+        self._seed_sent("kim@corp.example", 10,
+                        "타이밍 클로저 마진 재검증. 양자화 회귀 확인 부탁드립니다.")
+        d = web.render_dossier(self.store, self.cfg, "kim@corp.example")
+        self.assertIn("주요 어휘", d)
+        self.assertIn("class='wcloud'", d)
+        self.assertIn("발신 10통 기준", d)
+        self.assertIn("타이밍", d)
+        self.assertNotIn("김도현", d)                 # 내 이름 제외
+        self.assertNotIn("부탁드립니다", d)           # 상투어 제외
+
+    def test_noise_sender_skips_cloud(self):
+        self._seed_sent("jira@corp.example", 12, "이슈 NPX-1 갱신되었습니다 담당자")
+        d = web.render_dossier(self.store, self.cfg, "jira@corp.example")
+        self.assertNotIn("주요 어휘", d)              # 봇은 어휘 구름 생략
+
+    def test_only_counts_person_sent_not_mine(self):
+        # 내가 이 사람에게 보낸 것(is_sent=1)은 대상 아님
+        self._seed_sent("kim@corp.example", 3, "짧음")
+        self.store.ingest([_rec("mine", ME, ["kim@corp.example"], "RE",
+                                "2026-07-20T09:00:00", body="내 발신어 잔뜩 타이밍")])
+        texts = self.store.person_sent_texts("kim@corp.example")
+        self.assertEqual(len(texts), 3)              # kim 발신 3통만
+        self.assertTrue(all("내 발신어" not in t for t in texts))
+
+
 class TestDecisionRegex(unittest.TestCase):
     def test_matches_requests(self):
         for s in ["재시험 여부 판단 부탁드립니다.", "설비 가부 회신 부탁드립니다.",

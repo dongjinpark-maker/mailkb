@@ -259,6 +259,13 @@ h1 { font-size: 20px; } h2 { font-size: 17px; margin-top: 22px; }
 .dcard ul { margin: 6px 0; padding-left: 18px; }
 .dcard li { margin: 4px 0; line-height: 1.5; }
 .dcard p { color: var(--ink-2); line-height: 1.6; }
+.wcloud { display: flex; flex-wrap: wrap; gap: 3px 12px; align-items: baseline;
+    line-height: 2; padding: 4px 0 2px; }
+.wcloud .wc { white-space: nowrap; }
+.wcloud .wc.hi { color: var(--ink); font-weight: 700; }
+.wcloud .wc.mid { color: var(--ink-2); }
+.wcloud .wc.lo { color: var(--ink-3); }
+.wcloud .wc:hover { color: var(--accent); }
 .dim { color: var(--ink-3); }
 /* 홈 '지금 할 일' 배너 + 접이식 개입 + 컴팩트 렌즈 (개입 페이지 흡수) */
 .banner { background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
@@ -2884,8 +2891,25 @@ def render_people_page(store, cfg) -> str:
     return "\n".join(out)
 
 
+def _wordcloud_html(words, n_mails: int) -> str:
+    """빈도 태그 클라우드 — 글자 크기(연속)와 농도(3단계)로 직관화. 단어가 여러
+    스레드에 걸쳐 v1 은 단어별 근거 링크 없이 발신 통수만 표기한다."""
+    counts = [c for _, c in words]
+    lo, hi = min(counts), max(counts)
+    span = (hi - lo) or 1
+    tags = []
+    for w, c in words:
+        r = (c - lo) / span                       # 0..1
+        size = round(13 + r * 13)                 # 13..26px
+        tier = "hi" if r >= 0.66 else ("mid" if r >= 0.33 else "lo")
+        tags.append(f"<span class='wc {tier}' style='font-size:{size}px' "
+                    f"title='{c}회'>{esc(w)}</span>")
+    return (f"<div class='wcloud'>{' '.join(tags)}</div>"
+            f"<p class='dim'>발신 {n_mails}통 기준 · 인용·상투어 제외</p>")
+
+
 def render_dossier(store, cfg, addr: str) -> str:
-    """단일 인물 도시에 — 결정론 5카드. 재료 없는 카드는 그리지 않는다."""
+    """단일 인물 도시에 — 결정론 카드. 재료 없는 카드는 그리지 않는다."""
     addr = (addr or "").strip().lower()
     if not addr:
         return "<h1>인물</h1><p class='empty'>주소가 없습니다</p>"
@@ -2955,6 +2979,22 @@ def render_dossier(store, cfg, addr: str) -> str:
             f"<span class='dim'>· {esc(s['date'])}</span></li>"
             for s in sigs[:8])
         cards.append(("최근 변화", f"<ul>{lis}</ul>"))
+
+    # 6. 주요 어휘 (본인 발신어 빈도 태그 클라우드) — 발신 통수가 임계 이상일 때만.
+    # 봇·자동발송(하드 노이즈)은 어휘 구름이 무의미하므로 건너뛴다.
+    min_mails = int(cfg.opt("dossier", "wordcloud_min_mails", default=8) or 8)
+    top_n = int(cfg.opt("dossier", "wordcloud_top", default=25) or 25)
+    texts = ([t for t in store.person_sent_texts(addr) if t.strip()]
+             if not cfg.is_noise_sender_hard(addr) else [])
+    if len(texts) >= min_mails:
+        # 내 이름·주소 로컬파트(나를 호칭하는 것)와 본인 이름(서명 누출)은 제외
+        extra = ([n for n in cfg.my_names if n]
+                 + [a.split("@")[0] for a in cfg.my_addresses]
+                 + [w for w in name.split() if w]
+                 + list(cfg.opt("dossier", "word_stop_extra", default=[]) or []))
+        words = report.top_words(texts, limit=top_n, extra_stop=extra)
+        if words:
+            cards.append(("주요 어휘", _wordcloud_html(words, len(texts))))
 
     if not cards:
         out.append("<p class='empty'>아직 이 사람에 대한 도시에 재료가 없습니다.</p>")

@@ -24,7 +24,7 @@
     위주(`recv*1.0 + sent*0.5`). 정렬을 바꾸려면 `_intensity` 한 곳만 고친다.
   - 기간 = `cfg.opt("dossier","window_weeks", default=13)` (config 무수정 조정).
     창은 DB 최신 메일(asof) 기준 상대 → 결정론·테스트 안정.
-- **도시에 `/people?addr=`**: 결정론 5카드(재료 없는 카드는 안 그림).
+- **도시에 `/people?addr=`**: 결정론 6카드(재료 없는 카드는 안 그림).
 
   | 카드 | 원천 |
   |---|---|
@@ -33,10 +33,29 @@
   | 서로의 미결 | ① `actions.classify_threads` source 발신자=이 사람·REQUIRED ② `report.sig_evaporated` addr 필터 |
   | 관여한 결정 | `store.person_decisions(addr,name)` — decider 매치를 참여 스레드로 교집합 |
   | 최근 변화 | `store.person_signals(addr,name)` — distill_signals **첫 소비처** |
+  | 주요 어휘 | 본인 발신어 빈도 태그 클라우드 — `store.person_sent_texts` + `report.top_words` |
 
 - 모든 항목에 **근거 스레드 링크 `[#nnn]`**. 도시에 하단 "전체 왕래 메일 →" 로
   기존 `/person` 메일 목록에 도달. 스레드 상세의 이름 클릭도 `/person` → `/people`
   (도시에)로 승격.
+
+### 주요 어휘 (관찰 가능한 관여 영역)
+
+역량·성과 "평가"는 배제하되, 그 사람이 **실제로 무엇을 다뤘나**는 사실이므로 넣는다.
+본인이 **발신한** 메일(`is_sent=0 AND sender_addr=addr`)의 정제 본문에서 단어 빈도를
+뽑아 태그 클라우드로 보여준다 — 도메인 어휘(SoC·타이밍·양자화·CVSS…)가 드러나
+"누구한테 물어보나"에 답한다.
+
+- **결정론·무AI.** 형태소 분석기(mecab/konlpy) 없이 stdlib 로만: 토큰 분리 →
+  어미·호칭·조사 스트립(어간 2자+ 가드로 결과→결 과잉절단 방지) → 불용어(상투어·
+  업무동사·직함·서명 라벨) → 1회성 제외(min_count) → 상위 N. **형태소 분석이 아니라
+  빈도 뷰**라 이름을 '주요 어휘'로 한다.
+- **표시 임계**: 발신 통수 `cfg.opt("dossier","wordcloud_min_mails",default=8)` 이상일
+  때만(표본 적으면 상투어만 남음). 상위 수 `wordcloud_top`(기본 25).
+- **제외**: 내 이름·본인 이름(서명 누출)·봇 발신자(하드 노이즈). 실메일 튜닝은
+  `cfg.opt("dossier","word_stop_extra")` 로 config 무수정 추가.
+- **한계**: 무형태소라 복합어·띄어쓰기 오류는 못 잡는다. 단어별 근거 링크는 여러
+  스레드에 걸쳐 v1 생략(발신 통수만 표기). 진짜 공기어 군집화는 v2 AI 영역.
 
 ## 인물 식별 (동명이인·별칭)
 

@@ -456,6 +456,70 @@ def person_metrics(store, cfg, addr: str, weeks: int = 13) -> dict | None:
     }
 
 
+# ── 주요 어휘 (도시에 v1) — 본인 발신어의 가중 빈도. 형태소 분석기(mecab/konlpy)
+# 없이 stdlib 로만: 토큰 분리 → 말미 조사 제거 → 불용어 → 빈도. "형태소 분석"이
+# 아니라 "빈도 뷰"라는 것을 이름('주요 어휘')으로 명확히 한다.
+
+# 한글 2자+ 또는 영문 시작 2자+(NPX-200·DDR·QAT 등 약어·모델명 보존)
+_WORD_RX = re.compile(r"[가-힣]{2,}|[A-Za-z][A-Za-z0-9+._-]{1,}")
+# 말미 조사 — 긴 것 먼저(에서 > 에). 제거는 어간 2자+ 일 때만(결과→결 같은 과잉절단 방지).
+_JOSA_RX = re.compile(
+    r"(에서|으로|에게|한테|처럼|보다|마다|밖에|조차|라도|이라도|든지|까지|부터"
+    r"|과의|와의|은|는|이|가|을|를|의|에|로|도|만|과|와|나)$")
+# 동사·경어체 어미(첨부합니다→첨부) · 호칭(도현님→도현) — 조사와 같은 어간 가드.
+_ENDING_RX = re.compile(
+    r"(었습니다|았습니다|였습니다|하였습니다|했습니다|하겠습니다|겠습니다|드립니다"
+    r"|드리겠습니다|바랍니다|주시기|주세요|하세요|드려요|해요|합니다|됩니다|입니다"
+    r"|습니다)$")
+_HONOR_RX = re.compile(r"(님께|께서|님|씨|군|양)$")
+# 업무메일 상투어·기능어 + 직함·서명 라벨 — 도메인 명사를 드러내려 일반 업무동사도 제외.
+WORD_STOP = frozenset("""
+안녕하세요 안녕하십니까 감사합니다 감사드립니다 감사 수고하세요 수고 부탁드립니다
+부탁드려요 부탁드리겠습니다 부탁 바랍니다 드립니다 드리겠습니다 드려요 올림 드림 인사
+있습니다 없습니다 합니다 했습니다 하겠습니다 됩니다 되었습니다 같습니다 입니다
+관련 관련하여 대한 대해 통해 통하여 위해 위한 경우 내용 아래 이번 다음 이전 오늘 내일
+어제 저희 제가 그리고 하지만 또한 다만 이에 해당 그것 이것 여기 거기
+첨부 참고 참조 회신 전달 공유 확인 답변 문의 말씀 안내 검토 요청 진행 예정 필요 처리 부분
+팀장 수석 책임 선임 주임 사원 대리 과장 차장 부장 이사 상무 전무 대표 그룹 본부 사업부
+개발팀 파트 센터 내선 직통 휴대폰 대표번호 사무실
+""".split())
+
+
+def _strip_josa(w: str) -> str:
+    if not ("가" <= w[0] <= "힣"):
+        return w
+    m = _JOSA_RX.search(w)
+    if not m:
+        return w
+    stem = w[:m.start()]
+    return stem if len(stem) >= 2 else w
+
+
+def _stem(w: str) -> str:
+    """한글 토큰 → 어간. 어미·호칭·조사를 순서대로 벗기되 어간 2자+ 일 때만."""
+    if "가" <= w[0] <= "힣":
+        for rx in (_ENDING_RX, _HONOR_RX):
+            m = rx.search(w)
+            if m and len(w) - len(m.group(0)) >= 2:
+                w = w[:m.start()]
+    return _strip_josa(w)
+
+
+def top_words(texts, limit: int = 25, extra_stop=(),
+              min_count: int = 2) -> list[tuple[str, int]]:
+    """본인 발신 본문 목록 → (단어, 빈도) 상위 limit. 1회성 단어(min_count 미만)는
+    '주요' 어휘가 아니므로 제외. 반환은 빈도 내림차순."""
+    stop = WORD_STOP | {str(s).strip() for s in extra_stop if str(s).strip()}
+    c: Counter = Counter()
+    for t in texts:
+        for tok in _WORD_RX.findall(strip_preserved(t or "")):
+            w = _stem(tok)
+            if len(w) < 2 or w in stop or w.lower() in stop:
+                continue
+            c[w] += 1
+    return [(w, n) for w, n in c.most_common() if n >= min_count][:limit]
+
+
 def sig_offhours(d: dict) -> dict:
     """§4 주별 야간·주말 발신 비율."""
     tot = [0] * d["n_weeks"]

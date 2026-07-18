@@ -1299,6 +1299,18 @@ class Store:
                  "recv": v[0], "sent": v[1], "last_seen": v[2]}
                 for a, v in agg.items()]
 
+    def person_sent_texts(self, addr: str, limit: int = 300) -> list[str]:
+        """이 사람이 보낸 메일의 정제 본문(신규 작성분) — 도시에 '주요 어휘'용.
+
+        본인이 직접 쓴 것만(is_sent=0 이고 발신자=이 addr). 인용된 남의 말·내 말은
+        new_content 단계에서 이미 빠져 있고, 표시부에서 strip_preserved 로 한 번 더
+        보존 인용을 걷는다. 최신순 limit 통(어휘 표본 상한)."""
+        addr = (addr or "").lower()
+        return [r["new_content"] or "" for r in self.db.execute(
+            "SELECT new_content FROM messages "
+            "WHERE is_sent=0 AND LOWER(sender_addr)=? "
+            "ORDER BY sent_on DESC LIMIT ?", (addr, limit))]
+
     def person_name(self, addr: str) -> str:
         """이 주소의 표시 이름(people 우선, 없으면 메일 발신명). 없으면 ''."""
         addr = (addr or "").lower()
