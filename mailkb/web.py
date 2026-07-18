@@ -3029,10 +3029,11 @@ def render_dossier(store, cfg, addr: str) -> str:
     texts = ([t for t in store.person_sent_texts(addr) if t.strip()]
              if not cfg.is_noise_sender_hard(addr) else [])
     if len(texts) >= min_mails:
-        # 내 이름·주소 로컬파트(나를 호칭하는 것)와 본인 이름(서명 누출)은 제외
+        # 제외 대상은 '이 사람 자신'의 서명 이름과 나 호칭뿐. 다른 인물 이름은
+        # 남긴다 — A가 B를 자주 언급하면 "A는 B와 밀접"이라는 강한 신호다.
         extra = ([n for n in cfg.my_names if n]
                  + [a.split("@")[0] for a in cfg.my_addresses]
-                 + [w for w in name.split() if w]
+                 + [w for w in name.split() if len(w) >= 2]   # 주인공 본인 서명
                  + list(cfg.opt("dossier", "word_stop_extra", default=[]) or []))
         words = report.top_words(texts, limit=top_n, extra_stop=extra)
         if words:

@@ -2102,6 +2102,31 @@ class TestWordCloud(unittest.TestCase):
         self.assertNotIn("김도현", words)             # 내 이름 제외
         self.assertIn("타이밍", words)
 
+    def test_english_two_char_dropped_acronyms_kept(self):
+        t = ["EC ED DB AI CVE SoC 타이밍", "EC ED DB AI CVE SoC 타이밍"]
+        words = dict(report.top_words(t, min_count=2))
+        for noise in ("EC", "ED", "DB", "AI"):       # 2자 영문 = 노이즈
+            self.assertNotIn(noise, words)
+        self.assertIn("CVE", words)                  # 3자+ 도메인 약어 유지
+        self.assertIn("SoC", words)
+
+    def test_urls_and_web_terms_dropped(self):
+        t = ["https://confluence.corp/x 참고 타이밍 검증",
+             "www.example.com jira 티켓 타이밍 검증 me@corp.example"]
+        words = dict(report.top_words(t, min_count=2))
+        for noise in ("http", "https", "www", "confluence", "jira", "com", "corp"):
+            self.assertNotIn(noise, {k.lower() for k in words})
+        self.assertIn("타이밍", words)                # 도메인어는 남음
+
+    def test_english_function_words_and_josa_dropped(self):
+        t = ["this is the report for the meeting 타이밍 in progress 에서",
+             "that was the summary of the work 타이밍 as noted 에서"]
+        words = {k.lower() for k in dict(report.top_words(t, min_count=2))}
+        for fn in ("the", "and", "for", "this", "that", "was", "is", "in",
+                   "of", "as", "에서"):
+            self.assertNotIn(fn, words)
+        self.assertIn("타이밍", words)
+
     def _seed_sent(self, addr, n, body):
         recs = [_rec(f"wc{i}", addr, [ME], "건", f"2026-07-{i+1:02d}T09:00:00",
                      body=body) for i in range(n)]
@@ -2140,6 +2165,16 @@ class TestWordCloud(unittest.TestCase):
         self._seed_sent("jira@corp.example", 12, "이슈 NPX-1 갱신되었습니다 담당자")
         d = web.render_dossier(self.store, self.cfg, "jira@corp.example")
         self.assertNotIn("주요 어휘", d)              # 봇은 어휘 구름 생략
+
+    def test_other_person_name_kept_own_name_dropped(self):
+        # 주인공(kim) 발신 메일에 다른 사람(박서준)이 자주 나오면 그건 신호 →
+        # 유지. 본인 이름(kim)만 서명 누출로 제외. (전원 이름 제거는 오설계였음)
+        self._seed_sent("kim@corp.example", 10, "박서준 타이밍 재검증 kim 진행")
+        d = web.render_dossier(self.store, self.cfg, "kim@corp.example")
+        cloud = d.split("주요 어휘", 1)[1]              # 어휘 구름 영역만 검사
+        self.assertIn("박서준", cloud)                 # 다른 인물 이름 = 신호, 유지
+        self.assertIn("타이밍", cloud)
+        self.assertNotIn("kim", cloud)                # 본인 이름은 칩에서 제외
 
     def test_only_counts_person_sent_not_mine(self):
         # 내가 이 사람에게 보낸 것(is_sent=1)은 대상 아님

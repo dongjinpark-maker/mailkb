@@ -457,11 +457,16 @@ def person_metrics(store, cfg, addr: str, weeks: int = 13) -> dict | None:
 
 
 # ── 주요 어휘 (도시에 v1) — 본인 발신어의 가중 빈도. 형태소 분석기(mecab/konlpy)
-# 없이 stdlib 로만: 토큰 분리 → 말미 조사 제거 → 불용어 → 빈도. "형태소 분석"이
-# 아니라 "빈도 뷰"라는 것을 이름('주요 어휘')으로 명확히 한다.
+# 없이 stdlib 로만: URL 제거 → 토큰 분리 → 말미 조사 제거 → 불용어 → 빈도.
+# "형태소 분석"이 아니라 "빈도 뷰"라 이름('주요 어휘')으로 명확히 한다.
+# 불용어 한/영 표준은 stopwords-iso(MIT, github.com/stopwords-iso)에서 발췌·정리.
 
-# 한글 2자+ 또는 영문 시작 2자+(NPX-200·DDR·QAT 등 약어·모델명 보존)
-_WORD_RX = re.compile(r"[가-힣]{2,}|[A-Za-z][A-Za-z0-9+._-]{1,}")
+# URL·이메일 — 본문의 http/https/www/도메인·주소를 통째로 제거(어휘 아님).
+_URL_RX = re.compile(
+    r"https?://\S+|www\.\S+|[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+# 한글 2자+ 또는 영문 시작 3자+(EC·ED·DB·AI 같은 2자 약어는 노이즈라 제외;
+# CVE·QAT·MPW·DDR·NPX-200·SoC 등 3자+ 도메인 약어·모델명은 보존).
+_WORD_RX = re.compile(r"[가-힣]{2,}|[A-Za-z][A-Za-z0-9+.\-]{2,}")
 # 말미 조사 — 긴 것 먼저(에서 > 에). 제거는 어간 2자+ 일 때만(결과→결 같은 과잉절단 방지).
 _JOSA_RX = re.compile(
     r"(에서|으로|에게|한테|처럼|보다|마다|밖에|조차|라도|이라도|든지|까지|부터"
@@ -472,8 +477,9 @@ _ENDING_RX = re.compile(
     r"|드리겠습니다|바랍니다|주시기|주세요|하세요|드려요|해요|합니다|됩니다|입니다"
     r"|습니다)$")
 _HONOR_RX = re.compile(r"(님께|께서|님|씨|군|양)$")
-# 업무메일 상투어·기능어 + 직함·서명 라벨 — 도메인 명사를 드러내려 일반 업무동사도 제외.
-WORD_STOP = frozenset("""
+
+# 한국어 불용어 — stopwords-iso/ko 2자+ 발췌 + 업무메일 상투어·직함·서명·조사.
+_STOP_KO = """
 안녕하세요 안녕하십니까 감사합니다 감사드립니다 감사 수고하세요 수고 부탁드립니다
 부탁드려요 부탁드리겠습니다 부탁 바랍니다 드립니다 드리겠습니다 드려요 올림 드림 인사
 있습니다 없습니다 합니다 했습니다 하겠습니다 됩니다 되었습니다 같습니다 입니다
@@ -482,7 +488,36 @@ WORD_STOP = frozenset("""
 첨부 참고 참조 회신 전달 공유 확인 답변 문의 말씀 안내 검토 요청 진행 예정 필요 처리 부분
 팀장 수석 책임 선임 주임 사원 대리 과장 차장 부장 이사 상무 전무 대표 그룹 본부 사업부
 개발팀 파트 센터 내선 직통 휴대폰 대표번호 사무실
-""".split())
+에서 으로 에게 한테 까지 부터 처럼 마다 밖에 조차 라도 든지
+가까스로 가령 각각 각자 각종 같다 같이 거의 게다가 겨우 결국 고로 과연 관하여 관한
+그들 그때 그래 그래도 그래서 그러나 그러니 그러면 그런데 그럼 그저 근거 기타 나머지
+남들 남짓 너희 다른 다섯 다소 다수 단지 당신 당장 대로 더구나 도착 동시 동안 두번
+뒤이어 등등 따라 따위 때문 마저 마치 만약 만일 만큼 매번 모두 무렵 무슨 무엇 물론
+바로 반대로 반드시 보다 불구 비교 비록 상대 설령 설마 설사 시각 시간 아니 아무 아울러
+아홉 약간 양자 어느 어디 어때 어떤 어떻게 언제 얼마 여덟 여러분 여부 여섯 여전히
+오로지 오직 오히려 외에 우리 우선 응당 의거 의해 이것 이곳 이때 이라면 이래 이런 이상
+이어서 이외 이용 이유 이제 일곱 일단 일반 있다 자기 자신 잠깐 잠시 저것 저기 저희 전부
+전자 정도 제외 조금 즉시 지금 진짜 차라리 첫번째 타인 하게 하고 하곤 하기 하나 하느니
+하는 하더라도 하도록 하든지 하면 하면서 하물며 하여 하여금 하여야 한다면 한데 한마디
+함께 해도 해요 했어요 향하여 향해서 혹시 혹은 혼자 훨씬
+""".split()
+
+# 영어 불용어 — stopwords-iso/en 기능어(3자+) + 웹/툴·첨부 확장자(도메인 아님).
+_STOP_EN = """
+the and for are was this that with from have has had not but you your our all any can
+will would should could been were they them their then than out get got may more most
+some such only also into over under about after before per via its just now how who
+which when where why what does did might must shall her him his she said through during
+between among against without within because while although however therefore moreover
+furthermore these those each every both either neither other another same different few
+several many much least enough too are aren isn don doesn didn couldn wouldn shouldn
+http https www com org net html htm url uri link links click href
+jira confluence wiki sharepoint teams zoom slack outlook gmail email mail mailto cid
+png jpg jpeg gif svg pdf docx xlsx pptx doc xls ppt zip
+""".split()
+
+# 통합(영문은 소문자 저장 — 토큰도 소문자로 대조).
+WORD_STOP = frozenset(_STOP_KO) | frozenset(w.lower() for w in _STOP_EN)
 
 
 def _strip_josa(w: str) -> str:
@@ -509,10 +544,12 @@ def top_words(texts, limit: int = 25, extra_stop=(),
               min_count: int = 2) -> list[tuple[str, int]]:
     """본인 발신 본문 목록 → (단어, 빈도) 상위 limit. 1회성 단어(min_count 미만)는
     '주요' 어휘가 아니므로 제외. 반환은 빈도 내림차순."""
-    stop = WORD_STOP | {str(s).strip() for s in extra_stop if str(s).strip()}
+    stop = WORD_STOP | {s2 for s in extra_stop if (s2 := str(s).strip())} \
+        | {s2.lower() for s in extra_stop if (s2 := str(s).strip())}
     c: Counter = Counter()
     for t in texts:
-        for tok in _WORD_RX.findall(strip_preserved(t or "")):
+        body = _URL_RX.sub(" ", strip_preserved(t or ""))   # URL·이메일 먼저 제거
+        for tok in _WORD_RX.findall(body):
             w = _stem(tok)
             if len(w) < 2 or w in stop or w.lower() in stop:
                 continue
