@@ -4163,6 +4163,14 @@ class TestWeb(unittest.TestCase):
         # 스레드 상태 변경(플래그·숨김·신호 해제/복원) 시 왼쪽 목록 즉시 갱신
         self.assertIn("flag|unflag|hide|unhide|signal-off|signal-on", js)
 
+    def test_appjs_s_key_dismisses_signal(self):
+        # 's' 키 = 선택 행의 신호 끄기(j/k 와 같은 커서 기준). 서버 변경 없이 기존
+        # /thread/N/signal-off(kind=action) 엔드포인트를 호출한다.
+        js = self.web._APP_JS
+        self.assertIn('k === "s"', js)                  # 's' 분기 존재
+        self.assertIn("/signal-off", js)               # 신호 끄기 엔드포인트 호출
+        self.assertIn("kind=action", js)               # 전체 신호 끄기
+
     def test_nav_active_underline(self):
         # 현재 위치한 최상위 메뉴에 밑줄(active) 표시
         js = self.web._APP_JS

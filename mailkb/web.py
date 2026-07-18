@@ -1714,6 +1714,21 @@ _APP_JS = r"""
       rows = navRows(); if (!rows.length) return;
       e.preventDefault(); i = curIdx(rows);
       focusRow(rows, i < 0 ? rows.length - 1 : Math.max(i - 1, 0));
+    } else if (k === "s") {        /* 's' → 선택 행의 신호 끄기(전체) — 목록에서 바로 */
+      rows = navRows(); if (!rows.length) return;
+      i = curIdx(rows); if (i < 0) return;         /* 커서/열린 항목 없으면 무동작 */
+      var sa = rows[i].querySelector("a[href^='/thread/']");
+      var sm = sa && sa.getAttribute("href").match(/\/thread\/(\d+)/);
+      if (!sm) return;
+      e.preventDefault();
+      fetch("/thread/" + sm[1] + "/signal-off", {
+        method: "POST",
+        headers: { "X-Requested-With": "fetch",
+                   "Content-Type": "application/x-www-form-urlencoded" },
+        body: "kind=action", redirect: "manual"    /* 303 안 따라감 — DB 처리만 */
+      }).then(function () { toast("신호 껐어요 · 새 요청 오면 자동 복귀");
+                            refreshDisplay(); })    /* 좌측 목록 in-place 갱신 */
+        .catch(function () {});
     }
   });
 
