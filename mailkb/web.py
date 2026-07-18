@@ -31,6 +31,12 @@ from .store import Store, image_cutoff_for
 _review_job = {"running": False, "msg": "", "step": 0, "total": 7}
 _review_lock = threading.Lock()
 
+# 결정론 데일리 리뷰 자동 갱신(lazy-on-view) — 버튼 없이 오늘치를 배경 재생성한다.
+# {날짜: 마지막 생성 기준선(MAX rowid)} — 새 메일로 rowid 가 늘면 다시 생성.
+# 인메모리(재시작 시 리셋 → 그날 첫 조회에 1회 재생성, 무해). 결정론이라 비용 작음.
+_auto_review_basis: dict = {}
+_auto_lock = threading.Lock()
+
 # AI 검색 백그라운드 잡(단일) — 번역·본문심사에 수십 초 걸려 요청 스레드에서 돌리면
 # 서버(단일 스레드)가 그동안 멈춘다. 별 스레드로 돌리고 /aisearch/status 폴링으로
 # 단계(방법 7)·잠정 결과(방법 8)를 흘린다. prelim=엔진 1차 후보, result=최종.
@@ -558,7 +564,7 @@ input, select, textarea { background: var(--surface); color: var(--ink); }
 .decedit form { display: flex; gap: 6px; margin-top: 4px; flex-wrap: wrap; }
 .decedit input[type=text] { padding: 4px 6px; font-size: 13px;
     border: 1px solid var(--border-strong); border-radius: 6px; width: 260px; }
-/* '오늘 메일 정리 중' 대기 화면 — 사서가 메일을 장부로 옮겨 적는 루프 (순수 CSS) */
+/* 'AI 요약 작성 중' 대기 화면 — 사서가 메일을 장부로 옮겨 적는 루프 (순수 CSS) */
 .libscene { position: relative; height: 112px; max-width: 420px; margin: 16px 0 4px; }
 .libscene .mailstack { position: absolute; left: 22px; bottom: 14px; }
 .libscene .mailstack span { display: block; width: 46px; height: 13px; margin-top: 4px;
@@ -1813,6 +1819,28 @@ def _start_review(cfg, ai: bool, today: str) -> bool:
     return True
 
 
+def _maybe_auto_review(cfg, today: str, max_rowid: int) -> None:
+    """오늘 데일리 리뷰(결정론)를 lazy-on-view 로 배경 재생성한다. 버튼 없이,
+    페이지를 막지 않고(논블로킹) 조용히 — 완료되면 /latest 토큰(데일리 mtime 포함)이
+    바뀌어 app.js 가 홈을 in-place 로 다시 그린다(사용성 무해).
+
+    재생성 조건: 오늘치 파일이 없거나, 마지막 생성 기준선(MAX rowid) 이후 새 메일이
+    들어온 경우. 같은 기준선으로 이미 만들었으면 no-op(매 조회·60초 폴링에도 안전).
+    AI 계층은 넣지 않는다 — 비싸므로 '데일리 리뷰' 버튼(AI 요약)에만."""
+    exists = (Path(cfg.vault) / "daily" / f"{today}.md").exists()
+    with _auto_lock:
+        if exists and _auto_review_basis.get(today) == max_rowid:
+            return                       # 이 기준선으로 이미 생성됨
+    if _start_review(cfg, ai=False, today=today):   # 진행 중 잡 있으면 False → 다음 조회에 재시도
+        with _auto_lock:
+            _auto_review_basis[today] = max_rowid
+
+
+def _max_rowid(store) -> int:
+    row = store.db.execute("SELECT COALESCE(MAX(rowid), 0) FROM messages").fetchone()
+    return int(row[0]) if row else 0
+
+
 # ─────────────────────────────────────────────────── 메일 동기화(백그라운드)
 
 def _do_sync(store, cfg) -> tuple:
@@ -1922,7 +1950,7 @@ def render_review_status(store=None):
             label = esc(msg or "준비 중…")
         # data-review-running: app.js 폴링 훅 마커 (전체 페이지는 meta refresh)
         return ("<div data-review-running='1' hidden></div>"
-                "<h1>오늘 메일 정리 중…</h1>" + _LIB_SCENE +
+                "<h1>AI 요약 작성 중…</h1>" + _LIB_SCENE +
                 f"<div id='rv-meta'><div class='rvbar'>{fill}</div>"
                 f"<p class='dim' id='rv-stage'>{label}</p></div>"
                 "<p class='dim'>메일을 읽고 장기기억 초안을 준비합니다 — "
@@ -1935,7 +1963,7 @@ def render_review_status(store=None):
         if pend:
             links.insert(0, f"<a href='/records?tab=decisions'>"
                             f"반영 대기 {pend}건 → 기억 › 장기기억</a>")
-    return (f"<h1>오늘 메일 정리</h1>{body}"
+    return (f"<h1>AI 요약</h1>{body}"
             "<p>" + " · ".join(links) + " · <a href='/'>홈</a></p>", False)
 
 
@@ -1976,10 +2004,11 @@ def render_home(store, cfg, today: str) -> str:
     """홈 = 단일 대시보드. 구 개입 페이지를 흡수해 '지금 할 일'만 전면에 두고
     나머지 개입은 접는다(미니멀).
 
-    AI 주석(긴급도·사유·제안)은 '오늘 메일 정리'가 붙여 저장한 것을 읽어 반영한다
-    — 홈에서 메모를 주고 재실행하던 'AI 정리' 입력창은 제거(2026-07-17 사용자
-    요청, PROPOSAL-distill.md 가 Phase 2 예고분으로 남겼던 정리. 자동 주석은 유지).
+    결정론 데일리 리뷰는 버튼 없이 lazy-on-view 로 배경 자동 생성된다 — 오늘 홈을
+    열 때 새 메일이 있으면 배경 재생성 후 in-place 갱신(_maybe_auto_review). AI 주석
+    (긴급도·사유·제안)은 'AI 요약'(데일리 페이지 버튼)이 붙여 저장한 것을 읽어 반영.
     """
+    _maybe_auto_review(cfg, today, _max_rowid(store))
     m = build_home(store, cfg, today, load_daily(cfg, today))
     queue = review.apply_saved_ai(m["intervention"],
                                   store.load_intervention_ai(today))
@@ -1987,7 +2016,7 @@ def render_home(store, cfg, today: str) -> str:
     out = [f"<h1>Minerva · {esc(today)}</h1>",
            "<div class='actions'>"
            "<form method='post' action='/sync'><button>메일 동기화</button></form>"
-           + _review_button_forms() + "</div>"]
+           "</div>"]
 
     # ── 지금 할 일 (구 개입 흡수, 미니멀) ──
     if not queue:
@@ -2048,7 +2077,7 @@ def render_home(store, cfg, today: str) -> str:
     out.append("<div class='lensrow'><span class='lh'>장기기억</span>"
                f"<a href='/records?tab=decisions'>결정 <b>{m['n_dec']}</b>{pend}</a></div>")
     if not (m["n_dec"] or m["n_dec_pending"]) and not m["has_review"]:
-        out.append("<p class='dim'>· 장기기억은 <b>오늘 메일 정리</b>가 제안을 올려 "
+        out.append("<p class='dim'>· 장기기억은 <b>AI 요약</b>이 제안을 올려 "
                    "채웁니다 (반영은 기억 › 장기기억에서)</p>")
     return "\n".join(out)
 
@@ -3466,11 +3495,10 @@ def render_search(store, cfg, qs, today: str) -> str:
 
 
 def _review_button_forms() -> str:
-    # '오늘 메일 정리' = AI 5단계(요약·수확·디제스트·분류·주석) 포함 데일리 생성.
-    # '기록만 남기기' = AI 없이 결정론 스냅샷만 (Phase 2 에서 축소 여부 판단).
+    # 결정론 데일리 리뷰는 이제 버튼 없이 lazy-on-view 로 자동 생성(_maybe_auto_review).
+    # 남은 버튼은 'AI 요약' 하나 — 오늘치 리뷰에 AI 계층(요약·수확·주석)을 얹는다.
     return ("<form method='post' action='/review'><input type='hidden' name='ai' value='1'>"
-            "<button>오늘 메일 정리</button></form>"
-            "<form method='post' action='/review'><button>기록만 남기기</button></form>")
+            "<button>AI 요약</button></form>")
 
 
 def render_daily(cfg, day: str, today: str | None = None) -> str:
@@ -3556,7 +3584,7 @@ def render_decisions(store, qs) -> str:
     q = (qs.get("q") or [""])[0].strip()
     counts = store.decision_counts()
     out = ["<h1>장기기억</h1>",
-           "<p class='dim'>메일에서 건진 결정의 영구 기억 — '오늘 메일 정리'가 "
+           "<p class='dim'>메일에서 건진 결정의 영구 기억 — 'AI 요약'이 "
            "반영문 초안을 제안하고, 반영/유보는 사람이 정합니다. 반영된 것만 "
            "검색·회고 재료가 됩니다.</p>"]
     cands = store.decisions(status="candidate")
@@ -3607,7 +3635,10 @@ def render_records(store, cfg, qs, today: str) -> str:
            + " · ".join(tabs) + "</span></div>")
     if tab == "decisions":
         return bar + render_decisions(store, qs)
-    return bar + render_daily(cfg, (qs.get("date") or [today])[0], today)
+    day = (qs.get("date") or [today])[0]
+    if day == today:                     # 오늘 데일리 조회 시에도 배경 자동 생성
+        _maybe_auto_review(cfg, today, _max_rowid(store))
+    return bar + render_daily(cfg, day, today)
 
 
 # ─────────────────────────────────────────────────── 조작(POST) 동작
@@ -3882,15 +3913,18 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         if path == "/latest":             # 표시 최신화 토큰 — DB 변경(새 메일) 감지용(가벼움)
-            # MAX(rowid) 만으로 충분 — messages 는 삭제 없이 append-only 라 새 메일이면
-            # 반드시 증가. COUNT(*) 는 대형 DB 에서 매 폴링(60s)마다 전수 스캔이라 제거.
+            # MAX(rowid): messages 는 삭제 없이 append-only 라 새 메일이면 반드시 증가.
+            # + 오늘 데일리 파일 mtime: 배경 자동 리뷰가 재생성하면 토큰이 바뀌어
+            #   app.js 가 홈을 in-place 로 다시 그린다(결정론 리뷰 자동 반영).
             st = Store(self.cfg.db_path, self.cfg.my_addresses, self.cfg.my_names, noise=self.cfg)
             try:
                 row = st.db.execute(
                     "SELECT COALESCE(MAX(rowid), 0) FROM messages").fetchone()
             finally:
                 st.close()
-            body = str(row[0]).encode("ascii")
+            daily = Path(self.cfg.vault) / "daily" / f"{date.today().isoformat()}.md"
+            mt = int(daily.stat().st_mtime) if daily.exists() else 0
+            body = f"{row[0]}:{mt}".encode("ascii")
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))

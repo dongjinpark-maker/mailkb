@@ -2048,6 +2048,56 @@ class TestRelMetricsViz(unittest.TestCase):
         self.assertIn("<polyline", web._spark_svg([1, 2, 3, 2]))
 
 
+class TestAutoReview(unittest.TestCase):
+    """결정론 데일리 리뷰 lazy-on-view 자동 갱신 — 트리거·기준선 가드."""
+
+    DAY = "2026-07-04"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = Config(home=Path(self.tmp.name), my_addresses=[ME],
+                          my_names=["나"], internal_domains=["corp.example"])
+        (self.cfg.vault / "daily").mkdir(parents=True, exist_ok=True)
+        web._auto_review_basis.clear()
+        self.calls = []
+        self._orig = web._start_review
+        # 실제 스레드 대신 호출만 기록(성공 반환)
+        web._start_review = lambda cfg, ai, today: (self.calls.append((ai, today)) or True)
+
+    def tearDown(self):
+        web._start_review = self._orig
+        web._auto_review_basis.clear()
+        self.tmp.cleanup()
+
+    def _write_daily(self):
+        (self.cfg.vault / "daily" / f"{self.DAY}.md").write_text("x", encoding="utf-8")
+
+    def test_triggers_deterministic_when_missing(self):
+        web._maybe_auto_review(self.cfg, self.DAY, 5)
+        self.assertEqual(self.calls, [(False, self.DAY)])     # AI 없이(결정론)
+
+    def test_noop_when_same_basis_and_file_exists(self):
+        self._write_daily()
+        web._maybe_auto_review(self.cfg, self.DAY, 5)          # 최초 → 기준선 기록
+        self.calls.clear()
+        web._maybe_auto_review(self.cfg, self.DAY, 5)          # 동일 기준선 → no-op
+        self.assertEqual(self.calls, [])
+
+    def test_retriggers_on_new_mail(self):
+        self._write_daily()
+        web._maybe_auto_review(self.cfg, self.DAY, 5)          # 기준선 5
+        self.calls.clear()
+        web._maybe_auto_review(self.cfg, self.DAY, 9)          # 새 메일 → 기준선 변화
+        self.assertEqual(self.calls, [(False, self.DAY)])
+
+    def test_retries_when_file_missing_even_if_basis_recorded(self):
+        # 지난 생성이 실패해 파일이 없으면 같은 기준선이라도 다시 시도
+        web._maybe_auto_review(self.cfg, self.DAY, 5)          # 기록되지만 파일 미생성
+        self.calls.clear()
+        web._maybe_auto_review(self.cfg, self.DAY, 5)
+        self.assertEqual(self.calls, [(False, self.DAY)])
+
+
 class TestPeopleDossierAI(unittest.TestCase):
     """인물 도시에 v2 — AI 요약 캐시·근거 검증·증분 갱신 가드."""
 
@@ -3113,8 +3163,11 @@ class TestWeb(unittest.TestCase):
 
     def test_home_renders(self):
         out = self.web.render_home(self.store, self.cfg, "2026-07-04")
-        self.assertIn("action='/review'", out)   # 리뷰 생성 버튼
-        self.assertIn("action='/sync'", out)      # 동기화 버튼
+        # 데일리 리뷰는 자동(lazy-on-view) → 홈에 리뷰 버튼 없음(2026-07-18)
+        self.assertNotIn("action='/review'", out)
+        self.assertNotIn("오늘 메일 정리", out)
+        self.assertNotIn("기록만 남기기", out)
+        self.assertIn("action='/sync'", out)      # 동기화 버튼은 유지
         self.assertIn("오늘 메일 핵심", out)
         # 개입을 홈에 흡수(미니멀): '지금 할 일' 배너 + 큐 항목 노출
         self.assertIn("지금 할 일", out)
@@ -3127,6 +3180,20 @@ class TestWeb(unittest.TestCase):
         out = self.web.render_home(self.store, self.cfg, "2026-07-04")
         self.assertNotIn("/refine", out)
         self.assertNotIn("AI 정리", out)
+
+    def test_daily_page_has_ai_button_only(self):
+        # 데일리 페이지엔 'AI 요약'(ai=1) 버튼 하나. '기록만 남기기'는 제거.
+        out = self.web.render_daily(self.cfg, "2026-07-04", "2026-07-04")
+        self.assertIn("AI 요약", out)
+        self.assertIn("action='/review'", out)
+        self.assertIn("value='1'", out)              # ai=1 (AI 계층 포함)
+        self.assertNotIn("기록만 남기기", out)
+
+    def test_review_button_forms_single_ai(self):
+        forms = self.web._review_button_forms()
+        self.assertEqual(forms.count("<button>"), 1)
+        self.assertIn("AI 요약", forms)
+        self.assertNotIn("오늘 메일 정리", forms)
         self.assertNotIn("class='refine'", self.web._CSS)
         self.assertNotIn("/refine", self.web._APP_JS)
 
