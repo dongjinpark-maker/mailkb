@@ -14,7 +14,7 @@ from urllib.parse import unquote as urllib_unquote
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from mailkb import actions, distill, notes, report, review, web
+from mailkb import actions, distill, notes, report, review, terms, web
 from mailkb import search as search_mod
 from mailkb.features import classify_message
 from mailkb.clean import (
@@ -1545,16 +1545,18 @@ class TestViewModel(unittest.TestCase):
         self.addCleanup(store.close)
         cfg = Config(home=Path(tmp.name), my_addresses=[ME],
                      ignore_senders=["noreply"], internal_domains=["corp.example"])
+        today = date.today()
+        when = (today - timedelta(days=2)).isoformat()
         store.ingest([
             MailRecord(message_id="<a@t>", subject="검토 요청",
                        sender_name="kim", sender_addr="kim@corp.example",
-                       to=[ME], sent_on="2026-07-04T09:00:00", body_text="확인 부탁"),
+                       to=[ME], sent_on=f"{when}T09:00:00", body_text="확인 부탁"),
             # 스팸(외부) → 미답변에서 제외되어야
             MailRecord(message_id="<b@t>", subject="특가",
                        sender_name="ad", sender_addr="promo@spam.example",
-                       to=[ME], sent_on="2026-07-04T09:10:00", body_text="세일"),
+                       to=[ME], sent_on=f"{when}T09:10:00", body_text="세일"),
         ])
-        home = web.build_home(store, cfg, "2026-07-04", None)
+        home = web.build_home(store, cfg, today.isoformat(), None)
         self.assertEqual(len(home["missed"]), 1)  # 스팸 제외
         self.assertFalse(home["has_review"])
         self.assertEqual(home["n_dec"], 0)         # 결정 렌즈 = 원장 직접 조회
@@ -2013,7 +2015,7 @@ class TestPeopleDossier(unittest.TestCase):
         self.assertIn("보낸 1", d)
         self.assertIn("class='rsfill'", d)                # 회신 속도 막대
         self.assertIn("이 사람", d)
-        self.assertIn("최근 3개월", d)                    # 기간 캡션
+        self.assertIn("최근 6개월", d)                    # 기간 캡션
         # 짧은 기간(한 주) → 스파크라인 생략(graceful)
         self.assertNotIn("class='rspark'", d)
 
@@ -2341,7 +2343,7 @@ class TestPeopleDossierSchema(unittest.TestCase):
 
 
 class TestWordCloud(unittest.TestCase):
-    """도시에 '주요 어휘' — 본인 발신어 빈도. 조사 스트립·과잉절단 방지·불용어·임계."""
+    """도시에 업무 어휘 지도 — 기존 tokenizer 호환 + 새 분석·표시 임계."""
 
     def test_josa_strip_without_overcut(self):
         f = report._strip_josa
@@ -2423,33 +2425,36 @@ class TestWordCloud(unittest.TestCase):
         # 발신 5통(<8) → 카드 없음
         self._seed_sent("kim@corp.example", 5, "타이밍 클로저 마진 검증 진행")
         d = web.render_dossier(self.store, self.cfg, "kim@corp.example")
-        self.assertNotIn("주요 어휘", d)
+        self.assertNotIn("업무 어휘 지도", d)
 
-    def test_card_shows_cloud_above_threshold(self):
+    def test_card_shows_wordmap_above_threshold(self):
         self._seed_sent("kim@corp.example", 10,
                         "타이밍 클로저 마진 재검증. 양자화 회귀 확인 부탁드립니다.")
         d = web.render_dossier(self.store, self.cfg, "kim@corp.example")
-        self.assertIn("주요 어휘", d)
-        self.assertIn("class='wcloud'", d)
-        self.assertIn("발신 10통 기준", d)
+        self.assertIn("업무 어휘 지도", d)
+        self.assertIn("class='wordmap'", d)
+        self.assertIn("반복 구문", d)
+        self.assertIn("발신 10통", d)
+        self.assertIn("메일 단위 출현", d)
         self.assertIn("타이밍", d)
+        self.assertRegex(d, r"href='/thread/\d+'")      # 표현별 근거
         self.assertNotIn("김도현", d)                 # 내 이름 제외
         self.assertNotIn("부탁드립니다", d)           # 상투어 제외
 
-    def test_noise_sender_skips_cloud(self):
+    def test_noise_sender_skips_wordmap(self):
         self._seed_sent("jira@corp.example", 12, "이슈 NPX-1 갱신되었습니다 담당자")
         d = web.render_dossier(self.store, self.cfg, "jira@corp.example")
-        self.assertNotIn("주요 어휘", d)              # 봇은 어휘 구름 생략
+        self.assertNotIn("업무 어휘 지도", d)         # 봇은 어휘 지도 생략
 
     def test_other_person_name_kept_own_name_dropped(self):
         # 주인공(kim) 발신 메일에 다른 사람(박서준)이 자주 나오면 그건 신호 →
         # 유지. 본인 이름(kim)만 서명 누출로 제외. (전원 이름 제거는 오설계였음)
         self._seed_sent("kim@corp.example", 10, "박서준 타이밍 재검증 kim 진행")
         d = web.render_dossier(self.store, self.cfg, "kim@corp.example")
-        cloud = d.split("주요 어휘", 1)[1]              # 어휘 구름 영역만 검사
-        self.assertIn("박서준", cloud)                 # 다른 인물 이름 = 신호, 유지
-        self.assertIn("타이밍", cloud)
-        self.assertNotIn("kim", cloud)                # 본인 이름은 칩에서 제외
+        wordmap = d.split("업무 어휘 지도", 1)[1]
+        self.assertIn("박서준", wordmap)               # 미등록 이름은 정보 손실 없이 유지
+        self.assertIn("타이밍", wordmap)
+        self.assertNotIn(">kim<", wordmap)            # 본인 이름은 칩에서 제외
 
     def test_only_counts_person_sent_not_mine(self):
         # 내가 이 사람에게 보낸 것(is_sent=1)은 대상 아님
@@ -2459,6 +2464,143 @@ class TestWordCloud(unittest.TestCase):
         texts = self.store.person_sent_texts("kim@corp.example")
         self.assertEqual(len(texts), 3)              # kim 발신 3통만
         self.assertTrue(all("내 발신어" not in t for t in texts))
+
+
+class TestWordMapAnalysis(unittest.TestCase):
+    """6개월 업무 어휘 지도 — 대조·문서빈도·군집·추세·근거의 합성 회귀."""
+
+    KIM = "kim@corp.example"
+    LEE = "lee@corp.example"
+    PARK = "park@corp.example"
+
+    @staticmethod
+    def _row(mid, addr, body, when, thread=None, subject=""):
+        return {
+            "id": mid, "thread_id": thread or mid, "subject": subject,
+            "sender_name": addr.split("@")[0], "sender_addr": addr,
+            "sent_on": when, "new_content": body,
+        }
+
+    @staticmethod
+    def _all_terms(profile):
+        out = {x["term"]: x for x in profile["terms"]}
+        for cluster in profile["clusters"]:
+            out.update({x["term"]: x for x in cluster["terms"]})
+        return out
+
+    def test_document_frequency_beats_repetition_and_common_terms(self):
+        rows = []
+        for i in range(8):
+            rows.append(self._row(
+                i + 1, self.KIM, "공통검증 양자화 양자화 양자화",
+                f"2026-07-{i+1:02d}T09:00:00"))
+            rows.append(self._row(
+                i + 20, self.LEE, "공통검증 일정협의",
+                f"2026-07-{i+1:02d}T10:00:00"))
+        profile = terms.analyze(
+            rows, self.KIM, names={self.KIM: "김민수", self.LEE: "이영희"})
+        found = self._all_terms(profile)
+        self.assertEqual(found["양자화"]["support"], 8)  # 24회가 아니라 메일 8통
+        self.assertGreater(found["양자화"]["score"], found["공통검증"]["score"])
+
+    def test_one_mail_repetition_is_not_a_characteristic(self):
+        rows = [self._row(1, self.KIM, "칩렛 " * 20, "2026-07-01T09:00:00")]
+        rows += [self._row(i, self.KIM, "패키지", f"2026-07-{i:02d}T09:00:00")
+                 for i in range(2, 9)]
+        profile = terms.analyze(rows, self.KIM)
+        self.assertNotIn("칩렛", self._all_terms(profile))  # 지지 메일 1통
+
+    def test_signature_is_removed_and_phrase_has_evidence(self):
+        rows = [
+            self._row(i, self.KIM,
+                      "타이밍 클로저 결과입니다.\n--\n홍길동 책임\n전화: 1234",
+                      f"2026-07-{i:02d}T09:00:00", thread=100 + i)
+            for i in range(1, 5)
+        ]
+        profile = terms.analyze(rows, self.KIM, names={self.KIM: "홍길동"})
+        phrases = {x["term"]: x for x in profile["phrases"]}
+        self.assertIn("타이밍 클로저", phrases)
+        self.assertTrue(phrases["타이밍 클로저"]["evidence"])
+        self.assertNotIn("전화", self._all_terms(profile))
+        self.assertNotIn("홍길동", self._all_terms(profile))
+
+    def test_cooccurring_terms_form_separate_clusters(self):
+        rows = [
+            self._row(i, self.KIM, "타이밍 클로저", f"2026-07-{i:02d}T09:00:00")
+            for i in range(1, 5)
+        ]
+        rows += [
+            self._row(10 + i, self.KIM, "양자화 회귀",
+                      f"2026-07-{i+4:02d}T09:00:00")
+            for i in range(1, 5)
+        ]
+        profile = terms.analyze(rows, self.KIM)
+        groups = [{x["term"] for x in c["terms"]} for c in profile["clusters"]]
+        self.assertIn({"타이밍", "클로저"}, groups)
+        self.assertIn({"양자화", "회귀"}, groups)
+
+    def test_recent_rising_term_uses_six_week_overlay(self):
+        rows = [
+            self._row(i, self.KIM, "기존업무", f"2026-02-{i:02d}T09:00:00")
+            for i in range(1, 6)
+        ]
+        rows += [
+            self._row(10 + i, self.KIM, "기존업무 칩렛",
+                      f"2026-07-{i:02d}T09:00:00")
+            for i in range(1, 4)
+        ]
+        profile = terms.analyze(rows, self.KIM)
+        self.assertIn("칩렛", {x["term"] for x in profile["rising"]})
+
+    def test_known_person_mentions_are_separate_from_terms(self):
+        rows = [
+            self._row(i, self.KIM, "박서준과 양자화 검토", f"2026-07-{i:02d}T09:00:00")
+            for i in range(1, 5)
+        ]
+        names = {self.KIM: "김민수", self.PARK: "박서준"}
+        profile = terms.analyze(rows, self.KIM, names=names)
+        self.assertEqual(profile["mentions"][0]["addr"], self.PARK)
+        self.assertEqual(profile["mentions"][0]["support"], 4)
+        self.assertNotIn("박서준", self._all_terms(profile))
+
+    def test_store_window_and_target_scoped_cache_basis(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = Store(Path(td) / "wordmap.sqlite", [ME])
+            try:
+                store.ingest([
+                    _rec("old", self.KIM, [ME], "구자료",
+                         "2025-12-01T09:00:00", "구형어휘"),
+                    _rec("new", self.KIM, [ME], "신자료",
+                         "2026-07-19T09:00:00", "신규어휘"),
+                    _rec("lee", self.LEE, [ME], "대조",
+                         "2026-07-19T10:00:00", "대조어휘"),
+                ])
+                basis = store.person_word_basis(self.KIM)
+                self.assertEqual(basis["mail_count"], 1)   # 6개월 밖 메일 제외
+                rows = store.people_word_rows([self.KIM, self.LEE])
+                self.assertNotIn("구형어휘", {r["new_content"] for r in rows})
+                self.assertEqual(store.person_sent_texts(self.KIM), ["신규어휘"])
+                before = basis["basis_message_id"]
+                cached = {"mail_count": 1, "terms": [{"term": "신규어휘"}]}
+                store.save_people_word_profile(
+                    self.KIM, cached, basis, 26, "test-v1")
+                self.assertEqual(
+                    store.people_word_profile(
+                        self.KIM, basis, 26, "test-v1"), cached)
+                store.ingest([_rec("lee2", self.LEE, [ME], "대조2",
+                                   "2026-07-19T11:00:00", "새 대조어휘")])
+                unchanged = store.person_word_basis(self.KIM)
+                self.assertEqual(unchanged["basis_message_id"], before)
+                self.assertIsNotNone(store.people_word_profile(
+                    self.KIM, unchanged, 26, "test-v1"))
+                store.ingest([_rec("new2", self.KIM, [ME], "신자료2",
+                                   "2026-07-19T12:00:00", "새 특징어")])
+                changed = store.person_word_basis(self.KIM)
+                self.assertGreater(changed["basis_message_id"], before)
+                self.assertIsNone(store.people_word_profile(
+                    self.KIM, changed, 26, "test-v1"))
+            finally:
+                store.close()
 
 
 class TestDecisionRegex(unittest.TestCase):

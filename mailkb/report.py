@@ -392,7 +392,7 @@ def _intensity(recv: int, sent: int, last_seen: str, today: str) -> float:
     return recv * 1.0 + sent * 0.5
 
 
-def rank_people(store, cfg, window_weeks: int = 13, limit: int = 50) -> list[dict]:
+def rank_people(store, cfg, window_weeks: int = 26, limit: int = 50) -> list[dict]:
     """인물 랜딩 — 최근 window_weeks 주 교류 강도순. 봇·자동발송(ignore/blocked)만
     제외하고 외부 협력사는 남긴다(도시에 대상). 각 원소: addr·name·recv·sent·
     last_seen·score."""
@@ -416,7 +416,7 @@ def _addr_in_to(m: dict, addr: str) -> bool:
                     for a in (m.get("to_addrs") or "").split(";") if a.strip()}
 
 
-def person_metrics(store, cfg, addr: str, weeks: int = 13) -> dict | None:
+def person_metrics(store, cfg, addr: str, weeks: int = 26) -> dict | None:
     """단일 인물의 결정론 지표 — 관계 수치·진행중·미결(내 대기). 전원 대상
     report.load 를 한 번 로드해 이 addr 로 좁힌다(→ /stats 수치와 정의상 일치)."""
     extra_me = {a.lower() for a in getattr(cfg, "my_addresses", []) or []}

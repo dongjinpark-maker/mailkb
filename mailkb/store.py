@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -98,6 +99,10 @@ CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id);
 CREATE INDEX IF NOT EXISTS idx_messages_sent_on ON messages(sent_on);
 CREATE INDEX IF NOT EXISTS idx_messages_thread_date
     ON messages(thread_id, sent_on DESC, id DESC);
+-- 인물 업무 어휘 지도: 6개월 창의 특정 발신자 본문만 읽는다. LOWER() 없이
+-- 저장 단계에서 정규화한 sender_addr를 그대로 조회해 대형 DB에서도 범위 탐색.
+CREATE INDEX IF NOT EXISTS idx_messages_sender_date
+    ON messages(is_sent, sender_addr, sent_on DESC, id DESC);
 
 CREATE TABLE IF NOT EXISTS threads (
     id                INTEGER PRIMARY KEY,
@@ -194,6 +199,18 @@ CREATE TABLE IF NOT EXISTS people_dossier (
     updated         TEXT DEFAULT '',
     basis_msg_count INTEGER DEFAULT 0,
     validator_version INTEGER DEFAULT 1 -- 인용 출처 검증 규약 버전
+);
+
+-- 인물 업무 어휘 지도 파생 캐시. 원문은 복제하지 않고 표시용 점수·근거 ID만
+-- JSON으로 저장한다. 대상 인물 최신 메일 또는 날짜 창/규칙이 바뀔 때만 갱신.
+CREATE TABLE IF NOT EXISTS people_word_profiles (
+    addr             TEXT PRIMARY KEY,
+    profile_json     TEXT DEFAULT '',
+    basis_message_id INTEGER DEFAULT 0,
+    window_end       TEXT DEFAULT '',
+    window_weeks     INTEGER DEFAULT 26,
+    feature_version  TEXT DEFAULT '',
+    updated          TEXT DEFAULT ''
 );
 
 -- AI 검색 결과 캐시 (Phase 2) — 질의별 지속 저장. 뒤로가기·반복 질의 재과금 방지 +
@@ -1316,7 +1333,7 @@ class Store:
                        OR (';' || cc_addrs || ';') LIKE ?))""",
             (addr, like, like))}
 
-    def person_window_counts(self, window_weeks: int = 13) -> list[dict]:
+    def person_window_counts(self, window_weeks: int = 26) -> list[dict]:
         """최근 window_weeks 주 창 안 addr별 (recv, sent, last_seen) 집계 —
         인물 랜딩 순위 재료. 창은 DB 최신 메일(asof) 기준 상대(결정론·테스트 안정).
         점수 공식은 report._intensity 로 분리 — 여기선 원자료만 만든다."""
@@ -1353,17 +1370,115 @@ class Store:
                  "recv": v[0], "sent": v[1], "last_seen": v[2]}
                 for a, v in agg.items()]
 
-    def person_sent_texts(self, addr: str, limit: int = 300) -> list[str]:
-        """이 사람이 보낸 메일의 정제 본문(신규 작성분) — 도시에 '주요 어휘'용.
+    def person_sent_texts(self, addr: str, limit: int = 300,
+                          window_weeks: int = 26) -> list[str]:
+        """이 사람이 최근 창에 보낸 정제 본문 — AI 도시에 어휘 재료용.
 
         본인이 직접 쓴 것만(is_sent=0 이고 발신자=이 addr). 인용된 남의 말·내 말은
         new_content 단계에서 이미 빠져 있고, 표시부에서 strip_preserved 로 한 번 더
-        보존 인용을 걷는다. 최신순 limit 통(어휘 표본 상한)."""
+        보존 인용을 걷는다. 최신순 limit 통(어휘 표본 상한), 기본 창은 26주."""
         addr = (addr or "").lower()
+        latest = self.db.execute(
+            "SELECT MAX(sent_on) FROM messages WHERE sent_on != ''").fetchone()[0]
+        if not latest:
+            return []
+        since = self.db.execute(
+            "SELECT date(?, ?)", (latest, f"-{window_weeks * 7} days")
+        ).fetchone()[0]
         return [r["new_content"] or "" for r in self.db.execute(
             "SELECT new_content FROM messages "
-            "WHERE is_sent=0 AND LOWER(sender_addr)=? "
-            "ORDER BY sent_on DESC LIMIT ?", (addr, limit))]
+            "WHERE is_sent=0 AND sender_addr=? AND sent_on >= ? "
+            "ORDER BY sent_on DESC LIMIT ?", (addr, since, limit))]
+
+    def person_word_basis(self, addr: str, window_weeks: int = 26) -> dict:
+        """업무 어휘 캐시 기준선 — DB 최신일과 창 안 대상 메일의 최신 ID·통수.
+
+        다른 사람이 같은 날 보낸 새 메일은 대상 캐시를 깨지 않는다. 날짜가
+        넘어가 창 경계가 움직이거나 대상 인물 메일이 추가되면 다음 조회에서 갱신.
+        """
+        addr = (addr or "").strip().lower()
+        latest = self.db.execute(
+            "SELECT MAX(sent_on) FROM messages WHERE sent_on != ''").fetchone()[0]
+        if not latest:
+            return {"window_end": "", "since": "", "basis_message_id": 0,
+                    "mail_count": 0}
+        since = self.db.execute(
+            "SELECT date(?, ?)", (latest, f"-{window_weeks * 7} days")
+        ).fetchone()[0]
+        row = self.db.execute(
+            """SELECT COALESCE(MAX(id), 0), COUNT(*)
+               FROM messages
+               WHERE is_sent=0 AND sender_addr=? AND sent_on >= ?""",
+            (addr, since),
+        ).fetchone()
+        return {
+            "window_end": latest[:10],
+            "since": since,
+            "basis_message_id": int(row[0]),
+            "mail_count": int(row[1]),
+        }
+
+    def people_word_rows(self, addrs, window_weeks: int = 26) -> list[sqlite3.Row]:
+        """업무 어휘 대조 코퍼스 — 최근 창의 선택된 사람 발신 메일 메타+본문."""
+        normalized = sorted({str(a).strip().lower() for a in addrs if str(a).strip()})
+        if not normalized:
+            return []
+        latest = self.db.execute(
+            "SELECT MAX(sent_on) FROM messages WHERE sent_on != ''").fetchone()[0]
+        if not latest:
+            return []
+        since = self.db.execute(
+            "SELECT date(?, ?)", (latest, f"-{window_weeks * 7} days")
+        ).fetchone()[0]
+        marks = ",".join("?" * len(normalized))
+        return self.db.execute(
+            f"""SELECT id, thread_id, subject, sender_name, sender_addr,
+                       sent_on, new_content
+                FROM messages
+                WHERE is_sent=0 AND sender_addr IN ({marks}) AND sent_on >= ?""",
+            [*normalized, since],
+        ).fetchall()
+
+    def people_word_profile(self, addr: str, basis: dict, window_weeks: int,
+                            feature_version: str) -> dict | None:
+        """현재 기준선과 정확히 맞는 업무 어휘 파생 캐시를 읽는다."""
+        row = self.db.execute(
+            """SELECT profile_json FROM people_word_profiles
+               WHERE addr=? AND basis_message_id=? AND window_end=?
+                 AND window_weeks=? AND feature_version=?""",
+            ((addr or "").strip().lower(), basis["basis_message_id"],
+             basis["window_end"], window_weeks, feature_version),
+        ).fetchone()
+        if not row or not row["profile_json"]:
+            return None
+        try:
+            value = json.loads(row["profile_json"])
+        except (TypeError, ValueError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    def save_people_word_profile(self, addr: str, profile: dict, basis: dict,
+                                 window_weeks: int,
+                                 feature_version: str) -> None:
+        """업무 어휘 파생 결과 저장. 기존 메일 원문은 캐시에 복제하지 않는다."""
+        self.db.execute(
+            """INSERT INTO people_word_profiles
+               (addr, profile_json, basis_message_id, window_end, window_weeks,
+                feature_version, updated)
+               VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+               ON CONFLICT(addr) DO UPDATE SET
+                 profile_json=excluded.profile_json,
+                 basis_message_id=excluded.basis_message_id,
+                 window_end=excluded.window_end,
+                 window_weeks=excluded.window_weeks,
+                 feature_version=excluded.feature_version,
+                 updated=excluded.updated""",
+            ((addr or "").strip().lower(),
+             json.dumps(profile, ensure_ascii=False, separators=(",", ":")),
+             basis["basis_message_id"], basis["window_end"], window_weeks,
+             feature_version),
+        )
+        self.db.commit()
 
     def person_msg_count(self, addr: str) -> int:
         """이 사람 관련 메시지 수(양방향) — 도시에 증분 갱신 가드(basis)용."""

@@ -21,7 +21,7 @@ from datetime import date, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-from . import __version__, actions, config as cfgmod, report, review
+from . import __version__, actions, config as cfgmod, report, review, terms
 from .clean import (PRESERVED_MARK, QFOLD_CLOSE, QFOLD_OPEN,
                     hide_image_signatures, strip_preserved)
 from .store import Store, image_cutoff_for
@@ -277,16 +277,26 @@ h1 { font-size: 20px; } h2 { font-size: 17px; margin-top: 22px; }
 .dcard ul { margin: 6px 0; padding-left: 18px; }
 .dcard li { margin: 4px 0; line-height: 1.5; }
 .dcard p { color: var(--ink-2); line-height: 1.6; }
-.wcloud { display: flex; flex-wrap: wrap; gap: 6px 7px; align-items: center;
-    padding: 6px 0 2px; }
-.wcloud .wc { display: inline-block; padding: 2px 9px; border-radius: 999px;
-    background: var(--surface-3); color: var(--ink-2); line-height: 1.35;
-    white-space: nowrap; }
-.wcloud .wc.hi { background: var(--sel-bg); color: var(--accent-strong);
-    font-weight: 600; }
-.wcloud .wc.mid { color: var(--ink); }
-.wcloud .wc.lo { background: var(--surface-2); color: var(--ink-3); }
-.wcloud .wc:hover { color: var(--accent); }
+.wordmap { padding: 2px 0; }
+.wmgroup { display: grid; grid-template-columns: minmax(90px, 145px) 1fr;
+    gap: 10px; align-items: start; padding: 8px 0;
+    border-bottom: 1px solid var(--border); }
+.wmgroup:last-of-type { border-bottom: 0; }
+.wmlabel { color: var(--ink-2); font-size: 12.5px; font-weight: 600;
+    overflow-wrap: anywhere; }
+.wmterms { display: flex; flex-wrap: wrap; gap: 5px 6px; min-width: 0; }
+.wmterm { display: inline-flex; align-items: baseline; gap: 4px;
+    padding: 2px 7px; border: 1px solid var(--border); border-radius: 4px;
+    background: var(--surface-2); color: var(--ink); font-size: 12.5px;
+    line-height: 1.4; white-space: nowrap; }
+.wmterm:hover { border-color: var(--accent); color: var(--accent); text-decoration: none; }
+.wmterm .wmn { color: var(--ink-3); font-size: 11px; font-variant-numeric: tabular-nums; }
+.wmrise { color: var(--accent-strong); }
+.wmmentions { display: flex; flex-wrap: wrap; gap: 5px 10px; }
+.wmmentions a { font-size: 12.5px; }
+@media (max-width: 560px) {
+    .wmgroup { grid-template-columns: 1fr; gap: 5px; }
+}
 .dcap { color: var(--ink-3); font-size: 12px; margin: 6px 0 0; }
 /* 관계 수치 시각화 — 자족적(팔레트 토큰만, report.CSS 불필요) */
 .relbal { display: flex; align-items: center; gap: 10px; margin: 10px 0 2px; }
@@ -2988,7 +2998,7 @@ def _days_ago(iso: str, ref: str) -> str:
 def render_people_page(store, cfg) -> str:
     """'인물' 랜딩 — 최근 N개월 교류 강도순 목록. 순위는 report.rank_people
     (계산 분리), 미결 배지는 액션 큐를 발신자별 집계."""
-    win = int(cfg.opt("dossier", "window_weeks", default=13) or 13)
+    win = int(cfg.opt("dossier", "window_weeks", default=26) or 26)
     ranked = report.rank_people(store, cfg, window_weeks=win)
     out = ["<h1>인물</h1>",
            f"<p class='dim'>최근 {max(1, win // 4)}개월 · 교류 강도순 · "
@@ -3030,22 +3040,59 @@ def render_people_page(store, cfg) -> str:
     return "\n".join(out)
 
 
-def _wordcloud_html(words, n_mails: int) -> str:
-    """빈도 태그 클라우드(키워드 칩) — 크기·농도로 빈도를 직관화. 빈도 폭이 좁거나
-    균일하면 중간값으로 두어 납작해지지 않게 한다. 단어별 근거 링크는 여러 스레드에
-    걸쳐 v1 생략, 발신 통수만 표기."""
-    counts = [c for _, c in words]
-    lo, hi = min(counts), max(counts)
-    span = hi - lo
-    tags = []
-    for w, c in words:
-        r = 0.5 if span == 0 else (c - lo) / span   # 0..1 (균일하면 중간)
-        size = round(14 + r * 12)                   # 14..26px (읽히는 하한)
-        tier = "hi" if r >= 0.66 else ("mid" if r >= 0.33 else "lo")
-        tags.append(f"<span class='wc {tier}' style='font-size:{size}px' "
-                    f"title='{c}회'>{esc(w)}</span>")
-    return (f"<div class='wcloud'>{' '.join(tags)}</div>"
-            f"<p class='dcap'>발신 {n_mails}통 기준 · 인용·상투어 제외</p>")
+def _wordmap_chip(item, css: str = "") -> str:
+    """특징어 칩 — 메일 단위 지지도와 최신 근거 스레드를 함께 표시."""
+    support = int(item.get("support", 0))
+    evidence = item.get("evidence") or []
+    title = f"{support}통에서 확인"
+    if "lift" in item:
+        title += f" · 다른 인물 대비 {float(item['lift']):+.1f}"
+    if "ratio" in item:
+        title += f" · 최근 지지율 {float(item['ratio']):.1f}배"
+    body = (f"{esc(item.get('term', ''))}"
+            f"<span class='wmn'>{support}</span>")
+    classes = f"wmterm {css}".strip()
+    if evidence:
+        return (f"<a class='{classes}' href='/thread/{int(evidence[0])}' "
+                f"title='{esc(title)}'>{body}</a>")
+    return f"<span class='{classes}' title='{esc(title)}'>{body}</span>"
+
+
+def _wordmap_html(profile: dict, months: int = 6) -> str:
+    """업무 어휘 지도 — 구문·공기어 군집·특징어·상승어·사람 언급."""
+    rows = []
+    phrases = profile.get("phrases") or []
+    if phrases:
+        rows.append("<div class='wmgroup'><div class='wmlabel'>반복 구문</div>"
+                    f"<div class='wmterms'>{''.join(_wordmap_chip(x) for x in phrases)}</div>"
+                    "</div>")
+    for cluster in profile.get("clusters") or []:
+        chips = "".join(_wordmap_chip(x) for x in cluster.get("terms") or [])
+        if chips:
+            rows.append(
+                f"<div class='wmgroup'><div class='wmlabel'>{esc(cluster.get('label', '연관어'))}"
+                f"</div><div class='wmterms'>{chips}</div></div>")
+    singles = profile.get("terms") or []
+    if singles:
+        rows.append("<div class='wmgroup'><div class='wmlabel'>특징어</div>"
+                    f"<div class='wmterms'>{''.join(_wordmap_chip(x) for x in singles)}</div>"
+                    "</div>")
+    rising = profile.get("rising") or []
+    if rising:
+        rows.append("<div class='wmgroup'><div class='wmlabel'>최근 상승</div>"
+                    f"<div class='wmterms'>{''.join(_wordmap_chip(x, 'wmrise') for x in rising)}"
+                    "</div></div>")
+    mentions = profile.get("mentions") or []
+    if mentions:
+        links = "".join(
+            f"<a href='/people?addr={_q(x['addr'])}'>{esc(x['name'])} "
+            f"<span class='dim'>{int(x['support'])}통</span></a>"
+            for x in mentions)
+        rows.append("<div class='wmgroup'><div class='wmlabel'>함께 언급</div>"
+                    f"<div class='wmmentions'>{links}</div></div>")
+    return (f"<div class='wordmap'>{''.join(rows)}</div>"
+            f"<p class='dcap'>최근 {months}개월 · 발신 {int(profile.get('mail_count', 0))}통"
+            " · 메일 단위 출현 · 다른 인물 대비 · 표현을 누르면 근거 스레드로 이동</p>")
 
 
 def _spark_svg(series, w: int = 120, h: int = 22) -> str:
@@ -3150,7 +3197,7 @@ def render_dossier(store, cfg, addr: str) -> str:
     if not addr:
         return "<h1>인물</h1><p class='empty'>주소가 없습니다</p>"
     name = store.person_name(addr) or addr
-    win = int(cfg.opt("dossier", "window_weeks", default=13) or 13)
+    win = int(cfg.opt("dossier", "window_weeks", default=26) or 26)
     m = report.person_metrics(store, cfg, addr, weeks=win)
     out = ["<div class='personhead'><a href='/people' class='backlink'>← 인물</a>"
            f"<span class='ptitle'>{esc(name)}</span>"
@@ -3215,22 +3262,39 @@ def render_dossier(store, cfg, addr: str) -> str:
             for s in sigs[:8])
         cards.append(("최근 변화", f"<ul>{lis}</ul>"))
 
-    # 6. 주요 어휘 (본인 발신어 빈도 태그 클라우드) — 발신 통수가 임계 이상일 때만.
-    # 봇·자동발송(하드 노이즈)은 어휘 구름이 무의미하므로 건너뛴다.
+    # 6. 업무 어휘 지도 — 최근 창 안 메일 단위 지지도·대조 점수·공기어 군집.
+    # 하드 노이즈는 제외하고, 파생 캐시는 대상 인물 최신 메일에만 묶는다.
     min_mails = int(cfg.opt("dossier", "wordcloud_min_mails", default=8) or 8)
     top_n = int(cfg.opt("dossier", "wordcloud_top", default=25) or 25)
-    texts = ([t for t in store.person_sent_texts(addr) if t.strip()]
-             if not cfg.is_noise_sender_hard(addr) else [])
-    if len(texts) >= min_mails:
-        # 제외 대상은 '이 사람 자신'의 서명 이름과 나 호칭뿐. 다른 인물 이름은
-        # 남긴다 — A가 B를 자주 언급하면 "A는 B와 밀접"이라는 강한 신호다.
+    basis = (store.person_word_basis(addr, win)
+             if not cfg.is_noise_sender_hard(addr) else None)
+    if basis and basis["mail_count"] >= min_mails:
         extra = ([n for n in cfg.my_names if n]
                  + [a.split("@")[0] for a in cfg.my_addresses]
-                 + [w for w in name.split() if len(w) >= 2]   # 주인공 본인 서명
                  + list(cfg.opt("dossier", "word_stop_extra", default=[]) or []))
-        words = report.top_words(texts, limit=top_n, extra_stop=extra)
-        if words:
-            cards.append(("주요 어휘", _wordcloud_html(words, len(texts))))
+        ranked = report.rank_people(store, cfg, window_weeks=win, limit=50)
+        eligible = {r["addr"].lower() for r in ranked}
+        eligible.add(addr)
+        names = {r["addr"].lower(): (r["name"] or r["addr"]) for r in ranked}
+        # 대조 코퍼스는 상위 교신자 50명으로 제한하되, 이름 언급 분리는 people의
+        # 더 넓은 주소록을 쓴다. 낮은 빈도의 실제 협업자 이름도 특징어로 섞지 않는다.
+        for person in store.frequent_people(limit=500):
+            paddr = (person["addr"] or "").lower()
+            if paddr and not cfg.is_noise_sender_hard(paddr):
+                names.setdefault(paddr, person["name"] or paddr)
+        names[addr] = name
+        version = terms.profile_signature(
+            extra, eligible, top_n, name, people_names=names)
+        profile = store.people_word_profile(addr, basis, win, version)
+        if profile is None:
+            rows = store.people_word_rows(eligible, win)
+            profile = terms.analyze(
+                rows, addr, names=names, extra_stop=extra, top_n=top_n)
+            store.save_people_word_profile(addr, profile, basis, win, version)
+        if any(profile.get(k) for k in
+               ("clusters", "terms", "phrases", "rising", "mentions")):
+            cards.append(("업무 어휘 지도",
+                          _wordmap_html(profile, months=max(1, win // 4))))
 
     if not cards and not has_ai:
         out.append("<p class='empty'>아직 이 사람에 대한 도시에 재료가 없습니다.</p>")
