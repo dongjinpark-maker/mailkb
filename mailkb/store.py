@@ -9,11 +9,13 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import search as search_mod
+from . import terms as terms_mod
 from .clean import (extract_new_content, inject_inline_images,
                     normalize_subject, sanitize_html, strip_preserved)
 from .features import FEATURE_VERSION, classify_message
@@ -67,6 +69,33 @@ CREATE TABLE IF NOT EXISTS thread_state (
     action_has_deadline     INTEGER NOT NULL DEFAULT 0,
     completion_after_action INTEGER NOT NULL DEFAULT 0
 );
+"""
+
+_TERM_FEATURES_DDL = """
+CREATE TABLE IF NOT EXISTS message_term_features (
+    message_id   INTEGER PRIMARY KEY,
+    feature_json BLOB NOT NULL DEFAULT X''
+);
+CREATE TABLE IF NOT EXISTS message_term_bags (
+    message_id       INTEGER PRIMARY KEY,
+    body_bag_json    BLOB NOT NULL DEFAULT X'',
+    subject_bag_json BLOB NOT NULL DEFAULT X''
+);
+CREATE TABLE IF NOT EXISTS message_term_subject_delta (
+    message_id INTEGER NOT NULL,
+    kind       TEXT NOT NULL,       -- 'term' | 'phrase'
+    term       TEXT NOT NULL,
+    PRIMARY KEY (message_id, kind, term)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS person_term_window (
+    sender_addr TEXT NOT NULL,
+    term        TEXT NOT NULL,
+    kind        TEXT NOT NULL,       -- 'term' | 'phrase'
+    mail_df     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (kind, term, sender_addr)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_messages_word_thread
+    ON messages(is_sent, sender_addr, thread_id, sent_on, id);
 """
 
 _SCHEMA = """
@@ -201,8 +230,8 @@ CREATE TABLE IF NOT EXISTS people_dossier (
     validator_version INTEGER DEFAULT 1 -- 인용 출처 검증 규약 버전
 );
 
--- 인물 업무 어휘 지도 파생 캐시. 원문은 복제하지 않고 표시용 점수·근거 ID만
--- JSON으로 저장한다. 대상 인물 최신 메일 또는 날짜 창/규칙이 바뀔 때만 갱신.
+-- 인물 업무 어휘 지도 최종 파생 캐시. 원문은 복제하지 않고 표시용 점수·근거
+-- ID만 저장한다. 실제 26주 대조 메일 집합이나 규칙이 바뀔 때만 갱신한다.
 CREATE TABLE IF NOT EXISTS people_word_profiles (
     addr             TEXT PRIMARY KEY,
     profile_json     TEXT DEFAULT '',
@@ -364,6 +393,7 @@ class Store:
         # 파생 테이블(재구축 가능) — 버전 마이그레이션이 drop+재생성으로 스키마를 바꾼다.
         self.db.executescript(_FEATURES_DDL)
         self.db.executescript(_THREAD_STATE_DDL)
+        self.db.executescript(_TERM_FEATURES_DDL)
         # 일반 스키마 개편은 clean start 원칙. 목록용 파생 테이블만 원본 messages에서
         # 결과 불변으로 재생성할 수 있어 _ensure_derived_state가 버전별 1회 백필한다.
         try:
@@ -374,6 +404,9 @@ class Store:
             self.fts_tokenizer = "unicode61"
         self.db.commit()
         self._ensure_derived_state()
+        self._term_features_ready = self._term_features_are_current()
+        self._term_bags_ready = self._term_bags_are_current()
+        self._word_background_cache: dict[tuple, dict] = {}
 
     def close(self) -> None:
         self.db.close()
@@ -451,6 +484,303 @@ class Store:
             f"INSERT INTO message_features (message_id, {cols}) VALUES ({marks})",
             (message_id, *[feats[c] for c in _FEATURE_COLS]),
         )
+
+    def _term_feature_version(self) -> str:
+        return str(terms_mod.WORD_FEATURE_VERSION)
+
+    def _word_window_weeks(self) -> int:
+        raw = (self._noise.opt("dossier", "window_weeks", default=26)
+               if self._noise is not None and hasattr(self._noise, "opt")
+               else 26)
+        try:
+            return max(1, min(260, int(raw or 26)))
+        except (TypeError, ValueError):
+            return 26
+
+    def _term_window_is_current(self) -> bool:
+        row = self.db.execute(
+            "SELECT value FROM sync_state WHERE key='term_window_weeks'"
+        ).fetchone()
+        return bool(row and row["value"] == str(self._word_window_weeks()))
+
+    def _word_bounds(self, window_weeks: int | None = None
+                     ) -> tuple[str, str]:
+        latest = self.db.execute(
+            "SELECT MAX(sent_on) FROM messages WHERE sent_on != ''").fetchone()[0]
+        if not latest:
+            return "", ""
+        weeks = self._word_window_weeks() if window_weeks is None else window_weeks
+        since = self.db.execute(
+            "SELECT date(?, ?)", (latest, f"-{int(weeks) * 7} days")
+        ).fetchone()[0]
+        return latest, since
+
+    def _term_features_are_current(self) -> bool:
+        row = self.db.execute(
+            "SELECT value FROM sync_state WHERE key='term_feature_version'"
+        ).fetchone()
+        return bool(
+            row and row["value"] == self._term_feature_version()
+            and self._term_window_is_current()
+        )
+
+    def _insert_term_features(self, message_id: int, new_content: str,
+                              subject: str) -> None:
+        self.db.execute(
+            "INSERT OR REPLACE INTO message_term_features "
+            "(message_id, feature_json) VALUES (?, ?)",
+            (message_id, terms_mod.encode_features(new_content, subject)),
+        )
+
+    def _sync_term_features(self, message_ids: list[int]) -> None:
+        """메일별 어휘 사실을 sync 트랜잭션 안에서 버전 백필한다.
+
+        웹 Store 초기화에서는 호출하지 않는다. 새 버전 배포 후에도 페이지 시작을
+        막지 않고, 다음 Outlook sync가 최근 분석 창의 본문만 한 번 읽는다.
+        """
+        version = self._term_feature_version()
+        have = self.db.execute(
+            "SELECT value FROM sync_state WHERE key='term_feature_version'"
+        ).fetchone()
+        full = not (
+            have and have["value"] == version
+            and self._term_window_is_current()
+        )
+        _, since = self._word_bounds()
+        if full:
+            self.db.execute("DELETE FROM message_term_features")
+            self.db.execute("DELETE FROM message_term_bags")
+            self.db.execute("DELETE FROM message_term_subject_delta")
+            self.db.execute("DELETE FROM person_term_window")
+            self.db.execute(
+                "DELETE FROM sync_state WHERE key='term_bag_version'")
+            for row in self.db.execute(
+                """SELECT id, new_content, subject
+                   FROM messages
+                   WHERE is_sent=0 AND sent_on >= ?
+                   ORDER BY id""", (since or "9999",)):
+                self._insert_term_features(
+                    row["id"], row["new_content"] or "",
+                    row["subject"] or "")
+        else:
+            self.db.execute(
+                """DELETE FROM message_term_features
+                   WHERE message_id IN (
+                     SELECT id FROM messages
+                     WHERE is_sent!=0 OR sent_on < ?
+                   )""", (since or "9999",))
+            for pos in range(0, len(message_ids), 500):
+                chunk = message_ids[pos:pos + 500]
+                marks = ",".join("?" * len(chunk))
+                rows = self.db.execute(
+                    f"""SELECT id, new_content, subject
+                        FROM messages
+                        WHERE is_sent=0 AND sent_on >= ?
+                          AND id IN ({marks})
+                        ORDER BY id""",
+                    [since or "9999", *chunk],
+                ).fetchall()
+                for row in rows:
+                    self._insert_term_features(
+                        row["id"], row["new_content"] or "",
+                        row["subject"] or "")
+        self.db.execute(
+            "INSERT INTO sync_state(key, value) VALUES('term_feature_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (version,))
+        self.db.execute(
+            "INSERT INTO sync_state(key, value) VALUES('term_window_weeks', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(self._word_window_weeks()),))
+        self._term_features_ready = True
+
+    def word_people_names(self) -> dict[str, str]:
+        """어휘에서 사람 언급을 분리할 현재 주소록. 하드 노이즈는 제외."""
+        out = {}
+        for row in self.db.execute(
+                "SELECT addr, name FROM people WHERE name != ''"):
+            addr = (row["addr"] or "").lower()
+            if addr and not self._is_hard_noise(addr, ""):
+                out[addr] = row["name"] or addr
+        return out
+
+    def _word_extra_stop(self) -> list[str]:
+        extra = list(self.my_names)
+        extra.extend(a.split("@")[0] for a in self.my_addresses)
+        if self._noise is not None and hasattr(self._noise, "opt"):
+            extra.extend(
+                self._noise.opt(
+                    "dossier", "word_stop_extra", default=[]) or [])
+        return extra
+
+    def _term_bag_version(self) -> str:
+        payload = {
+            "feature": terms_mod.WORD_FEATURE_VERSION,
+            "projection": terms_mod.WORD_BAG_VERSION,
+            "window_weeks": self._word_window_weeks(),
+            "names": sorted(self.word_people_names().items()),
+            "stop": sorted(str(v).strip().lower()
+                           for v in self._word_extra_stop() if str(v).strip()),
+        }
+        raw = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()[:20]
+
+    def _term_bags_are_current(self) -> bool:
+        if not self._term_features_are_current():
+            return False
+        row = self.db.execute(
+            "SELECT value FROM sync_state WHERE key='term_bag_version'"
+        ).fetchone()
+        return bool(row and row["value"] == self._term_bag_version())
+
+    @staticmethod
+    def _phrase_term(pair) -> str:
+        return "\x1f".join(pair)
+
+    def _term_analysis_context(self) -> dict:
+        return terms_mod.analysis_context(
+            self.word_people_names(), self._word_extra_stop())
+
+    def _build_term_bags(self, rows, context: dict) -> None:
+        bag_rows = []
+        subject_delta_rows = []
+        window_df: Counter = Counter()
+        for row in rows:
+            feature = terms_mod.decode_features(row["feature_json"])
+            body = terms_mod.document_bags(
+                feature, row["sender_addr"], context, ("body",))
+            subject = terms_mod.document_bags(
+                feature, row["sender_addr"], context, ("subject",))
+            bag_rows.append((
+                row["id"], terms_mod.encode_bag(body),
+                terms_mod.encode_bag(subject)))
+            subject_delta_rows.extend(
+                (row["id"], "term", term)
+                for term in subject["terms"] - body["terms"])
+            subject_delta_rows.extend(
+                (row["id"], "phrase", self._phrase_term(phrase))
+                for phrase in subject["phrases"] - body["phrases"])
+            addr = row["sender_addr"]
+            if not addr:
+                continue
+            for term in body["terms"]:
+                window_df[(addr, term, "term")] += 1
+            for phrase in body["phrases"]:
+                window_df[
+                    (addr, self._phrase_term(phrase), "phrase")] += 1
+        if bag_rows:
+            self.db.executemany(
+                """INSERT OR REPLACE INTO message_term_bags
+                   (message_id, body_bag_json, subject_bag_json)
+                   VALUES (?, ?, ?)""", bag_rows)
+        if subject_delta_rows:
+            self.db.executemany(
+                """INSERT OR REPLACE INTO message_term_subject_delta
+                   (message_id, kind, term) VALUES (?, ?, ?)""",
+                subject_delta_rows)
+        if window_df:
+            self.db.executemany(
+                """INSERT INTO person_term_window
+                   (sender_addr, term, kind, mail_df)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(kind, term, sender_addr)
+                   DO UPDATE SET mail_df=mail_df+excluded.mail_df""",
+                [(*key, count) for key, count in window_df.items()])
+
+    def _subtract_expired_term_bags(self, since: str) -> None:
+        """rolling window 밖으로 나간 메일의 본문 DF를 정확히 차감한다."""
+        last_id = 0
+        while True:
+            expired = self.db.execute(
+                """SELECT m.id, m.sender_addr, b.body_bag_json
+                   FROM message_term_bags b
+                   JOIN messages m ON m.id=b.message_id
+                   WHERE (m.is_sent!=0 OR m.sent_on < ?) AND m.id > ?
+                   ORDER BY m.id LIMIT 250""",
+                (since or "9999", last_id),
+            ).fetchall()
+            if not expired:
+                break
+            removed: Counter = Counter()
+            for row in expired:
+                body = terms_mod.decode_bag(row["body_bag_json"])
+                addr = row["sender_addr"]
+                for term in body["terms"]:
+                    removed[(addr, term, "term")] += 1
+                for phrase in body["phrases"]:
+                    removed[
+                        (addr, self._phrase_term(phrase), "phrase")] += 1
+            self.db.executemany(
+                """UPDATE person_term_window
+                   SET mail_df=mail_df-?
+                   WHERE sender_addr=? AND term=? AND kind=?""",
+                [(count, *key) for key, count in removed.items()],
+            )
+            last_id = expired[-1]["id"]
+        self.db.execute(
+            "DELETE FROM person_term_window WHERE mail_df <= 0")
+
+    def _rebuild_term_bags(self, version: str) -> None:
+        self.db.execute("DELETE FROM message_term_bags")
+        self.db.execute("DELETE FROM message_term_subject_delta")
+        self.db.execute("DELETE FROM person_term_window")
+        context = self._term_analysis_context()
+        last_id = 0
+        while True:
+            rows = self.db.execute(
+                """SELECT m.id, m.sender_addr, m.sent_on, f.feature_json
+                   FROM message_term_features f
+                   JOIN messages m ON m.id=f.message_id
+                   WHERE f.message_id > ?
+                   ORDER BY f.message_id LIMIT 250""", (last_id,)).fetchall()
+            if not rows:
+                break
+            self._build_term_bags(rows, context)
+            last_id = rows[-1]["id"]
+        self.db.execute(
+            "INSERT INTO sync_state(key, value) VALUES('term_bag_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (version,))
+        self._term_bags_ready = True
+
+    def _sync_term_bags(self, message_ids: list[int]) -> None:
+        """설정별 compact bag과 rolling 문서 빈도를 sync에서 증분 유지한다."""
+        version = self._term_bag_version()
+        have = self.db.execute(
+            "SELECT value FROM sync_state WHERE key='term_bag_version'"
+        ).fetchone()
+        if not have or have["value"] != version:
+            self._rebuild_term_bags(version)
+            return
+        _, since = self._word_bounds()
+        self._subtract_expired_term_bags(since)
+        self.db.execute(
+            """DELETE FROM message_term_subject_delta
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM message_term_features f
+                 WHERE f.message_id=message_term_subject_delta.message_id
+               )""")
+        self.db.execute(
+            """DELETE FROM message_term_bags
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM message_term_features f
+                 WHERE f.message_id=message_term_bags.message_id
+               )""")
+        if not message_ids:
+            self._term_bags_ready = True
+            return
+        context = self._term_analysis_context()
+        for pos in range(0, len(message_ids), 500):
+            chunk = message_ids[pos:pos + 500]
+            marks = ",".join("?" * len(chunk))
+            rows = self.db.execute(
+                f"""SELECT m.id, m.sender_addr, m.sent_on, f.feature_json
+                    FROM messages m
+                    JOIN message_term_features f ON f.message_id=m.id
+                    WHERE m.is_sent=0 AND m.id IN ({marks})""",
+                chunk,
+            ).fetchall()
+            self._build_term_bags(rows, context)
+        self._term_bags_ready = True
 
     def _write_action_state(self, thread_id: int, st: dict) -> None:
         self.db.execute(
@@ -593,6 +923,7 @@ class Store:
         """
         stats = SyncStats()
         max_seen = self.last_sync() or ""
+        self._pending_term_ids: list[int] = []
         try:
             for rec in records:
                 stats.fetched += 1
@@ -604,6 +935,9 @@ class Store:
                     max_seen = rec.sent_on
                 if progress:
                     progress(stats)
+            self._sync_term_features(self._pending_term_ids)
+            self._sync_term_bags(self._pending_term_ids)
+            self._word_background_cache.clear()
             if max_seen:
                 self.db.execute(
                     "INSERT INTO sync_state(key, value) VALUES('last_sync', ?) "
@@ -663,6 +997,8 @@ class Store:
             self.db.execute(
                 "INSERT INTO message_html(message_id, html) VALUES (?, ?)",
                 (cur.lastrowid, body_html))
+        if not is_sent:
+            self._pending_term_ids.append(cur.lastrowid)
         feats = classify_message(new_content, rec.subject or "",
                                  self._signal_names)
         feats["addressed_to_me"] = self._addressed_to_me(
@@ -1391,11 +1727,7 @@ class Store:
             "ORDER BY sent_on DESC LIMIT ?", (addr, since, limit))]
 
     def person_word_basis(self, addr: str, window_weeks: int = 26) -> dict:
-        """업무 어휘 캐시 기준선 — DB 최신일과 창 안 대상 메일의 최신 ID·통수.
-
-        다른 사람이 같은 날 보낸 새 메일은 대상 캐시를 깨지 않는다. 날짜가
-        넘어가 창 경계가 움직이거나 대상 인물 메일이 추가되면 다음 조회에서 갱신.
-        """
+        """업무 어휘 대상 기준선 — DB 최신일과 창 안 대상 메일의 최신 ID·통수."""
         addr = (addr or "").strip().lower()
         latest = self.db.execute(
             "SELECT MAX(sent_on) FROM messages WHERE sent_on != ''").fetchone()[0]
@@ -1419,7 +1751,11 @@ class Store:
         }
 
     def people_word_rows(self, addrs, window_weeks: int = 26) -> list[sqlite3.Row]:
-        """업무 어휘 대조 코퍼스 — 최근 창의 선택된 사람 발신 메일 메타+본문."""
+        """업무 어휘 대조 코퍼스.
+
+        sync 백필이 준비됐으면 compact 문장 토큰만 읽고, 준비 전에는 결과 보존을
+        위해 기존 최근 본문 경로를 사용한다.
+        """
         normalized = sorted({str(a).strip().lower() for a in addrs if str(a).strip()})
         if not normalized:
             return []
@@ -1431,6 +1767,18 @@ class Store:
             "SELECT date(?, ?)", (latest, f"-{window_weeks * 7} days")
         ).fetchone()[0]
         marks = ",".join("?" * len(normalized))
+        self._term_features_ready = self._term_features_are_current()
+        if (self._term_features_ready
+                and window_weeks <= self._word_window_weeks()):
+            return self.db.execute(
+                f"""SELECT m.id, m.thread_id, m.sender_addr, m.sent_on,
+                           f.feature_json AS term_features
+                    FROM messages m
+                    JOIN message_term_features f ON f.message_id=m.id
+                    WHERE m.is_sent=0 AND m.sender_addr IN ({marks})
+                      AND m.sent_on >= ?""",
+                [*normalized, since],
+            ).fetchall()
         return self.db.execute(
             f"""SELECT id, thread_id, subject, sender_name, sender_addr,
                        sent_on, new_content
@@ -1439,15 +1787,198 @@ class Store:
             [*normalized, since],
         ).fetchall()
 
+    def person_word_bag_rows(
+            self, addr: str, window_weeks: int = 26) -> list[sqlite3.Row] | None:
+        """대상 인물 compact bag. 집계 백필 전에는 None으로 폴백을 지시한다."""
+        self._term_bags_ready = self._term_bags_are_current()
+        if (not self._term_bags_ready
+                or window_weeks != self._word_window_weeks()):
+            return None
+        latest = self.db.execute(
+            "SELECT MAX(sent_on) FROM messages WHERE sent_on != ''").fetchone()[0]
+        if not latest:
+            return []
+        since = self.db.execute(
+            "SELECT date(?, ?)", (latest, f"-{window_weeks * 7} days")
+        ).fetchone()[0]
+        return self.db.execute(
+            """SELECT m.id, m.thread_id, m.sender_addr, m.sent_on,
+                      b.body_bag_json AS term_body_bag,
+                      b.subject_bag_json AS term_subject_bag
+               FROM messages m
+               JOIN message_term_bags b ON b.message_id=m.id
+               WHERE m.is_sent=0 AND m.sender_addr=? AND m.sent_on >= ?""",
+            ((addr or "").strip().lower(), since),
+        ).fetchall()
+
+    def people_word_background(
+            self, addrs, target_addr: str,
+            window_weeks: int = 26, candidates: dict | None = None,
+            corpus_fingerprint: str = "") -> dict | None:
+        """대상 후보에 대한 대조군의 정확한 메일 DF.
+
+        eligible 전체 DF를 후보별로 지연 캐시한 뒤 대상 DF를 뺀다. 본문은 rolling
+        집계, 제목은 스레드 첫 메시지의 subject-body 차집합에서만 센다.
+        candidates가 없으면 호출자가 전체 원문 경로로 폴백한다.
+        """
+        self._term_bags_ready = self._term_bags_are_current()
+        if (not self._term_bags_ready or candidates is None
+                or window_weeks != self._word_window_weeks()):
+            return None
+        target = (target_addr or "").strip().lower()
+        normalized = sorted({
+            str(a).strip().lower() for a in addrs
+            if str(a).strip()
+        })
+        if not normalized or target not in normalized:
+            return {"mail_count": 0, "term_df": Counter(),
+                    "phrase_df": Counter()}
+        latest = self.db.execute(
+            "SELECT MAX(sent_on) FROM messages WHERE sent_on != ''").fetchone()[0]
+        if not latest:
+            return {"mail_count": 0, "term_df": Counter(),
+                    "phrase_df": Counter()}
+        since = self.db.execute(
+            "SELECT date(?, ?)", (latest, f"-{window_weeks * 7} days")
+        ).fetchone()[0]
+        fingerprint = (
+            corpus_fingerprint
+            or self.people_word_corpus_fingerprint(normalized, window_weeks)
+        )
+        cache_key = (
+            tuple(normalized), int(window_weeks), fingerprint,
+            self._term_bag_version(),
+        )
+        cached = self._word_background_cache.get(cache_key)
+        marks = ",".join("?" * len(normalized))
+        if cached is None:
+            if len(self._word_background_cache) >= 4:
+                self._word_background_cache.pop(
+                    next(iter(self._word_background_cache)))
+            mail_count = self.db.execute(
+                f"""SELECT COUNT(*) FROM messages
+                    WHERE is_sent=0 AND sender_addr IN ({marks})
+                      AND sent_on >= ?""",
+                [*normalized, since],
+            ).fetchone()[0]
+            cached = {"mail_count": int(mail_count), "df": {}}
+            self._word_background_cache[cache_key] = cached
+
+        wanted = {
+            ("term", str(term)) for term in candidates.get("terms") or ()
+        }
+        wanted.update(
+            ("phrase", self._phrase_term(phrase))
+            for phrase in candidates.get("phrases") or ())
+        missing = wanted - set(cached["df"])
+        if missing:
+            self.db.execute(
+                """CREATE TEMP TABLE IF NOT EXISTS word_term_candidates (
+                     kind TEXT NOT NULL,
+                     term TEXT NOT NULL,
+                     PRIMARY KEY (kind, term)
+                   ) WITHOUT ROWID""")
+            self.db.execute("DELETE FROM word_term_candidates")
+            self.db.executemany(
+                "INSERT INTO word_term_candidates(kind, term) VALUES (?, ?)",
+                sorted(missing))
+            values = {key: 0 for key in missing}
+            for row in self.db.execute(
+                f"""SELECT d.kind, d.term, d.mail_df AS n
+                    FROM word_term_candidates c
+                    CROSS JOIN person_term_window d
+                    WHERE d.kind=c.kind AND d.term=c.term
+                      AND d.sender_addr IN ({marks})""",
+                normalized,
+            ):
+                values[(row["kind"], row["term"])] += int(row["n"])
+
+            # ranked는 현재 창 안 sender/thread 첫 메시지만 남긴다. delta 테이블은
+            # subject-body 차집합이라 본문과 제목이 겹쳐도 메일 DF를 한 번만 센다.
+            for row in self.db.execute(
+                f"""WITH ranked AS (
+                        SELECT m.id,
+                               ROW_NUMBER() OVER (
+                                 PARTITION BY m.sender_addr, m.thread_id
+                                 ORDER BY m.sent_on, m.id
+                               ) AS rn
+                        FROM messages m
+                        WHERE m.is_sent=0
+                          AND m.sender_addr IN ({marks})
+                          AND m.sent_on >= ?
+                    )
+                    SELECT sd.kind, sd.term
+                    FROM ranked r
+                    JOIN message_term_subject_delta sd
+                      ON sd.message_id=r.id
+                    JOIN word_term_candidates c
+                      ON c.kind=sd.kind AND c.term=sd.term
+                    WHERE r.rn=1""",
+                [*normalized, since],
+            ):
+                values[(row["kind"], row["term"])] += 1
+            cached["df"].update(values)
+
+        term_df, phrase_df = Counter(), Counter()
+        own_terms = Counter(candidates.get("term_df") or {})
+        own_phrases = Counter(candidates.get("phrase_df") or {})
+        for kind, encoded in wanted:
+            total = int(cached["df"].get((kind, encoded), 0))
+            if kind == "term":
+                term_df[encoded] = max(0, total - own_terms[encoded])
+            else:
+                pair = tuple(encoded.split("\x1f", 1))
+                if len(pair) == 2:
+                    phrase_df[pair] = max(
+                        0, total - own_phrases[pair])
+        return {
+            "mail_count": max(
+                0, int(cached["mail_count"])
+                - int(candidates.get("mail_count", 0))),
+            "term_df": term_df,
+            "phrase_df": phrase_df,
+        }
+
+    def people_word_corpus_fingerprint(
+            self, addrs, window_weeks: int = 26) -> str:
+        """현재 분석 창 대조 메일 집합의 안정적인 내용 지문.
+
+        새 대조 메일과 창 밖으로 빠진 메일을 모두 감지한다. 날짜 자체가 아니라
+        실제 집합이 바뀔 때만 최종 프로필 캐시를 무효화한다.
+        """
+        normalized = sorted({str(a).strip().lower() for a in addrs if str(a).strip()})
+        if not normalized:
+            return "-"
+        latest = self.db.execute(
+            "SELECT MAX(sent_on) FROM messages WHERE sent_on != ''").fetchone()[0]
+        if not latest:
+            return "-"
+        since = self.db.execute(
+            "SELECT date(?, ?)", (latest, f"-{window_weeks * 7} days")
+        ).fetchone()[0]
+        marks = ",".join("?" * len(normalized))
+        digest = hashlib.sha256()
+        count = 0
+        for row in self.db.execute(
+            f"""SELECT id
+                FROM messages
+                WHERE is_sent=0 AND sender_addr IN ({marks}) AND sent_on >= ?
+                ORDER BY id""",
+            [*normalized, since],
+        ):
+            digest.update(int(row["id"]).to_bytes(8, "big", signed=False))
+            count += 1
+        return f"{count}:{digest.hexdigest()}"
+
     def people_word_profile(self, addr: str, basis: dict, window_weeks: int,
                             feature_version: str) -> dict | None:
         """현재 기준선과 정확히 맞는 업무 어휘 파생 캐시를 읽는다."""
         row = self.db.execute(
             """SELECT profile_json FROM people_word_profiles
-               WHERE addr=? AND basis_message_id=? AND window_end=?
+               WHERE addr=? AND basis_message_id=?
                  AND window_weeks=? AND feature_version=?""",
             ((addr or "").strip().lower(), basis["basis_message_id"],
-             basis["window_end"], window_weeks, feature_version),
+             window_weeks, feature_version),
         ).fetchone()
         if not row or not row["profile_json"]:
             return None

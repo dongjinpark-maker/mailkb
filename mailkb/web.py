@@ -3263,7 +3263,7 @@ def render_dossier(store, cfg, addr: str) -> str:
         cards.append(("최근 변화", f"<ul>{lis}</ul>"))
 
     # 6. 업무 어휘 지도 — 최근 창 안 메일 단위 지지도·대조 점수·공기어 군집.
-    # 하드 노이즈는 제외하고, 파생 캐시는 대상 인물 최신 메일에만 묶는다.
+    # 하드 노이즈는 제외하고, compact 대상 bag + 현재 창 rolling DF를 읽는다.
     min_mails = int(cfg.opt("dossier", "wordcloud_min_mails", default=8) or 8)
     top_n = int(cfg.opt("dossier", "wordcloud_top", default=25) or 25)
     basis = (store.person_word_basis(addr, win)
@@ -3275,21 +3275,29 @@ def render_dossier(store, cfg, addr: str) -> str:
         ranked = report.rank_people(store, cfg, window_weeks=win, limit=50)
         eligible = {r["addr"].lower() for r in ranked}
         eligible.add(addr)
-        names = {r["addr"].lower(): (r["name"] or r["addr"]) for r in ranked}
-        # 대조 코퍼스는 상위 교신자 50명으로 제한하되, 이름 언급 분리는 people의
-        # 더 넓은 주소록을 쓴다. 낮은 빈도의 실제 협업자 이름도 특징어로 섞지 않는다.
-        for person in store.frequent_people(limit=500):
-            paddr = (person["addr"] or "").lower()
-            if paddr and not cfg.is_noise_sender_hard(paddr):
-                names.setdefault(paddr, person["name"] or paddr)
+        names = store.word_people_names()
         names[addr] = name
+        corpus_fingerprint = store.people_word_corpus_fingerprint(
+            eligible, win)
         version = terms.profile_signature(
-            extra, eligible, top_n, name, people_names=names)
+            extra, eligible, top_n, name, people_names=names,
+            corpus_fingerprint=corpus_fingerprint)
         profile = store.people_word_profile(addr, basis, win, version)
         if profile is None:
-            rows = store.people_word_rows(eligible, win)
+            rows = store.person_word_bag_rows(addr, win)
+            background = None
+            if rows is not None:
+                candidates = terms.background_candidates(
+                    rows, addr, names=names, extra_stop=extra)
+                background = store.people_word_background(
+                    eligible, addr, win, candidates=candidates,
+                    corpus_fingerprint=corpus_fingerprint)
+            if rows is None or background is None:
+                rows = store.people_word_rows(eligible, win)
+                background = None
             profile = terms.analyze(
-                rows, addr, names=names, extra_stop=extra, top_n=top_n)
+                rows, addr, names=names, extra_stop=extra, top_n=top_n,
+                background=background)
             store.save_people_word_profile(addr, profile, basis, win, version)
         if any(profile.get(k) for k in
                ("clusters", "terms", "phrases", "rising", "mentions")):

@@ -15,7 +15,8 @@
 ## v1 — 결정론 재조립 (AI·새 테이블 없음)
 
 새 최상위 **'인물'** 메뉴. 초기 v1은 스키마 변경 0, 재수집 0으로 기존 테이블만
-읽었다. 아래 업무 어휘 지도 개선은 재수집 없이 파생 캐시 테이블 하나를 추가한다.
+읽었다. 아래 업무 어휘 지도 개선은 Outlook 재수집 없이 재구축 가능한 파생
+테이블을 추가한다.
 
 - **랜딩 `/people`**: 최근 6개월 **교류 강도**순(미결 우선 아님). 각 행 = 이름 ·
   수신/발신 통수 · 미결 배지 · 최근 접촉. 봇/자동발송(ignore/blocked)만 제외,
@@ -86,11 +87,33 @@
 - **표시 임계**: 발신 통수 `cfg.opt("dossier","wordcloud_min_mails",default=8)` 이상만.
   상위 후보 수 `wordcloud_top`(기본 25). 기존 설정 키를 유지해 업그레이드 시
   config 변경이 필요 없다. 실메일 튜닝은 `word_stop_extra`로 한다.
-- **성능·캐시**: `(is_sent,sender_addr,sent_on,id)` 복합 인덱스로 26주 본문만 읽는다.
-  결과는 `people_word_profiles`에 점수·표현·근거 ID만 저장한다(원문 복제 없음).
-  캐시 기준은 대상 인물의 최신 메시지 ID + DB 최신 날짜 + 분석/설정 버전이다.
-  대상에게 새 메일이 오면 그 사람만 갱신되고, 다른 사람의 같은 날 새 메일은 기존
-  프로필 전체를 무효화하지 않는다. 날짜 경계나 대조 집단·설정이 바뀌면 지연 재계산한다.
+- **성능·캐시**: 표본 수와 대조군은 줄이지 않는다. `message_term_features`가
+  분석 대상인 수신 메일의 설정 독립 문장 토큰을 sync에서 한 번 추출하고,
+  `message_term_bags`가 현재 이름·추가 불용어를 반영한 compact bag을 저장한다.
+  두 JSON은 zlib BLOB으로 압축한다. `person_term_window`는 현재 26주 본문 DF를
+  `(kind,term,sender)` 기본키로 직접 유지한다. 새 메일은 더하고 창 밖 메일 bag은
+  빼므로 일·월 버킷이나 조회 시 전체 GROUP BY가 필요 없다.
+- **후보 조회**: 대상에게 2통 이상 나타난 term/phrase만 대조 DF가 필요하다.
+  임시 후보 테이블을 바깥 루프로 고정해 rolling 기본키를 후보별로 탐색한다.
+  제목은 `message_term_subject_delta`의 `subject-body` 차집합을 창 안
+  sender/thread 첫 메시지에서만 더한다. eligible 전체 후보 DF는 메모리에
+  지연 캐시하고 대상 DF를 빼 여러 인물 조회에 재사용한다. 상위 K phrase 제한은
+  하지 않아 종전 결과와 같다.
+- **수명주기**: 기존 DB의 토큰 백필은 웹 시작이 아니라 다음 sync 트랜잭션에서
+  수행한다. 최근 설정 기간의 수신 메일만 파생 저장하고, 창 밖 feature·bag·DF는
+  제거한다. 준비 전이나 기간 확대 직후에는 종전 원문 경로로 폴백한다.
+  이름·불용어·규칙 버전이 바뀌면 필요한 파생 단계만 재구축하며 Outlook
+  재수집은 없다.
+  최종 `people_word_profiles` 캐시는 대상 최신 ID와 실제 26주 대조 메일 집합
+  지문을 사용한다. 날짜 문자열만 바뀌어 실제 집합이 같으면 캐시를 유지하고,
+  새 대조 메일이나 창 이탈로 점수가 달라지면 정확히 무효화한다.
+- **측정**: 고유 어휘·300토큰·50인·고유 스레드 합성 데이터에서 5천 통 최초
+  fast 계산 70ms(대상 읽기+후보+대조+분석), raw 분석 2.88초, 정확한 지문을
+  포함한 대조 재사용 4.2ms, 장문 1통 증분 sync 46ms였다. DB 전체 81.0MiB 중
+  어휘 파생 구조는 34.3MiB였다. 1만 통은 fast 146ms, raw 5.84초였고,
+  DB 전체 157.5MiB 중 어휘 파생 구조는 68.0MiB였다. 최초 1만 통 파생 구축
+  31.0초는 sync에서 1회 수행한다. fast/raw 결과는 동일했다. 재현은
+  `tests/benchmark_wordmap.py`.
 - **한계**: 무형태소라 복합어·띄어쓰기 변형을 완전히 합치지 못한다. 서명 구분자나
   고지 패턴이 없는 조직 고유 서명은 `word_stop_extra`가 필요할 수 있다. 점수는
   업무 관여 신호이지 역량·성과·성격 평가가 아니다.
@@ -107,7 +130,7 @@
 ## 손댄 곳
 
 - `store.py`: `person_thread_ids` · `person_window_counts` · `person_signals` ·
-  `person_decisions` · `person_word_basis` · `people_word_rows` · 파생 프로필 캐시.
+  `person_decisions` · 메일별 어휘 특징/bag · rolling DF · 파생 프로필 캐시.
 - `report.py`: `_intensity`(분리) · `rank_people` · `person_metrics`(addr 어댑터).
 - `terms.py`: 문서 빈도·대조 점수·구문·공기어 군집·상승어·언급 분리 순수 코어.
 - `web.py`: `render_people_page` · `render_dossier` · `_wordmap_html` +

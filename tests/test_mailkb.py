@@ -2563,7 +2563,78 @@ class TestWordMapAnalysis(unittest.TestCase):
         self.assertEqual(profile["mentions"][0]["support"], 4)
         self.assertNotIn("박서준", self._all_terms(profile))
 
-    def test_store_window_and_target_scoped_cache_basis(self):
+    def test_precomputed_features_are_identical_to_raw_analysis(self):
+        rows = [
+            self._row(1, self.KIM, "타이밍 김민수 클로저 검토",
+                      "2026-02-01T09:00:00", thread=10,
+                      subject="RE: 양자화 검토"),
+            self._row(2, self.KIM, "박서준과 칩렛 패키지",
+                      "2026-07-01T09:00:00", thread=11,
+                      subject="칩렛 일정"),
+            self._row(3, self.LEE, "타이밍 일정 칩렛",
+                      "2026-07-02T09:00:00", thread=12,
+                      subject="칩렛 일정"),
+        ]
+        names = {self.KIM: "김민수", self.LEE: "이영희", self.PARK: "박서준"}
+        expected = terms.analyze(
+            rows, self.KIM, names=names, extra_stop=["일정"])
+        prepared = [
+            {k: v for k, v in row.items()
+             if k not in ("new_content", "subject")}
+            | {"term_features": terms.encode_features(
+                row["new_content"], row["subject"])}
+            for row in rows
+        ]
+        actual = terms.analyze(
+            prepared, self.KIM, names=names, extra_stop=["일정"])
+        self.assertEqual(actual, expected)
+
+    def test_rolling_background_is_identical_to_full_corpus(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = Store(Path(td) / "aggregate.sqlite", [ME])
+            try:
+                records = []
+                for i in range(1, 5):
+                    records.append(_rec(
+                        f"ak{i}", self.KIM, [ME], "칩렛 타이밍",
+                        f"2026-07-{i:02d}T09:00:00",
+                        "칩렛 패키지 타이밍"))
+                    records.append(_rec(
+                        f"al{i}", self.LEE, [ME], "칩렛 일정",
+                        f"2026-07-{i:02d}T10:00:00",
+                        "칩렛 일정 양자화"))
+                store.ingest(records)
+                names = store.word_people_names()
+                all_rows = store.people_word_rows([self.KIM, self.LEE])
+                expected = terms.analyze(
+                    all_rows, self.KIM, names=names)
+                target = store.person_word_bag_rows(self.KIM)
+                candidates = terms.background_candidates(
+                    target, self.KIM, names=names)
+                background = store.people_word_background(
+                    [self.KIM, self.LEE], self.KIM,
+                    candidates=candidates)
+                actual = terms.analyze(
+                    target, self.KIM, names=names, background=background)
+                self.assertEqual(actual, expected)
+
+                lee_expected = terms.analyze(
+                    all_rows, self.LEE, names=names)
+                lee_rows = store.person_word_bag_rows(self.LEE)
+                lee_candidates = terms.background_candidates(
+                    lee_rows, self.LEE, names=names)
+                lee_background = store.people_word_background(
+                    [self.KIM, self.LEE], self.LEE,
+                    candidates=lee_candidates)
+                lee_actual = terms.analyze(
+                    lee_rows, self.LEE, names=names,
+                    background=lee_background)
+                self.assertEqual(lee_actual, lee_expected)
+                self.assertEqual(len(store._word_background_cache), 1)
+            finally:
+                store.close()
+
+    def test_store_window_and_exact_corpus_cache_basis(self):
         with tempfile.TemporaryDirectory() as td:
             store = Store(Path(td) / "wordmap.sqlite", [ME])
             try:
@@ -2578,27 +2649,202 @@ class TestWordMapAnalysis(unittest.TestCase):
                 basis = store.person_word_basis(self.KIM)
                 self.assertEqual(basis["mail_count"], 1)   # 6개월 밖 메일 제외
                 rows = store.people_word_rows([self.KIM, self.LEE])
-                self.assertNotIn("구형어휘", {r["new_content"] for r in rows})
+                old_id = store.db.execute(
+                    "SELECT id FROM messages WHERE message_id='<old@t>'"
+                ).fetchone()[0]
+                self.assertNotIn(old_id, {r["id"] for r in rows})
+                self.assertIsNone(store.db.execute(
+                    "SELECT 1 FROM message_term_features WHERE message_id=?",
+                    (old_id,)).fetchone())
+                self.assertTrue(all(r["term_features"] for r in rows))
                 self.assertEqual(store.person_sent_texts(self.KIM), ["신규어휘"])
                 before = basis["basis_message_id"]
+                fp_before = store.people_word_corpus_fingerprint(
+                    [self.KIM, self.LEE])
+                version = f"test-v1:{fp_before}"
                 cached = {"mail_count": 1, "terms": [{"term": "신규어휘"}]}
                 store.save_people_word_profile(
-                    self.KIM, cached, basis, 26, "test-v1")
+                    self.KIM, cached, basis, 26, version)
                 self.assertEqual(
                     store.people_word_profile(
-                        self.KIM, basis, 26, "test-v1"), cached)
+                        self.KIM, basis, 26, version), cached)
                 store.ingest([_rec("lee2", self.LEE, [ME], "대조2",
                                    "2026-07-19T11:00:00", "새 대조어휘")])
                 unchanged = store.person_word_basis(self.KIM)
                 self.assertEqual(unchanged["basis_message_id"], before)
-                self.assertIsNotNone(store.people_word_profile(
-                    self.KIM, unchanged, 26, "test-v1"))
+                fp_other = store.people_word_corpus_fingerprint(
+                    [self.KIM, self.LEE])
+                self.assertNotEqual(fp_other, fp_before)
+                self.assertIsNone(store.people_word_profile(
+                    self.KIM, unchanged, 26, f"test-v1:{fp_other}"))
                 store.ingest([_rec("new2", self.KIM, [ME], "신자료2",
                                    "2026-07-19T12:00:00", "새 특징어")])
                 changed = store.person_word_basis(self.KIM)
                 self.assertGreater(changed["basis_message_id"], before)
                 self.assertIsNone(store.people_word_profile(
                     self.KIM, changed, 26, "test-v1"))
+            finally:
+                store.close()
+
+    def test_corpus_fingerprint_distinguishes_equal_id_aggregates(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = Store(Path(td) / "fingerprint.sqlite", [ME])
+            try:
+                senders = (
+                    self.KIM, self.KIM, self.LEE,
+                    self.LEE, self.KIM, self.KIM,
+                )
+                store.ingest([
+                    _rec(f"fp{i}", sender, [ME], f"안건 {i}",
+                         f"2026-07-{i:02d}T09:00:00", "공통 본문")
+                    for i, sender in enumerate(senders, 1)
+                ])
+                first = store.people_word_corpus_fingerprint([self.KIM])
+
+                # {1,2,5,6}과 {1,3,4,6}은 count/min/max/sum이 모두 같다.
+                store.db.execute(
+                    "UPDATE messages SET sender_addr=? WHERE id IN (2, 5)",
+                    (self.LEE,))
+                store.db.execute(
+                    "UPDATE messages SET sender_addr=? WHERE id IN (3, 4)",
+                    (self.KIM,))
+                second = store.people_word_corpus_fingerprint([self.KIM])
+                self.assertNotEqual(first, second)
+            finally:
+                store.close()
+
+    def test_legacy_term_features_backfill_only_during_sync(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "legacy-wordmap.sqlite"
+            store = Store(path, [ME])
+            store.ingest([
+                _rec("legacy1", self.KIM, [ME], "검토",
+                     "2026-07-01T09:00:00", "타이밍 클로저"),
+                _rec("legacy2", self.LEE, [ME], "일정",
+                     "2026-07-02T09:00:00", "양자화 회귀"),
+                _rec("legacy-mine", ME, [self.KIM], "회신",
+                     "2026-07-03T09:00:00", "내 발신 본문"),
+            ])
+            self.assertEqual(store.db.execute(
+                "SELECT COUNT(*) FROM message_term_features").fetchone()[0], 2)
+            store.db.execute("DELETE FROM message_term_features")
+            store.db.execute(
+                "DELETE FROM sync_state WHERE key='term_feature_version'")
+            store.db.commit()
+            store.close()
+
+            reopened = Store(path, [ME])
+            try:
+                self.assertFalse(reopened._term_features_ready)
+                self.assertEqual(reopened.db.execute(
+                    "SELECT COUNT(*) FROM message_term_features").fetchone()[0], 0)
+                raw_rows = reopened.people_word_rows([self.KIM, self.LEE])
+                self.assertIn("new_content", raw_rows[0].keys())
+                reopened.ingest([])  # Outlook sync 진입점에서 기존 본문 1회 백필
+                self.assertTrue(reopened._term_features_ready)
+                self.assertEqual(reopened.db.execute(
+                    "SELECT COUNT(*) FROM message_term_features").fetchone()[0], 2)
+                prepared = reopened.people_word_rows([self.KIM, self.LEE])
+                self.assertIn("term_features", prepared[0].keys())
+                self.assertNotIn("new_content", prepared[0].keys())
+            finally:
+                reopened.close()
+
+    def test_rolling_window_subtracts_expired_message_df(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = Store(Path(td) / "rolling-wordmap.sqlite", [ME])
+            try:
+                store.ingest([
+                    _rec("expires", self.LEE, [ME], "만료",
+                         "2026-01-01T09:00:00", "만료어휘"),
+                    _rec("basis", self.KIM, [ME], "기준",
+                         "2026-06-30T09:00:00", "유지어휘"),
+                ])
+                self.assertEqual(store.db.execute(
+                    """SELECT mail_df FROM person_term_window
+                       WHERE sender_addr=? AND term='만료어휘' AND kind='term'""",
+                    (self.LEE,)).fetchone()[0], 1)
+
+                # latest가 7월 3일로 이동하면 26주 시작은 1월 2일이 된다.
+                store.ingest([
+                    _rec("advance", ME, [self.KIM], "내 발신",
+                         "2026-07-03T09:00:00", "창 이동"),
+                ])
+                self.assertIsNone(store.db.execute(
+                    """SELECT 1 FROM person_term_window
+                       WHERE sender_addr=? AND term='만료어휘'""",
+                    (self.LEE,)).fetchone())
+                expired_id = store.db.execute(
+                    "SELECT id FROM messages WHERE message_id='<expires@t>'"
+                ).fetchone()[0]
+                for table in (
+                        "message_term_features", "message_term_bags",
+                        "message_term_subject_delta"):
+                    self.assertIsNone(store.db.execute(
+                        f"SELECT 1 FROM {table} WHERE message_id=?",
+                        (expired_id,)).fetchone(), msg=table)
+            finally:
+                store.close()
+
+    def test_projection_setting_change_falls_back_until_sync(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = Config(
+                home=Path(td), my_addresses=[ME],
+                raw={"dossier": {"word_stop_extra": []}})
+            store = Store(Path(td) / "projection.sqlite", [ME], noise=cfg)
+            try:
+                store.ingest([
+                    _rec(f"setting{i}", self.KIM, [ME], f"안건 {i}",
+                         f"2026-07-{i:02d}T09:00:00", "타이밍 클로저")
+                    for i in range(1, 4)
+                ])
+                self.assertIsNotNone(store.person_word_bag_rows(self.KIM))
+
+                cfg.raw["dossier"]["word_stop_extra"] = ["타이밍"]
+                self.assertIsNone(store.person_word_bag_rows(self.KIM))
+                fallback = store.people_word_rows([self.KIM])
+                self.assertIn("term_features", fallback[0].keys())
+
+                store.ingest([])
+                rebuilt = store.person_word_bag_rows(self.KIM)
+                self.assertIsNotNone(rebuilt)
+                profile = terms.analyze(
+                    rebuilt, self.KIM, extra_stop=["타이밍"],
+                    background={"mail_count": 0})
+                self.assertNotIn("타이밍", self._all_terms(profile))
+            finally:
+                store.close()
+
+    def test_candidate_df_query_uses_term_first_primary_key(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = Store(Path(td) / "candidate-plan.sqlite", [ME])
+            try:
+                store.ingest([
+                    _rec(f"plan{i}", self.KIM if i % 2 else self.LEE, [ME],
+                         f"안건 {i}", f"2026-07-{i:02d}T09:00:00",
+                         f"타이밍 클로저 고유어휘{i}")
+                    for i in range(1, 9)
+                ])
+                target = store.person_word_bag_rows(self.KIM)
+                candidates = terms.background_candidates(target, self.KIM)
+                store.people_word_background(
+                    [self.KIM, self.LEE], self.KIM,
+                    candidates=candidates)
+                plan = [
+                    row[3] for row in store.db.execute(
+                        """EXPLAIN QUERY PLAN
+                           SELECT d.kind, d.term, d.mail_df
+                           FROM word_term_candidates c
+                           CROSS JOIN person_term_window d
+                           WHERE d.kind=c.kind AND d.term=c.term
+                             AND d.sender_addr IN (?, ?)""",
+                        (self.KIM, self.LEE))
+                ]
+                self.assertTrue(any(
+                    "SEARCH d USING PRIMARY KEY" in step for step in plan), plan)
+                self.assertFalse(any(
+                    "SCAN d" in step or "USE TEMP B-TREE" in step
+                    for step in plan), plan)
             finally:
                 store.close()
 
@@ -6096,10 +6342,13 @@ class TestDerivedVersionSplit(unittest.TestCase):
                    noise=self._blocked_cfg("promo@ads.example"))
         self.addCleanup(st.close)
         self.assertEqual(tuple(st.db.execute(q, (other,)).fetchone()), before)
-        # 버전 두 개가 기록돼 다음 열기는 아무 일도 하지 않는다
+        # 메시지·액션·어휘 토큰·설정별 bag 버전이 기록돼 다음 열기는 재구축 안 함
         keys = dict(st.db.execute(
             "SELECT key, value FROM sync_state WHERE key LIKE '%_version'"))
-        self.assertEqual(set(keys), {"feature_version", "action_version"})
+        self.assertEqual(set(keys), {
+            "feature_version", "action_version",
+            "term_feature_version", "term_bag_version",
+        })
 
     def test_allowlist_change_triggers_nothing(self):
         # external_allowlist 는 fold 가 아니라 질의 시점(actions.evaluate)에만
