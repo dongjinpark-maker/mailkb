@@ -14,9 +14,13 @@ from pathlib import Path
 
 from . import search as search_mod
 from .clean import (extract_new_content, inject_inline_images,
-                    normalize_subject, sanitize_html)
+                    normalize_subject, sanitize_html, strip_preserved)
 from .features import FEATURE_VERSION, classify_message
 from .sources.base import MailRecord
+
+# 인물 도시에 AI 캐시의 근거 검증 규약. 저장된 버전이 이 값과 다르면 웹에서
+# 표시하지 않고 다음 AI 실행 때 새 검증기로 점진 재생성한다.
+DOSSIER_VALIDATOR_VERSION = 2
 
 # 파생 테이블 DDL 은 _SCHEMA 와 버전 마이그레이션(drop+재생성)이 공유한다.
 # 파생 테이블은 messages 에서 결과 불변으로 재구축 가능하므로 ALTER 대신
@@ -182,13 +186,14 @@ CREATE TABLE IF NOT EXISTS distill_signals (
 
 -- 인물 도시에 AI 요약 캐시 (v2) — addr당 1행. 결정론 카드 위에 얹는 AI 카드의 원천.
 -- 파생 테이블 아님(AI 산출물이라 재구축 불가) → 백필/버전 변경에도 살아남는다.
--- basis_msg_count = 마지막 생성 시점의 그 사람 관련 메시지 수. 증분 갱신 가드 —
--- 이 값보다 메시지가 늘어난 사람만 주간 재생성해 비용을 통제한다(요약 캐시와 동일 패턴).
+-- basis_msg_count = 마지막 생성/검증 시점의 그 사람 관련 메시지 수. 증분 갱신 가드 —
+-- 이 값보다 메시지가 늘어난 사람만 재생성해 비용을 통제한다(검증 0건 재호출도 방지).
 CREATE TABLE IF NOT EXISTS people_dossier (
     addr            TEXT PRIMARY KEY,
     dossier_md      TEXT DEFAULT '',    -- 근거 검증 통과한 요약(마크다운)
     updated         TEXT DEFAULT '',
-    basis_msg_count INTEGER DEFAULT 0
+    basis_msg_count INTEGER DEFAULT 0,
+    validator_version INTEGER DEFAULT 1 -- 인용 출처 검증 규약 버전
 );
 
 -- AI 검색 결과 캐시 (Phase 2) — 질의별 지속 저장. 뒤로가기·반복 질의 재과금 방지 +
@@ -338,6 +343,7 @@ class Store:
         self.db.execute("PRAGMA temp_store=MEMORY")    # 정렬·임시 결과 RAM
         self.db.execute("PRAGMA mmap_size=268435456")  # 256MB 메모리맵 읽기
         self.db.executescript(_SCHEMA)
+        self._ensure_people_dossier_schema()
         # 파생 테이블(재구축 가능) — 버전 마이그레이션이 drop+재생성으로 스키마를 바꾼다.
         self.db.executescript(_FEATURES_DDL)
         self.db.executescript(_THREAD_STATE_DDL)
@@ -354,6 +360,26 @@ class Store:
 
     def close(self) -> None:
         self.db.close()
+
+    def _ensure_people_dossier_schema(self) -> None:
+        """구 DB의 비파생 AI 캐시에 검증 버전 컬럼을 경량 추가한다.
+
+        people_dossier 는 AI 산출물이라 파생 테이블처럼 drop/rebuild 할 수 없다.
+        SQLite 는 ADD COLUMN IF NOT EXISTS 를 지원하지 않으므로 table_info 로 한 번
+        확인한다. 추가 컬럼은 메타데이터 변경뿐이라 Outlook 재수집이 필요 없다.
+        """
+        cols = {r["name"] for r in
+                self.db.execute("PRAGMA table_info(people_dossier)")}
+        if "validator_version" not in cols:
+            try:
+                self.db.execute(
+                    "ALTER TABLE people_dossier "
+                    "ADD COLUMN validator_version INTEGER DEFAULT 1")
+            except sqlite3.OperationalError as e:
+                # 웹과 CLI가 구 DB를 동시에 처음 열면 둘 다 table_info 에서 빠진
+                # 컬럼을 볼 수 있다. 먼저 끝난 쪽의 ADD만 인정하고 다른 오류는 전파.
+                if "duplicate column name" not in str(e).lower():
+                    raise
 
     def _is_hard_noise(self, sender: str, subject: str) -> bool:
         """액션 fold 가 무시할 확실한 노이즈 메시지인가 (판정자 없으면 항상 False)."""
@@ -1101,6 +1127,23 @@ class Store:
             (thread_id,),
         ).fetchall()
 
+    def quote_messages(self, thread_id: int,
+                       sender_addr: str | None = None) -> list[sqlite3.Row]:
+        """인용 검증용 경량 메시지 조회.
+
+        표시용 thread_messages 와 달리 message_html(인라인 이미지 포함)을 읽지 않고
+        인용 출처 판정에 필요한 열만 가져온다. sender_addr 를 주면 그 사람이 직접
+        발신한 수신 메일만 반환한다(인물 도시에 전용).
+        """
+        where = "WHERE thread_id=?"
+        args: list = [thread_id]
+        if sender_addr is not None:
+            where += " AND is_sent=0 AND sender_addr=?"
+            args.append((sender_addr or "").strip().lower())
+        return self.db.execute(
+            "SELECT id, thread_id, sender_addr, is_sent, sent_on, subject, new_content "
+            f"FROM messages {where} ORDER BY sent_on, id", args).fetchall()
+
     def thread(self, thread_id: int) -> sqlite3.Row | None:
         return self.db.execute(
             "SELECT * FROM threads WHERE id=?", (thread_id,)
@@ -1331,44 +1374,101 @@ class Store:
             "OR (is_sent=1 AND ((';'||to_addrs||';') LIKE ? "
             "OR (';'||cc_addrs||';') LIKE ?))", (addr, like, like)).fetchone()[0]
 
-    def person_thread_context(self, addr: str, limit: int = 8) -> list[dict]:
-        """도시에 AI 재료 — 이 사람 참여 스레드의 (제목·롤링요약·최신 발췌), 최근순.
+    def person_thread_context(self, addr: str, limit: int = 8,
+                              excerpts_per_thread: int = 2) -> list[dict]:
+        """도시에 AI 재료 — 대상 인물이 직접 쓴 발췌만, 최근 스레드순.
 
-        요약은 문맥, 발췌는 인용 근거용(AI 가 발췌에서만 인용하게). 원문 전체가
-        아니라 발췌 상한이라 토큰이 바운드된다."""
-        tids = self.person_thread_ids(addr)
-        if not tids:
-            return []
-        marks = ",".join("?" * len(tids))
+        롤링 요약은 문맥 전용이고 인용 근거는 sender_addr=addr 인 수신 메시지의
+        신규 작성분(strip_preserved)으로 제한한다. 스레드당 최근 N통만 제공해
+        프롬프트 크기를 바운드한다.
+        """
+        addr = (addr or "").strip().lower()
         rows = self.db.execute(
-            f"SELECT id, rolling_summary FROM threads WHERE id IN ({marks}) "
-            f"ORDER BY last_date DESC LIMIT ?", [*tids, limit]).fetchall()
+            """SELECT DISTINCT t.id, t.rolling_summary, t.last_date
+               FROM threads t JOIN messages m ON m.thread_id=t.id
+               WHERE m.is_sent=0 AND m.sender_addr=?
+               ORDER BY t.last_date DESC LIMIT ?""",
+            (addr, limit)).fetchall()
+        if not rows:
+            return []
+        tids = [r["id"] for r in rows]
+        marks = ",".join("?" * len(tids))
+        msgs = self.db.execute(
+            f"""SELECT id, thread_id, subject, new_content, sent_on
+                FROM messages
+                WHERE thread_id IN ({marks}) AND is_sent=0 AND sender_addr=?
+                ORDER BY sent_on DESC, id DESC""",
+            [*tids, addr]).fetchall()
+        by_tid: dict[int, list[dict]] = {tid: [] for tid in tids}
+        subjects: dict[int, str] = {}
+        for m in msgs:
+            tid = m["thread_id"]
+            subjects.setdefault(tid, m["subject"] or "(제목 없음)")
+            if len(by_tid[tid]) >= max(1, excerpts_per_thread):
+                continue
+            text = strip_preserved(m["new_content"] or "").strip()
+            if text:
+                by_tid[tid].append({"message_id": m["id"], "text": text})
         out = []
         for r in rows:
-            msgs = self.thread_messages(r["id"])
-            if not msgs:
+            excerpts = by_tid[r["id"]]
+            if not excerpts:
                 continue
-            subject = msgs[0]["subject"] or "(제목 없음)"
-            excerpt = (msgs[-1]["new_content"] or "").strip()
-            out.append({"thread_id": r["id"], "subject": subject,
+            out.append({"thread_id": r["id"],
+                        "subject": subjects.get(r["id"], "(제목 없음)"),
                         "summary": (r["rolling_summary"] or "").strip(),
-                        "excerpt": excerpt})
+                        "excerpts": excerpts})
         return out
 
-    def people_dossier(self, addr: str) -> sqlite3.Row | None:
+    def people_dossier(self, addr: str,
+                       include_stale: bool = False) -> sqlite3.Row | None:
+        where = "addr=?"
+        args: list = [(addr or "").lower()]
+        if not include_stale:
+            where += " AND validator_version=?"
+            args.append(DOSSIER_VALIDATOR_VERSION)
         return self.db.execute(
-            "SELECT * FROM people_dossier WHERE addr=?",
-            ((addr or "").lower(),)).fetchone()
+            f"SELECT * FROM people_dossier WHERE {where}", args).fetchone()
 
     def save_people_dossier(self, addr: str, dossier_md: str,
-                            basis_msg_count: int) -> None:
+                            basis_msg_count: int,
+                            validator_version: int = DOSSIER_VALIDATOR_VERSION) -> None:
         self.db.execute(
-            """INSERT INTO people_dossier (addr, dossier_md, updated, basis_msg_count)
-               VALUES (?,?,datetime('now'),?)
+            """INSERT INTO people_dossier
+               (addr, dossier_md, updated, basis_msg_count, validator_version)
+               VALUES (?,?,datetime('now'),?,?)
                ON CONFLICT(addr) DO UPDATE SET
                  dossier_md=excluded.dossier_md, updated=excluded.updated,
-                 basis_msg_count=excluded.basis_msg_count""",
-            ((addr or "").lower(), dossier_md or "", basis_msg_count))
+                 basis_msg_count=excluded.basis_msg_count,
+                 validator_version=excluded.validator_version""",
+            ((addr or "").lower(), dossier_md or "", basis_msg_count,
+             validator_version))
+        self.db.commit()
+
+    def mark_people_dossier_checked(
+            self, addr: str, basis_msg_count: int,
+            validator_version: int = DOSSIER_VALIDATOR_VERSION) -> None:
+        """AI 호출 불필요/검증 0건을 처리 완료로 기록해 같은 입력 재호출을 막는다.
+
+        현재 검증 버전의 유효 카드는 보존한다. 구버전 카드는 잘못된 발화자 근거를
+        포함할 수 있으므로 내용·갱신일을 비우고 현재 버전의 빈 행으로 전환한다.
+        """
+        addr = (addr or "").lower()
+        row = self.people_dossier(addr, include_stale=True)
+        if row and row["validator_version"] == validator_version:
+            self.db.execute(
+                "UPDATE people_dossier SET basis_msg_count=? WHERE addr=?",
+                (basis_msg_count, addr))
+        else:
+            self.db.execute(
+                """INSERT INTO people_dossier
+                   (addr, dossier_md, updated, basis_msg_count, validator_version)
+                   VALUES (?,'','',?,?)
+                   ON CONFLICT(addr) DO UPDATE SET
+                     dossier_md='', updated='',
+                     basis_msg_count=excluded.basis_msg_count,
+                     validator_version=excluded.validator_version""",
+                (addr, basis_msg_count, validator_version))
         self.db.commit()
 
     def dossier_roles(self) -> dict[str, str]:
@@ -1376,7 +1476,9 @@ class Store:
         '## 역할' 헤더는 건너뛰고 그 아래 첫 '- [#N] 서술'의 서술만 뽑는다."""
         out = {}
         for r in self.db.execute(
-                "SELECT addr, dossier_md FROM people_dossier WHERE dossier_md!=''"):
+                """SELECT addr, dossier_md FROM people_dossier
+                   WHERE dossier_md!='' AND validator_version=?""",
+                (DOSSIER_VALIDATOR_VERSION,)):
             for ln in (r["dossier_md"] or "").splitlines():
                 s = ln.strip()
                 if not s or s.startswith("##"):

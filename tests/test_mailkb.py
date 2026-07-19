@@ -3,6 +3,7 @@
 import json
 from datetime import date, timedelta
 import os
+import sqlite3
 import sys
 import tempfile
 import time
@@ -28,7 +29,7 @@ from mailkb.clean import (
 )
 from mailkb.config import Config
 from mailkb.sources.base import MailRecord
-from mailkb.store import Store
+from mailkb.store import DOSSIER_VALIDATOR_VERSION, Store
 
 ME = "me@corp.example"
 
@@ -2135,9 +2136,12 @@ class TestPeopleDossierAI(unittest.TestCase):
         self.store.ingest([
             _rec("k1", self.KIM, [ME], "NPX-200 타이밍 클로저",
                  "2026-07-01T09:00:00", "B0 타이밍 hold 위반 재현됩니다. 재검증 필요."),
-            _rec("k2", ME, [self.KIM], "RE", "2026-07-01T13:00:00", "확인했습니다."),
+            _rec("k2", ME, [self.KIM], "RE", "2026-07-01T13:00:00",
+                 "제가 최종 승인 담당입니다. 이번 릴리스를 승인합니다.",
+                 reply_to="k1"),
             _rec("k3", self.KIM, [ME], "RE", "2026-07-02T09:00:00",
-                 "LEC 스크립트 점검 완료했습니다. 16일 슬롯 문제없습니다."),
+                 "LEC 스크립트 점검 완료했습니다. 16일 슬롯 문제없습니다.",
+                 reply_to="k2"),
         ])
         self.t1 = self._tid("k1")
 
@@ -2182,6 +2186,111 @@ class TestPeopleDossierAI(unittest.TestCase):
         self.assertEqual(self._run(fake), 1)
         self.assertEqual(self.store.people_dossier(self.KIM)["basis_msg_count"], 4)
 
+    def test_rejects_my_quote_as_their_role(self):
+        # 회귀 재현: 같은 스레드의 내 발언은 대상 인물 역할의 근거가 될 수 없다.
+        raw = (f"## 역할\n- [#{self.t1}] 최종 승인 담당 · 인용: "
+               f'"제가 최종 승인 담당입니다"')
+        md = distill._sanitize_dossier(
+            raw, distill._PersonQuoteChecker(self.store, self.KIM))
+        self.assertEqual(md, "")
+
+    def test_rejects_third_party_quote_in_same_thread(self):
+        lee = "lee@corp.example"
+        self.store.ingest([
+            _rec("k4", lee, [ME, self.KIM], "RE", "2026-07-03T09:00:00",
+                 "제가 릴리스 승인 담당입니다. 결과는 오늘 공유합니다.",
+                 reply_to="k1"),
+        ])
+        self.assertEqual(self._tid("k4"), self.t1)
+        raw = (f"## 역할\n- [#{self.t1}] 릴리스 승인 담당 · 인용: "
+               f'"제가 릴리스 승인 담당입니다"')
+        md = distill._sanitize_dossier(
+            raw, distill._PersonQuoteChecker(self.store, self.KIM))
+        self.assertEqual(md, "")
+
+    def test_rejects_preserved_quote_inside_target_message(self):
+        quoted = "제가 최종 승인 담당입니다. 이번 릴리스를 승인합니다."
+        own = "B0 타이밍 hold 위반 재현됩니다. 재검증 필요."
+        self.store.db.execute(
+            "UPDATE messages SET new_content=? WHERE message_id='<k1@t>'",
+            (own + "\n\n" + PRESERVED_MARK + "\n" + quoted,))
+        self.store.db.commit()
+        checker = distill._PersonQuoteChecker(self.store, self.KIM)
+        self.assertTrue(checker.ok(self.t1, "B0 타이밍 hold 위반 재현됩니다"))
+        self.assertFalse(checker.ok(self.t1, "제가 최종 승인 담당입니다"))
+
+    def test_rejects_quote_spanning_two_messages(self):
+        self.store.ingest([
+            _rec("k4", self.KIM, [ME], "RE", "2026-07-03T09:00:00",
+                 "첫번째메시지마지막구절", reply_to="k1"),
+            _rec("k5", self.KIM, [ME], "RE", "2026-07-03T10:00:00",
+                 "두번째메시지시작구절", reply_to="k4"),
+        ])
+        self.assertEqual(self._tid("k4"), self.t1)
+        self.assertEqual(self._tid("k5"), self.t1)
+        checker = distill._PersonQuoteChecker(self.store, self.KIM)
+        self.assertFalse(
+            checker.ok(self.t1, "첫번째메시지마지막구절두번째메시지시작구절"))
+
+    def test_materials_only_include_target_authored_excerpts(self):
+        ctx = self.store.person_thread_context(self.KIM)
+        text = "\n".join(
+            e["text"] for c in ctx for e in c["excerpts"])
+        self.assertIn("B0 타이밍 hold 위반", text)
+        self.assertIn("LEC 스크립트 점검", text)
+        self.assertNotIn("제가 최종 승인 담당", text)
+        materials = distill._dossier_materials(
+            self.store, self.cfg, self.KIM, "kim")
+        self.assertIn("대상 인물 직접 작성 발췌", materials["threads"])
+        self.assertIn("문맥 전용, 인용 금지", materials["threads"])
+
+    def test_no_target_material_skips_ai_call(self):
+        only = "only-recipient@corp.example"
+        self.store.ingest([
+            _rec("only1", ME, [only], "단방향 공유", "2026-07-04T09:00:00",
+                 "제가 보낸 내용만 있고 상대 발신은 없습니다."),
+        ])
+        with mock.patch.object(review, "ai_run") as run:
+            result = distill._gen_dossier(
+                self.store, self.cfg, ["echo"], only, "수신자", "")
+        self.assertEqual(result.status, "no_material")
+        run.assert_not_called()
+
+    def test_empty_validation_advances_basis_without_repeated_call(self):
+        invalid = (f"## 역할\n- [#{self.t1}] 근거 없는 담당 · 인용: "
+                   f'"본문에 존재하지 않는 무효 인용문입니다"')
+        with mock.patch.object(review, "ai_run", return_value=invalid) as run:
+            self.assertEqual(
+                distill.refresh_people_dossiers(
+                    self.store, self.cfg, backend="internal"), 0)
+            self.assertEqual(
+                distill.refresh_people_dossiers(
+                    self.store, self.cfg, backend="internal"), 0)
+        self.assertEqual(run.call_count, 1)
+        row = self.store.people_dossier(self.KIM)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["dossier_md"], "")
+        self.assertEqual(row["basis_msg_count"], 3)
+
+    def test_stale_validator_hidden_then_regenerated_without_old_prompt(self):
+        self.store.save_people_dossier(
+            self.KIM, "## 역할\n- [#1] 오래된 잘못된 역할", 3,
+            validator_version=1)
+        self.assertIsNone(self.store.people_dossier(self.KIM))
+        self.assertNotIn(self.KIM, self.store.dossier_roles())
+        self.assertNotIn("오래된 잘못된 역할",
+                         web.render_dossier(self.store, self.cfg, self.KIM))
+        valid = (f"## 역할\n- [#{self.t1}] 타이밍 클로저 담당 · 인용: "
+                 f'"B0 타이밍 hold 위반 재현됩니다"')
+        with mock.patch.object(review, "ai_run", return_value=valid) as run:
+            self.assertEqual(
+                distill.refresh_people_dossiers(
+                    self.store, self.cfg, backend="internal"), 1)
+        self.assertNotIn("오래된 잘못된 역할", run.call_args.args[1])
+        row = self.store.people_dossier(self.KIM)
+        self.assertEqual(row["validator_version"], DOSSIER_VALIDATOR_VERSION)
+        self.assertIn("타이밍 클로저 담당", row["dossier_md"])
+
     def test_ai_card_and_landing_role(self):
         self._run(f'## 역할\n- [#{self.t1}] 타이밍 클로저 담당 · 인용: '
                   f'"B0 타이밍 hold 위반 재현됩니다"')
@@ -2200,6 +2309,35 @@ class TestPeopleDossierAI(unittest.TestCase):
         # 도시에 없으면 AI 카드 없이 결정론 카드만(graceful)
         d = web.render_dossier(self.store, self.cfg, self.KIM)
         self.assertNotIn("AI 추정", d)
+
+
+class TestPeopleDossierSchema(unittest.TestCase):
+    def test_old_table_gets_validator_column_without_resync(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "old.sqlite"
+            db = sqlite3.connect(path)
+            db.execute(
+                """CREATE TABLE people_dossier (
+                     addr TEXT PRIMARY KEY, dossier_md TEXT DEFAULT '',
+                     updated TEXT DEFAULT '', basis_msg_count INTEGER DEFAULT 0
+                   )""")
+            db.execute(
+                "INSERT INTO people_dossier VALUES (?,?,?,?)",
+                ("kim@corp.example", "## 역할\n- [#1] 구버전", "2026-07-01", 2))
+            db.commit()
+            db.close()
+
+            store = Store(path, [ME])
+            try:
+                cols = {r["name"] for r in
+                        store.db.execute("PRAGMA table_info(people_dossier)")}
+                self.assertIn("validator_version", cols)
+                self.assertIsNone(store.people_dossier("kim@corp.example"))
+                stale = store.people_dossier(
+                    "kim@corp.example", include_stale=True)
+                self.assertEqual(stale["validator_version"], 1)
+            finally:
+                store.close()
 
 
 class TestWordCloud(unittest.TestCase):
