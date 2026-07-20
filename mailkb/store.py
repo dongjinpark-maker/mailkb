@@ -372,14 +372,18 @@ class Store:
         # 판정 표면(ignore/blocked/subject_strong)은 _action_version 에 포함 —
         # 노이즈 설정이 바뀌면 본문 재분류 없이 액션만 재접기(_refold_all_actions).
         self._noise = noise
-        self.db = sqlite3.connect(db_path)
+        # timeout=30 은 sqlite busy_timeout 30000ms 와 동일한 busy handler 로,
+        # 연결 생성 시점에 설치되어 아래 PRAGMA·DDL 포함 전 구문을 보호한다.
+        # 기본 5s 로는 부족: 백그라운드 sync 의 ingest 가 전체 배치를 한 트랜잭션으로
+        # 잡는 동안(Outlook fetch 포함, 수십 초 가능) 다른 연결의 쓰기가 5s 대기 후
+        # 'database is locked' 로 실패했다(앱 모드에서 관측).
+        self.db = sqlite3.connect(db_path, timeout=30.0)
         self.db.row_factory = sqlite3.Row
         # incremental vacuum: 이미지 프룬이 지운 공간을 조각 단위로 회수 —
         # 풀 VACUUM(수십 초 배타 잠금)은 단일 스레드 웹 서버를 세우므로 금지.
         # 이 PRAGMA 는 새 DB(테이블 생성 전)에서만 효력 — clean start 전제.
         self.db.execute("PRAGMA auto_vacuum=INCREMENTAL")
         self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA busy_timeout=5000")  # 웹 백그라운드 쓰기 경합 대비
         # 성능 PRAGMA(결과 불변, 속도만) — synchronous=NORMAL: WAL 에서 표준 권장.
         # 앱 크래시엔 안전, OS 크래시/정전 시에만 마지막 트랜잭션 유실 가능한데
         # 이 DB 는 Outlook 에서 재수집 가능한 캐시(message_id UNIQUE 로 멱등)라
