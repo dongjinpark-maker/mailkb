@@ -4714,9 +4714,12 @@ class TestWeb(unittest.TestCase):
         self.assertIn("flag|unflag|hide|unhide|signal-off|signal-on", js)
 
     def test_appjs_xfh_toggle_keys(self):
-        # x 신호 · f 플래그 · h 숨김 = 선택 행 상태 토글(j/k 커서 기준).
-        # 서버 -toggle 엔드포인트 호출 + 커서 복원(restoreKbd).
+        # x 신호 · f 플래그 · h 숨김 — 대상은 우측에 열린 스레드 1순위(주소 →
+        # 우측 폼 action 순), 없으면 j/k 커서 행. 서버 -toggle 호출 + 커서 복원.
         js = self.web._APP_JS
+        self.assertIn("function openTid", js)          # 우측 열린 스레드 판별
+        self.assertIn('load("/thread/" + tid, "right", false)', js)  # 우측 상세 동기화
+        self.assertIn("right.scrollTop = rsc", js)     # 갱신 후 읽던 위치 유지
         self.assertNotIn('k === "s"', js)              # 구 's' 분기 제거
         self.assertIn('k === "x"', js)
         self.assertIn('k === "f"', js)

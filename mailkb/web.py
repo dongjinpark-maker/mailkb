@@ -1744,22 +1744,41 @@ _APP_JS = r"""
     rows[j].classList.add("kbd");
     if (rows[j].scrollIntoView) rows[j].scrollIntoView({ block: "nearest" });
   }
+  function openTid() {
+    /* 우측 상세에 열린 스레드 id. 주소가 1순위, 좌측 목록으로 이동해 주소가
+       바뀐 뒤에도 우측에 상세가 남아 있으면 그 조작 폼(action)에서 읽는다. */
+    var m = location.pathname.match(/^\/thread\/(\d+)/);
+    if (m) return m[1];
+    var f = right.querySelector("form[action^='/thread/']");
+    m = f && f.getAttribute("action").match(/^\/thread\/(\d+)/);
+    return m ? m[1] : null;
+  }
   function toggleRow(kind) {
-    var rows = navRows(); if (!rows.length) return false;
-    var i = curIdx(rows); if (i < 0) return false;   /* 커서/열린 항목 없으면 무동작 */
-    var row = rows[i];                                /* .mrow 는 행 자체가 <a> (focusRow 와 동일 처리) */
-    var a = (row.matches && row.matches("a[href^='/thread/']")) ? row
-          : (row.querySelector ? row.querySelector("a[href^='/thread/']") : null);
-    var m = a && a.getAttribute("href").match(/\/thread\/(\d+)/);
-    if (!m) return false;
-    var tid = m[1];
+    /* 대상 = 우측에 열린 스레드(보고 있는 것) 1순위 — 우측 안에서 다른 스레드로
+       이동해 목록 커서와 어긋나도 화면의 메일에 동작한다. 없으면 커서 행. */
+    var rows = navRows(), i = curIdx(rows), tid = openTid();
+    if (!tid && i >= 0) {
+      var row = rows[i];                              /* .mrow 는 행 자체가 <a> (focusRow 와 동일 처리) */
+      var a = (row.matches && row.matches("a[href^='/thread/']")) ? row
+            : (row.querySelector ? row.querySelector("a[href^='/thread/']") : null);
+      var m = a && a.getAttribute("href").match(/\/thread\/(\d+)/);
+      if (m) tid = m[1];
+    }
+    if (!tid) return false;
     fetch("/thread/" + tid + "/" + kind + "-toggle",
           { method: "POST", headers: { "X-Requested-With": "fetch" } })
       .then(function (r) { return r.text(); })
       .then(function (tok) {
         toast(tokenToast(tok));
+        if (openTid() === tid) {          /* 우측 상세 동기화 — 플래그·신호 칩·숨김 */
+          var rsc = right.scrollTop;
+          load("/thread/" + tid, "right", false)   /* 주소는 그대로(push 없음) */
+            .then(function () { right.scrollTop = rsc; })   /* 읽던 위치 유지 */
+            .catch(function () {});
+        }
         var cur = leftCur || (location.pathname + (location.search || ""));
-        load(cur, "left", false).then(function () { restoreKbd(tid, i); })
+        load(cur, "left", false)
+          .then(function () { if (i >= 0) restoreKbd(tid, i); })
           .catch(function () {});
       }).catch(function () {});
     return true;
