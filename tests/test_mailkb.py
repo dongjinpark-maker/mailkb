@@ -4527,7 +4527,8 @@ class TestWeb(unittest.TestCase):
             self.assertNotIn("추적제외", out)
             # 오른쪽 끝 (i) 키보드 도움말 — 기본은 CSS 로 숨김(호버/포커스 시 노출)
             self.assertIn("class='kbdhelp'", out)
-            self.assertIn("x 신호", out)        # 팝오버 내용
+            # 팝오버 내용 — x 의 범위(회신 필요·확인 후보 전체)를 명시
+            self.assertIn("x 신호 끄기·복원(회신 필요·확인 후보)", out)
         self.assertIn(".kbdpop", self.web._CSS)          # 도움말 팝오버 스타일
         self.assertIn("display: none", self.web._CSS)
         # 메일함 설명문 삭제 · 스레드 미답변 제거
@@ -4725,6 +4726,8 @@ class TestWeb(unittest.TestCase):
         self.assertIn("tokenToast", js)                # 상태명 토스트 매핑
         # .mrow 는 행 자체가 <a> — 자식만 찾으면 목록에서 무동작(회귀 가드)
         self.assertIn("row.matches", js)
+        # 접힌 확인 후보 폴드 안 행 제외 — 안 보이는 행에 커서·토글 금지(회귀 가드)
+        self.assertIn("offsetParent", js)
 
     def test_nav_active_underline(self):
         # 현재 위치한 최상위 메뉴에 밑줄(active) 표시
@@ -6612,6 +6615,25 @@ class TestSignalDismiss(unittest.TestCase):
                          "signal:on")
         self.assertEqual(
             actions.evaluate_thread(self.store, self.cfg, tid).level, "required")
+
+    def test_toggle_signal_maybe_also_dismissed(self):
+        # x 는 회신 필요(REQUIRED)만이 아니라 확인 후보(MAYBE)도 끈다 —
+        # 그룹 To 강등(group_to)으로 MAYBE 를 만들어 토글.
+        self.store.ingest([self._r(
+            "g1", "kim@corp.example", "그룹요청건",
+            "다음 주까지 검토 부탁드립니다.", "2026-07-15T09:00:00",
+            to=[ME, "a@corp.example", "b@corp.example",
+                "c@corp.example", "d@corp.example"])])
+        tid = self.store.db.execute(
+            "SELECT thread_id FROM messages WHERE message_id='<g1@t>'"
+        ).fetchone()[0]
+        self.assertEqual(
+            actions.evaluate_thread(self.store, self.cfg, tid).level, "maybe")
+        self.assertEqual(web._toggle_thread(self.store, self.cfg, tid, "signal"),
+                         "signal:off")
+        self.assertEqual(
+            actions.evaluate_thread(self.store, self.cfg, tid).reasons,
+            ["user_dismissed"])
 
     def test_toggle_signal_none_when_no_action(self):
         self.store.ingest([self._r("n1", "kim@corp.example", "공유건",

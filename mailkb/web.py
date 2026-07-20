@@ -1699,8 +1699,13 @@ _APP_JS = r"""
 
   /* ---- 키보드 네비게이션: j/k 로 이동하면 바로 열람(우측에 표시) ---- */
   function navRows() {
-    return left ? Array.prototype.slice.call(
-      left.querySelectorAll(".mrow, .item, .digest")) : [];
+    /* 보이는 행만 — 접힌 <details>(확인 후보 폴드) 안 행이 들어오면 j/k 커서가
+       화면 밖에서 돌고 x/f/h 가 안 보이는 행에 동작한다. offsetParent 는
+       display:none(접힘 포함) 조상 아래에서 null. */
+    if (!left) return [];
+    return Array.prototype.slice.call(
+      left.querySelectorAll(".mrow, .item, .digest"))
+      .filter(function (r) { return r.offsetParent !== null; });
   }
   function curIdx(rows) {
     var i;
@@ -2253,7 +2258,7 @@ def _list_filter_bar(base: str, active: str, counts: dict) -> str:
     # 오른쪽 끝 (i) — 키보드 단축키 안내(순수 CSS 호버/포커스 팝오버, CSP 준수).
     help = ("<span class='kbdhelp' tabindex='0' aria-label='키보드 단축키'>ⓘ"
             "<span class='kbdpop'>"
-            "<b>키보드</b><br>j / k 이동<br>x 신호 끄기·복원<br>"
+            "<b>키보드</b><br>j / k 이동<br>x 신호 끄기·복원(회신 필요·확인 후보)<br>"
             "f 플래그<br>h 숨김<br>/ 검색</span></span>")
     return ("<div class='listtabs'><span class='ltabs'>"
             + " · ".join(parts)
