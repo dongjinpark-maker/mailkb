@@ -1966,14 +1966,12 @@ class TestPeopleDossier(unittest.TestCase):
         self.assertLess(page.index("kim%40corp"), page.index("lee%40corp"))
         self.assertIn("pbadge", page)                     # kim 미결 배지
 
-    def test_dossier_relationship_and_mutual_cards(self):
+    def test_dossier_relationship_card(self):
         d = web.render_dossier(self.store, self.cfg, self.KIM)
         self.assertIn("관계 수치", d)
         self.assertIn("받은 2", d)
         self.assertIn("보낸 1", d)
-        self.assertIn("서로의 미결", d)
-        self.assertIn("이 사람 → 나", d)                  # kim 의 열린 요청
-        self.assertRegex(d, r"/thread/\d+'>#\d+")         # 근거 링크
+        self.assertNotIn("서로의 미결", d)                # 제거된 섹션
 
     def test_decisions_and_signals_scoped_by_participation(self):
         # 동명이인 방지: 이름이 같아도 이 사람 참여 스레드의 것만

@@ -3227,23 +3227,7 @@ def render_dossier(store, cfg, addr: str) -> str:
             for pp in m["pingpong"][:6])
         cards.append(("진행 중", f"<ul>{lis}</ul>"))
 
-    # 3. 서로의 미결
-    acts = actions.classify_threads(store, cfg)
-    they_ask = [(tid, a) for tid, a in acts.items()
-                if a.level == actions.REQUIRED and (a.sender_addr or "").lower() == addr]
-    waiting = m["waiting"] if m else []
-    if they_ask or waiting:
-        lis = []
-        for tid, a in they_ask:
-            lis.append(f"<li><b>이 사람 → 나</b> {esc(a.subject or '(제목 없음)')} "
-                       f"<a href='/thread/{tid}'>#{tid}</a></li>")
-        for ev in waiting:
-            lis.append(f"<li><b>나 → 이 사람</b> {esc(ev['subject'])} "
-                       f"<span class='dim'>· {ev['days']}일 대기</span> "
-                       f"<a href='/thread/{ev['thread_id']}'>#{ev['thread_id']}</a></li>")
-        cards.append(("서로의 미결", f"<ul>{''.join(lis)}</ul>"))
-
-    # 4. 관여한 결정 (결정자=이 사람, 참여 스레드 교집합)
+    # 3. 관여한 결정 (결정자=이 사람, 참여 스레드 교집합)
     decs = store.person_decisions(addr, name)
     if decs:
         lis = "".join(
@@ -3252,7 +3236,7 @@ def render_dossier(store, cfg, addr: str) -> str:
             for d in decs[:8])
         cards.append(("관여한 결정", f"<ul>{lis}</ul>"))
 
-    # 5. 최근 변화 (축적된 인물 신호 — distill_signals 첫 소비처)
+    # 4. 최근 변화 (축적된 인물 신호 — distill_signals 첫 소비처)
     sigs = store.person_signals(addr, name)
     if sigs:
         lis = "".join(
@@ -3262,7 +3246,7 @@ def render_dossier(store, cfg, addr: str) -> str:
             for s in sigs[:8])
         cards.append(("최근 변화", f"<ul>{lis}</ul>"))
 
-    # 6. 업무 어휘 지도 — 최근 창 안 메일 단위 지지도·대조 점수·공기어 군집.
+    # 5. 업무 어휘 지도 — 최근 창 안 메일 단위 지지도·대조 점수·공기어 군집.
     # 하드 노이즈는 제외하고, compact 대상 bag + 현재 창 rolling DF를 읽는다.
     min_mails = int(cfg.opt("dossier", "wordcloud_min_mails", default=8) or 8)
     top_n = int(cfg.opt("dossier", "wordcloud_top", default=25) or 25)
