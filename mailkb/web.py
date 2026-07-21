@@ -231,6 +231,8 @@ button.flag.on { color: var(--danger); }            /* ⚑ 플래그(색 있음)
 .mrow.sent { background: var(--sent-bg); border-color: var(--sent-border); }
 .mrow.sent .mfrom { font-weight: 400; color: var(--sent-ink); }
 /* 메일 클라이언트식 목록 행 (메일함·스레드) */
+/* 목록 날짜 그룹 헤더(오늘/어제/이번 주…) — 비 sticky(커서 outline·팝오버와 무간섭) */
+.dghead { margin: 12px 2px 2px; font-size: 12px; font-weight: 600; color: var(--ink-3); }
 .mrow { display: block; padding: 7px 10px; margin: 3px 0; border-radius: 8px;
         background: var(--surface); border: 1px solid var(--border); color: var(--ink); }
 .mrow:hover { border-color: var(--accent); text-decoration: none; }
@@ -365,8 +367,16 @@ details.catfold { margin: 8px 0 4px; background: var(--fold); border: 1px solid 
 .sigoff form { display: inline; margin: 0; }
 .sigoff button { border: 0; background: none; color: var(--accent); cursor: pointer;
                  padding: 0; font-size: 13px; text-decoration: underline; }
+/* 스레드 상세 sticky 헤더 — 제목+신호 칩이 스크롤을 따라온다. hookThreadHead 가
+   센티널 이탈 시 .stuck(컴팩트 1줄 말줄임). 배경 필수 — 비치면 타임라인과 겹침. */
+.threadhead { position: sticky; top: 0; z-index: 5; background: var(--bg);
+    padding: 2px 0 4px; }
+.threadhead.stuck { border-bottom: 1px solid var(--border); }
+.threadhead.stuck h1 { font-size: 15px; margin: 6px 0 4px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .msg { border: 1px solid var(--border); border-radius: 8px; margin: 12px 0; overflow: hidden;
-    scroll-margin-top: 10px; transition: box-shadow .5s ease; }
+    scroll-margin-top: 72px;  /* stuck 헤더 높이 — focusMsg·n/p 스크롤이 안 가리게 */
+    transition: box-shadow .5s ease; }
 /* 검색·목록에서 연 메일을 잠깐 강조(2.8s 후 JS 가 클래스 제거 → 트랜지션으로 페이드) */
 .msg.focusmsg { box-shadow: 0 0 0 2px var(--accent); }
 .msg.focusmsg .mhead { background: var(--sel-bg); }
@@ -376,7 +386,10 @@ details.catfold { margin: 8px 0 4px; background: var(--fold); border: 1px solid 
 .msg .mhead .mh-who { font-weight: 700; color: var(--ink); overflow: hidden;
     white-space: nowrap; text-overflow: ellipsis; }
 .msg .mhead .mh-when { margin-left: auto; flex: none; color: var(--ink-3); font-size: 12px; }
-.msg .mbody { padding: 12px 14px; }
+/* 본문 글자 크기 — 설정(web.reading_font)이 --read-fs 로 주입. 미설정 시 폴백이
+   현행(본문 16px 상속·pre 13px 모노)과 동일해 시각 변화 없음. 크롬(mhead·칩)은 고정. */
+.msg .mbody { padding: 12px 14px; font-size: var(--read-fs, 16px); }
+.msg .mbody pre { font-size: var(--read-fs, 13px); }
 .msg .mbody img { max-width: 100%; }
 .msg .mbody img[data-blocked-src] { min-width: 8px; min-height: 8px;
     outline: 1px dashed var(--border-strong); }
@@ -1127,7 +1140,7 @@ _FAVICON_SVG = (
 
 def _head(title: str, refresh: int | None = None, extra_css: str = "",
           read_w: int | None = None, active: str | None = None,
-          theme: str = "light") -> str:
+          theme: str = "light", read_fs: int | None = None) -> str:
     meta_refresh = f"<meta http-equiv='refresh' content='{refresh}'>" if refresh else ""
     # extra_css 는 _CSS '앞'에 넣는다 — 겹치는 셀렉터(body·h1·header·* 등)는 뒤의
     # _CSS 가 이겨 상단 셸 타이포/헤더가 다른 페이지와 동일하게 유지되고,
@@ -1135,6 +1148,8 @@ def _head(title: str, refresh: int | None = None, extra_css: str = "",
     extra = f"<style>{extra_css}</style>" if extra_css else ""
     # 읽기 창(#right) 너비는 설정값을 CSS 변수로 주입(미지정 시 CSS 기본 1200px).
     rw = f"<style>:root{{--read-w:{int(read_w)}px}}</style>" if read_w else ""
+    # 본문 글자 크기(web.reading_font)도 같은 방식 — 별도 <style>(rw 문자열 불변).
+    rf = f"<style>:root{{--read-fs:{int(read_fs)}px}}</style>" if read_fs else ""
     # 테마는 <html data-theme> 로 — 다크는 :root[data-theme='dark'] 토큰 오버라이드.
     th = "dark" if theme == "dark" else "light"
     return (
@@ -1143,7 +1158,7 @@ def _head(title: str, refresh: int | None = None, extra_css: str = "",
         f"{meta_refresh}"
         f"<title>{esc(title)} · Minerva</title>"
         "<link rel='icon' type='image/svg+xml' href='/favicon.svg'>"
-        f"{extra}<style>{_CSS}</style>{rw}"
+        f"{extra}<style>{_CSS}</style>{rw}{rf}"
         "</head><body>"
         f"<header class='top'><span class='brand'>Minerva</span>"
         f"{_nav_html(active)}</header>"
@@ -1184,10 +1199,11 @@ def render_stats_page(store, cfg, weeks: int) -> str:
 
 
 def _shell(title: str, left: str, right: str, refresh: int | None = None,
-           read_w: int | None = None, theme: str = "light") -> str:
+           read_w: int | None = None, theme: str = "light",
+           read_fs: int | None = None) -> str:
     """Outlook 유사 좌/우 분할 셸 (#14). 콘텐츠 갱신은 /app.js 가 fragment 로."""
     return (
-        _head(title, refresh, read_w=read_w, theme=theme)
+        _head(title, refresh, read_w=read_w, theme=theme, read_fs=read_fs)
         + "<div id='layout'>"
         + f"<aside id='left'><div class='inner'>{left}</div></aside>"
         + "<div id='splitter' title='드래그로 폭 조절'></div>"
@@ -1374,6 +1390,20 @@ _APP_JS = r"""
     hookAiPolling(el);
     hookSyncPolling(el);
     hookMore();
+    hookThreadHead();
+  }
+
+  /* ---- 스레드 sticky 헤더: 센티널이 위로 벗어나면 컴팩트(.stuck) ---- */
+  var _thObs = null;
+  function hookThreadHead() {
+    if (_thObs) { _thObs.disconnect(); _thObs = null; }
+    var sen = right.querySelector(".sticksentinel");
+    var head = right.querySelector(".threadhead");
+    if (!sen || !head || !window.IntersectionObserver) return;
+    _thObs = new IntersectionObserver(function (entries) {
+      head.classList.toggle("stuck", !entries[0].isIntersecting);
+    }, { root: right, threshold: 0 });
+    _thObs.observe(sen);
   }
 
   /* 검색·목록에서 연 메일로 스크롤 + 잠깐 강조. inject 가 방금 scrollTop=0 으로
@@ -1783,9 +1813,30 @@ _APP_JS = r"""
       }).catch(function () {});
     return true;
   }
+  function msgNav(dir) {
+    /* 스레드 타임라인(최신 먼저)에서 n=아래(과거)/p=위(최신) 메시지로 이동.
+       현재 위치 = 헤더 앵커 위로 지나간 마지막 메시지(읽는 중). 목록 화면은 no-op. */
+    var msgs = right.querySelectorAll(".mthread .msg");
+    if (!msgs.length) return false;
+    var th = right.querySelector(".threadhead");
+    var anchor = right.getBoundingClientRect().top + (th ? th.offsetHeight : 0) + 6;
+    var cur = -1;
+    for (var i = 0; i < msgs.length; i++) {
+      if (msgs[i].getBoundingClientRect().top <= anchor) cur = i; else break;
+    }
+    var j = Math.max(0, Math.min(cur + dir, msgs.length - 1));
+    if (j !== cur) focusMsg("right", msgs[j].id.slice(4));
+    return true;
+  }
   document.addEventListener("keydown", function (e) {
     if (e.ctrlKey || e.metaKey || e.altKey) return;
     var t = e.target;
+    if (e.key === "Escape") {  /* 입력란 탈출('/' 의 짝) — 그 외 Esc 는 무동작 */
+      if (t && (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.isContentEditable)) {
+        t.blur(); e.preventDefault();
+      }
+      return;
+    }
     if (t && (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.isContentEditable))
       return;                  /* 입력 중엔 개입 안 함 */
     var k = e.key, rows, i;
@@ -1808,6 +1859,10 @@ _APP_JS = r"""
       if (toggleRow("flag")) e.preventDefault();
     } else if (k === "h") {        /* 숨김 토글 */
       if (toggleRow("hide")) e.preventDefault();
+    } else if (k === "n") {        /* 스레드 안 다음(과거) 메일 */
+      if (msgNav(1)) e.preventDefault();
+    } else if (k === "p") {        /* 스레드 안 이전(최신) 메일 */
+      if (msgNav(-1)) e.preventDefault();
     }
   });
 
@@ -1860,6 +1915,7 @@ _APP_JS = r"""
   hookAiPolling(left);
   hookSyncPolling(right);
   hookMore();
+  hookThreadHead();
   /* 전체 로드로 /thread/…?focus=N 을 열었을 때(새로고침·직접 URL)도 그 메일로 스크롤 */
   focusMsg("right", new URLSearchParams(location.search).get("focus"));
 })();
@@ -2217,12 +2273,51 @@ def _fmt_when(iso: str) -> str:
     return f"{y}/{int(m)}/{int(dd)}"
 
 
-def _more_html(path: str, offset: int) -> str:
+def _date_group(iso: str, today) -> str:
+    """목록 날짜 그룹 키 — ASCII(더 보기 URL 로 다음 배치에 넘김). 최신순에서 단조:
+    t(오늘) → y(어제) → w(이번 주·월요일 시작) → lw(지난 주) → m(이번 달) → YYYY-MM.
+    '어제' 판정이 주(週) 판정보다 앞이라 월요일의 어제(지난주 일요일)도 역행 없음."""
+    if not iso:
+        return ""
+    try:
+        d = date.fromisoformat(iso[:10])
+    except ValueError:
+        return ""
+    if d >= today:                      # 미래 타임스탬프(시계 어긋남)도 오늘로 흡수
+        return "t"
+    if (today - d).days == 1:
+        return "y"
+    monday = today - timedelta(days=today.weekday())
+    if d >= monday:
+        return "w"
+    if d >= monday - timedelta(days=7):
+        return "lw"
+    if (d.year, d.month) == (today.year, today.month):
+        return "m"
+    return f"{d.year:04d}-{d.month:02d}"
+
+
+_GROUP_LABELS = {"t": "오늘", "y": "어제", "w": "이번 주",
+                 "lw": "지난 주", "m": "이번 달"}
+
+
+def _group_label(key: str) -> str:
+    """그룹 키 → 표시 라벨. 월 키(YYYY-MM)는 'YYYY년 M월'."""
+    if key in _GROUP_LABELS:
+        return _GROUP_LABELS[key]
+    y, m = key.split("-")
+    return f"{int(y)}년 {int(m)}월"
+
+
+def _more_html(path: str, offset: int, group: str = "") -> str:
     """추가 로딩 센티널 — app.js 가 IntersectionObserver 로 감지해 이어 붙인다.
-    JS 꺼짐 폴백은 '더 보기' 링크(전체 페이지 이동). path 에 쿼리가 있으면 '&' 로 연결."""
+    JS 꺼짐 폴백은 '더 보기' 링크(전체 페이지 이동). path 에 쿼리가 있으면 '&' 로 연결.
+    group = 이 배치 마지막 행의 날짜 그룹 키 — 다음 배치가 이어받아 같은 그룹이
+    경계에서 헤더를 중복 방출하지 않는다(offset 뒤에 부가 — 접두 단정 테스트 보존)."""
     sep = "&" if "?" in path else "?"
-    return (f"<div class='more' data-more='{path}{sep}offset={offset}'>"
-            f"<a href='{path}{sep}offset={offset}'>더 보기</a></div>")
+    g = f"&g={group}" if group else ""
+    return (f"<div class='more' data-more='{path}{sep}offset={offset}{g}'>"
+            f"<a href='{path}{sep}offset={offset}{g}'>더 보기</a></div>")
 
 
 # 메일함·스레드 왼쪽 목록 공통 필터 (양쪽 통일). 순서 = 탭 순서.
@@ -2372,12 +2467,13 @@ def _maybe_fold(store, acts, maybe_ids) -> str:
             f"<div class='mlist'>{''.join(items)}</div></details>")
 
 
-def render_mail(store, cfg, offset: int = 0, flt: str = "") -> str:
+def render_mail(store, cfg, offset: int = 0, flt: str = "", g: str = "") -> str:
     """메일함 — 노이즈 제외 수신함, 최신순. 스레드 목록과 같은 필터 바(양쪽 통일).
 
     flt: '' 전체 | unread 미개봉 | awaiting 회신 필요 | deadline 기한 |
     flagged 플래그 | hidden 숨김. 숨김은 전체/그 외 필터에서 빠지고 'hidden'
-    탭에서만. offset>0 이면 조각만 반환.
+    탭에서만. offset>0 이면 조각만 반환. g = 직전 배치 마지막 날짜 그룹 키
+    (더 보기 URL 로 전달 — 경계 헤더 중복 방지, 비교에만 쓰고 출력 안 함).
     """
     # 신호 필터(회신 필요·기한)는 스레드 단위 판정 — 소속 메일을 보여준다
     acts, await_ids, maybe_ids, dead_ids = _action_state(store, cfg)
@@ -2404,11 +2500,18 @@ def render_mail(store, cfg, offset: int = 0, flt: str = "") -> str:
         (_RAW_BATCH, offset)).fetchall()
     items: list[str] = []
     consumed = 0
+    nrows = 0                # 실제 행 수 — 그룹 헤더는 페이지 크기에 안 세게
+    last_g = g               # 직전 배치에서 이어받은 그룹 키
+    today_d = date.today()
     for r in raw:
         consumed += 1
         # 숨김 탭은 복구용 — 노이즈여도 보여준다(전체/미개봉/플래그 탭만 노이즈 제외).
         if flt != "hidden" and r["id"] in noise_msg:
             continue
+        gk = _date_group(r["sent_on"], today_d)
+        if gk and gk != last_g:          # emit 직전 비교 — 스킵 행은 키 갱신 없음
+            items.append(f"<div class='dghead'>{_group_label(gk)}</div>")
+            last_g = gk
         badge = "🚩 " if r["flagged"] else ""
         cls = "mrow read" if r["read_at"] else "mrow"   # 읽음=제목 볼드 해제
         items.append(
@@ -2416,11 +2519,12 @@ def render_mail(store, cfg, offset: int = 0, flt: str = "") -> str:
             f"<span class='mtop'><span class='mfrom'>{esc(badge)}{esc(r['subject'])}</span>"
             f"<span class='mdate'>{esc(_fmt_when(r['sent_on']))}</span></span>"
             f"<span class='msubj'>{esc(r['sender_name'] or r['sender_addr'])}</span></a>")
-        if len(items) >= _PAGE:
+        nrows += 1
+        if nrows >= _PAGE:
             break
-    has_more = ((len(items) >= _PAGE and consumed < len(raw))
+    has_more = ((nrows >= _PAGE and consumed < len(raw))
                 or len(raw) == _RAW_BATCH)
-    more = _more_html(base, offset + consumed) if has_more else ""
+    more = _more_html(base, offset + consumed, last_g) if has_more else ""
     if offset:
         return "".join(items) + more
     # 탭 카운트는 SQLite 한 번의 집계로 계산한다. id 문자열은 내부 정수만 사용한다.
@@ -2467,7 +2571,7 @@ def _thread_span_days(first: str, last: str) -> int:
         return 0
 
 
-def render_threads(store, cfg, offset: int = 0, flt: str = "") -> str:
+def render_threads(store, cfg, offset: int = 0, flt: str = "", g: str = "") -> str:
     """스레드 — 메일함과 같은 목록 UI: 제목 [N통] · 마지막 발신인 · 날짜.
 
     flt: '' 전체 | unread 미개봉 | awaiting 회신 필요 | deadline 기한 |
@@ -2509,7 +2613,13 @@ def render_threads(store, cfg, offset: int = 0, flt: str = "") -> str:
     has_more = len(rows) > _PAGE
     rows = rows[:_PAGE]
     items: list[str] = []
+    last_g = g               # 직전 배치에서 이어받은 그룹 키
+    today_d = date.today()
     for r in rows:
+        gk = _date_group(r["last_on"] or "", today_d)
+        if gk and gk != last_g:
+            items.append(f"<div class='dghead'>{_group_label(gk)}</div>")
+            last_g = gk
         marks = ("🚩" if r["flagged"] else "") + ("🙈" if r["hidden"] else "")
         if r["last_addr"] and cfg.is_blocked(r["last_addr"]):
             marks += "⛔"
@@ -2526,7 +2636,7 @@ def render_threads(store, cfg, offset: int = 0, flt: str = "") -> str:
             f"<span class='mdate'>{esc(_fmt_when(r['last_on'] or ''))}</span></span>"
             f"<span class='msubj'>마지막: {esc(r['last_name'] or r['last_addr'] or '')}</span></a>")
     base = f"/threads?{flt}=1" if flt else "/threads"
-    more = _more_html(base, offset + _PAGE) if has_more else ""
+    more = _more_html(base, offset + _PAGE, last_g) if has_more else ""
     if offset:
         return "".join(items) + more
     # total/미개봉/플래그는 노이즈 제외, 숨김(hid)은 노이즈 포함(복구용).
@@ -2637,14 +2747,17 @@ def _signal_chips(tid: int, act) -> str:
 def render_thread(store, cfg, tid: int) -> str:
     d = format_detail(store, cfg, tid)
     t = store.thread(tid)
-    out = [f"<h1>{esc(d['title'])}</h1>"]
+    # sticky 헤더(제목+신호 칩): 센티널이 화면을 벗어나면 app.js(hookThreadHead)가
+    # .stuck 을 붙여 컴팩트(1줄 말줄임)로. 액션 바는 sticky 밖 — x/f/h 키가 대체.
+    out = ["<div class='sticksentinel'></div>",
+           f"<div class='threadhead'><h1>{esc(d['title'])}</h1>"
+           f"{_signal_chips(tid, d.get('act'))}</div>"]
     if t:
         has_attach = any(blk["attach"] for blk in d["timeline"])
         # 결정자 기본값 = 최신 수신 메일 발신인 (타임라인은 최신 먼저)
         decider = next((blk["sender"] for blk in d["timeline"]
                         if not blk["is_sent"]), "")
         out.append(_actions_bar(tid, t, has_attach, decider=decider))
-    out.append(_signal_chips(tid, d.get("act")))
     out.append("<div class='analysis'>")
     for a in d["analysis"]:
         if not a:
@@ -2800,6 +2913,10 @@ def render_settings(store, cfg) -> str:
 
     # ── 표시 설정 ──
     rw = cfg.opt("web", "reading_width", default=1200)
+    rf = cfg.opt("web", "reading_font", default=0)
+    # 미설정이면 value 는 빈 값 — _save_settings 가 빈 필드를 건너뛰므로 다른
+    # 항목 저장 시 원치 않는 reading_font 오버라이드가 기록되지 않는다.
+    rf_val = esc(str(rf)) if rf else ""
     sync_min = cfg.opt("web", "sync_interval_min", default=30)
     img_days = cfg.opt("web", "image_retain_days", default=60)
     out.append("<h2>표시 · 동기화</h2>")
@@ -2810,6 +2927,10 @@ def render_settings(store, cfg) -> str:
         f"<td><input type='number' name='reading_width' value='{esc(str(rw))}' "
         "min='600' step='20' style='width:80px'></td>"
         "<td class='dim'>오른쪽 메일 확인창 본문 최대 폭 (기본 1200, 변경 후 새로고침 시 전체 반영)</td></tr>"
+        "<tr><th>본문 글자 크기(px)</th>"
+        f"<td><input type='number' name='reading_font' value='{rf_val}' "
+        "placeholder='16' min='12' step='1' style='width:80px'></td>"
+        "<td class='dim'>메일 본문 텍스트 크기 (기본 16 · 텍스트 메일 13, 변경 후 새로고침 시 반영)</td></tr>"
         "<tr><th>자동 동기화(분)</th>"
         f"<td><input type='number' name='sync_interval_min' value='{esc(str(sync_min))}' "
         "min='0' step='5' style='width:80px'></td>"
@@ -2898,6 +3019,7 @@ _SETTINGS_INTS = [   # (폼 필드, 오버라이드 섹션, 키, 최소값)
     ("stale_workdays", "review", "stale_workdays", 1),
     ("summary_max_days", "ai", "summary_max_days", 1),
     ("reading_width", "web", "reading_width", 600),
+    ("reading_font", "web", "reading_font", 12),
     ("sync_interval_min", "web", "sync_interval_min", 0),   # 0=자동 동기화 끔
     ("image_retain_days", "web", "image_retain_days", 0),   # 0=이미지 임베드 끔
 ]
@@ -3954,9 +4076,11 @@ def route(store, cfg, path, qs, today):
     if path == "/lens/intervene":     # 구 개입 페이지 → 홈으로 흡수(구 링크·북마크 호환)
         return "홈", render_home(store, cfg, today), 200, "left"
     if path == "/mail":
-        return "메일함", render_mail(store, cfg, _offset(qs), _list_flt(qs)), 200, "left"
+        return ("메일함", render_mail(store, cfg, _offset(qs), _list_flt(qs),
+                                   (qs.get("g") or [""])[0]), 200, "left")
     if path == "/threads":
-        return "스레드", render_threads(store, cfg, _offset(qs), _list_flt(qs)), 200, "left"
+        return ("스레드", render_threads(store, cfg, _offset(qs), _list_flt(qs),
+                                      (qs.get("g") or [""])[0]), 200, "left")
     if path == "/people":
         # 인물 도시에. addr 있으면 그 사람 도시에, 없으면 랜딩 목록.
         addr = (qs.get("addr") or [""])[0]
@@ -4128,8 +4252,10 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 left, right = self._panes(store, inner, pane, today, path)
                 rw = self.cfg.opt("web", "reading_width", default=1200)
+                rf = self.cfg.opt("web", "reading_font", default=0)  # 0=미설정(주입 없음)
                 theme = self.cfg.opt("web", "theme", default="light")
-                body = _shell(title, left, right, refresh, read_w=rw, theme=theme)
+                body = _shell(title, left, right, refresh, read_w=rw,
+                              theme=theme, read_fs=rf)
         except Exception:  # 죽지 않게 — 상세는 콘솔(개발용), 화면엔 친절한 안내
             import traceback
             traceback.print_exc()

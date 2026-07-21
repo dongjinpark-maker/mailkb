@@ -4272,6 +4272,134 @@ class TestWeb(unittest.TestCase):
         self.web._save_settings(home, {"reading_width": ["1600"]})
         self.assertEqual(cfgmod.load(home).opt("web", "reading_width", default=1200), 1600)
 
+    def test_reading_font_injected_and_configurable(self):
+        from mailkb import config as cfgmod
+        # read_fs 지정 시 별도 <style> 주입, 미지정 시 미주입(CSS 폴백 = 현행 크기)
+        self.assertIn(":root{--read-fs:17px}", self.web._shell("t", "L", "R", read_fs=17))
+        self.assertNotIn(":root{--read-fs", self.web._shell("t", "L", "R"))
+        both = self.web._shell("t", "L", "R", read_w=1500, read_fs=17)
+        self.assertIn(":root{--read-w:1500px}", both)   # rw 문자열과 독립
+        self.assertIn(":root{--read-fs:17px}", both)
+        home = Path(self.tmp.name)
+        (home / "config.toml").write_text(
+            'my_addresses=["me@corp.example"]\n', encoding="utf-8")
+        self.web._save_settings(home, {"reading_font": ["18"]})
+        self.assertEqual(cfgmod.load(home).opt("web", "reading_font", default=0), 18)
+        self.web._save_settings(home, {"reading_font": ["8"]})    # 최소 12 클램프
+        self.assertEqual(cfgmod.load(home).opt("web", "reading_font", default=0), 12)
+
+    def test_settings_reading_font_field(self):
+        page = self.web.render_settings(self.store, self.cfg)
+        self.assertIn("본문 글자 크기(px)", page)
+        # 미설정이면 빈 값 + placeholder — _save_settings 가 빈 필드를 건너뛰므로
+        # 다른 항목 저장 시 reading_font 오버라이드가 오기록되지 않는다
+        self.assertIn("name='reading_font' value='' placeholder='16'", page)
+
+    def test_css_read_fs_scoped_to_mbody(self):
+        css = self.web._CSS
+        self.assertIn(".msg .mbody { padding: 12px 14px; "
+                      "font-size: var(--read-fs, 16px); }", css)
+        self.assertIn(".msg .mbody pre { font-size: var(--read-fs, 13px); }", css)
+        self.assertEqual(css.count("var(--read-fs"), 2)  # 본문(mbody) 밖 누출 없음
+
+    def test_date_group_buckets(self):
+        dg = self.web._date_group
+        today = date(2026, 7, 22)                       # 수요일
+        self.assertEqual(dg("2026-07-22T09:00:00", today), "t")
+        self.assertEqual(dg("2026-07-21T23:00:00", today), "y")
+        self.assertEqual(dg("2026-07-20T08:00:00", today), "w")   # 이번 주 월요일
+        self.assertEqual(dg("2026-07-19T08:00:00", today), "lw")  # 지난주 일요일
+        self.assertEqual(dg("2026-07-13T08:00:00", today), "lw")  # 지난주 월요일
+        self.assertEqual(dg("2026-07-01T08:00:00", today), "m")
+        self.assertEqual(dg("2026-06-30T08:00:00", today), "2026-06")
+        self.assertEqual(dg("2025-12-01T08:00:00", today), "2025-12")
+        # 월요일의 '어제'(지난주 일요일)는 주(週) 판정보다 앞 — 순서 역행 없음
+        mon = date(2026, 7, 20)
+        self.assertEqual(dg("2026-07-19T08:00:00", mon), "y")
+        self.assertEqual(dg("2026-07-18T08:00:00", mon), "lw")
+        self.assertEqual(self.web._group_label("t"), "오늘")
+        self.assertEqual(self.web._group_label("lw"), "지난 주")
+        self.assertEqual(self.web._group_label("2026-06"), "2026년 6월")
+
+    def test_mail_date_group_headers(self):
+        today = date.today()
+        self.store.ingest([
+            _rec("g1", "kim@corp.example", [ME], "오늘 메일",
+                 today.isoformat() + "T09:00:00"),
+            _rec("g2", "kim@corp.example", [ME], "옛날 메일",
+                 "2026-03-05T09:00:00")])
+        out = self.web.render_mail(self.store, self.cfg)
+        self.assertIn("<div class='dghead'>오늘</div>", out)
+        self.assertIn("<div class='dghead'>2026년 3월</div>", out)
+        # 경계에서만 방출: 헤더 수 = 정렬(최신순)된 행 버킷의 런(run) 수
+        dates = sorted([today.isoformat(), "2026-07-04", "2026-03-05"],  # g1·w1·g2
+                       reverse=True)
+        keys = [self.web._date_group(s, today) for s in dates]
+        runs = sum(1 for i, k in enumerate(keys) if i == 0 or k != keys[i - 1])
+        self.assertEqual(out.count("class='dghead'"), runs)
+        self.assertLess(out.index("dghead'>오늘</div>"), out.index("오늘 메일"))
+
+    def test_mail_more_carries_group_key(self):
+        # 같은 옛 달 35통 → 첫 배치 센티널에 &g=, 다음 배치가 이어받아 헤더 억제
+        self.store.ingest([
+            _rec(f"gm{i}", "kim@corp.example", [ME], f"과거 {i:02d}",
+                 f"2026-03-{(i % 27) + 1:02d}T09:00:00") for i in range(35)])
+        first = self.web.render_mail(self.store, self.cfg)
+        url = first.split("data-more='")[1].split("'")[0]
+        self.assertIn("&g=2026-03", url)
+        self.assertIn("?offset=", url)                  # g 는 offset 뒤(접두 보존)
+        off = int(url.split("offset=")[1].split("&")[0])
+        gkey = url.split("&g=")[1]
+        frag = self.web.render_mail(self.store, self.cfg, offset=off, g=gkey)
+        self.assertNotIn("dghead", frag)                # 같은 그룹 계속 — 헤더 없음
+        frag2 = self.web.render_mail(self.store, self.cfg, offset=off, g="")
+        self.assertIn("dghead'>2026년 3월</div>", frag2)  # 핸드오프 없으면 방출
+
+    def test_threads_date_group_headers(self):
+        today = date.today()
+        self.store.ingest([
+            _rec("tg1", "kim@corp.example", [ME], "오늘 스레드",
+                 today.isoformat() + "T08:00:00"),
+            _rec("tg2", "kim@corp.example", [ME], "옛 스레드",
+                 "2026-03-05T09:00:00")])
+        out = self.web.render_threads(self.store, self.cfg)
+        self.assertIn("dghead'>오늘</div>", out)
+        self.assertIn("dghead'>2026년 3월</div>", out)
+        self.assertLess(out.index("dghead'>오늘</div>"),
+                        out.index("dghead'>2026년 3월</div>"))
+
+    def test_more_html_group_param(self):
+        # 그룹 키는 offset 뒤 — 기존 접두 단정(unread=1&offset=)과 공존
+        h = self.web._more_html("/mail?unread=1", 30, "2026-05")
+        self.assertIn("data-more='/mail?unread=1&offset=30&g=2026-05'", h)
+        self.assertIn("data-more='/mail?offset=30'",
+                      self.web._more_html("/mail", 30))  # group 없으면 종전 그대로
+
+    def test_thread_sticky_header_markup(self):
+        tid = self.store.message("1")["thread_id"]
+        out = self.web.render_thread(self.store, self.cfg, tid)
+        self.assertIn("<div class='sticksentinel'></div>", out)
+        self.assertIn("<div class='threadhead'><h1>", out)
+        # 신호 칩은 sticky 래퍼 안 — 액션 바는 래퍼 밖(뒤)
+        self.assertLess(out.index("threadhead"), out.index("class='actions'"))
+
+    def test_css_threadhead_and_scroll_margin(self):
+        css = self.web._CSS
+        self.assertIn(".threadhead { position: sticky; top: 0;", css)
+        self.assertIn(".threadhead.stuck h1", css)
+        self.assertIn("scroll-margin-top: 72px", css)   # stuck 헤더에 안 가리게
+        self.assertIn(".dghead", css)
+
+    def test_appjs_escape_and_msgnav(self):
+        js = self.web._APP_JS
+        self.assertIn('e.key === "Escape"', js)         # 입력란 탈출('/' 의 짝)
+        self.assertIn("t.blur()", js)
+        self.assertIn("function msgNav", js)            # n/p 메시지 이동
+        self.assertIn('k === "n"', js)
+        self.assertIn('k === "p"', js)
+        self.assertIn("function hookThreadHead", js)    # sticky 컴팩트 토글
+        self.assertIn('classList.toggle("stuck"', js)
+
     def test_settings_noise_add_remove(self):
         from mailkb import config as cfgmod
         home = Path(self.tmp.name)
