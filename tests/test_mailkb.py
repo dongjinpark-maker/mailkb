@@ -4274,12 +4274,14 @@ class TestWeb(unittest.TestCase):
 
     def test_reading_font_injected_and_configurable(self):
         from mailkb import config as cfgmod
-        # read_fs 지정 시 별도 <style> 주입, 미지정 시 미주입(CSS 폴백 = 현행 크기)
-        self.assertIn(":root{--read-fs:17px}", self.web._shell("t", "L", "R", read_fs=17))
+        # read_fs 지정 시 크기+배율(--read-zoom, 메일 HTML zoom 확대용) 주입,
+        # 미지정 시 미주입(CSS 폴백 = 현행 크기)
+        one = self.web._shell("t", "L", "R", read_fs=18)
+        self.assertIn(":root{--read-fs:18px;--read-zoom:1.125}", one)
         self.assertNotIn(":root{--read-fs", self.web._shell("t", "L", "R"))
-        both = self.web._shell("t", "L", "R", read_w=1500, read_fs=17)
+        both = self.web._shell("t", "L", "R", read_w=1500, read_fs=18)
         self.assertIn(":root{--read-w:1500px}", both)   # rw 문자열과 독립
-        self.assertIn(":root{--read-fs:17px}", both)
+        self.assertIn("--read-fs:18px", both)
         home = Path(self.tmp.name)
         (home / "config.toml").write_text(
             'my_addresses=["me@corp.example"]\n', encoding="utf-8")
@@ -4301,6 +4303,8 @@ class TestWeb(unittest.TestCase):
                       "font-size: var(--read-fs, 16px); }", css)
         self.assertIn(".msg .mbody pre { font-size: var(--read-fs, 13px); }", css)
         self.assertEqual(css.count("var(--read-fs"), 2)  # 본문(mbody) 밖 누출 없음
+        # 메일 원본 HTML 은 인라인 pt 가 상속을 이김 — zoom 비례 확대 + 이중 확대 방지
+        self.assertIn(".mailhtml { font-size: 16px; zoom: var(--read-zoom, 1); }", css)
 
     def test_date_group_buckets(self):
         dg = self.web._date_group
@@ -4399,6 +4403,17 @@ class TestWeb(unittest.TestCase):
         self.assertIn('k === "p"', js)
         self.assertIn("function hookThreadHead", js)    # sticky 컴팩트 토글
         self.assertIn('classList.toggle("stuck"', js)
+        # 본문 글자 크기 저장 즉시 반영 — CSS 변수 라이브 갱신
+        self.assertIn('setProperty("--read-fs"', js)
+        self.assertIn('setProperty("--read-zoom"', js)
+
+    def test_settings_section_order(self):
+        # 판정 기준 → 표시·동기화 → 차단된 발신인 (2026-07-22 사용자 지정)
+        page = self.web.render_settings(self.store, self.cfg)
+        self.assertLess(page.index("<h2>판정 기준</h2>"),
+                        page.index("<h2>표시 · 동기화</h2>"))
+        self.assertLess(page.index("<h2>표시 · 동기화</h2>"),
+                        page.index("<h2>차단된 발신인</h2>"))
 
     def test_settings_noise_add_remove(self):
         from mailkb import config as cfgmod

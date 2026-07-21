@@ -390,6 +390,9 @@ details.catfold { margin: 8px 0 4px; background: var(--fold); border: 1px solid 
    현행(본문 16px 상속·pre 13px 모노)과 동일해 시각 변화 없음. 크롬(mhead·칩)은 고정. */
 .msg .mbody { padding: 12px 14px; font-size: var(--read-fs, 16px); }
 .msg .mbody pre { font-size: var(--read-fs, 13px); }
+/* 메일 원본 HTML 은 인라인 font-size(pt)가 상속을 이긴다 — zoom 으로 블록째 비례
+   확대(제목·본문 위계 유지). 16px 고정은 이중 확대(상속 확대 × zoom) 방지. */
+.mailhtml { font-size: 16px; zoom: var(--read-zoom, 1); }
 .msg .mbody img { max-width: 100%; }
 .msg .mbody img[data-blocked-src] { min-width: 8px; min-height: 8px;
     outline: 1px dashed var(--border-strong); }
@@ -1149,7 +1152,10 @@ def _head(title: str, refresh: int | None = None, extra_css: str = "",
     # 읽기 창(#right) 너비는 설정값을 CSS 변수로 주입(미지정 시 CSS 기본 1200px).
     rw = f"<style>:root{{--read-w:{int(read_w)}px}}</style>" if read_w else ""
     # 본문 글자 크기(web.reading_font)도 같은 방식 — 별도 <style>(rw 문자열 불변).
-    rf = f"<style>:root{{--read-fs:{int(read_fs)}px}}</style>" if read_fs else ""
+    # --read-zoom: 메일 원본 HTML 은 인라인 font-size(pt)가 상속을 이겨 변수가 안
+    # 먹는다 → .mailhtml 을 zoom 으로 블록째 비례 확대(기준 16px 대비 배율).
+    rf = (f"<style>:root{{--read-fs:{int(read_fs)}px;"
+          f"--read-zoom:{int(read_fs) / 16:.4g}}}</style>") if read_fs else ""
     # 테마는 <html data-theme> 로 — 다크는 :root[data-theme='dark'] 토큰 오버라이드.
     th = "dark" if theme == "dark" else "light"
     return (
@@ -1703,6 +1709,18 @@ _APP_JS = r"""
         /* 303 을 따라온 경우만 주소 갱신 — 직접 200 응답이면 현재 주소 유지 */
         inject(p, html, res.redirected ? fin.pathname + (fin.search || "") : null);
         if (msg) toast(msg);
+        /* 본문 글자 크기 — 저장 즉시 CSS 변수 갱신(새로고침 불요).
+           서버 클램프(최소 12)와 같은 규칙으로 미러링한다 */
+        if (action === "/settings/save") {
+          var ff = form.querySelector("input[name='reading_font']");
+          var fv = ff ? parseInt(ff.value, 10) : 0;
+          if (fv > 0) {
+            fv = Math.max(12, fv);
+            var rt = document.documentElement;
+            rt.style.setProperty("--read-fs", fv + "px");
+            rt.style.setProperty("--read-zoom", String(fv / 16));
+          }
+        }
         /* 스레드 상태 변경(플래그·숨김·신호 해제/복원)은 왼쪽(홈·메일함·
            스레드 목록)에도 즉시 반영 — 큐·탭 카운트·확인 후보가 같이 갱신된다 */
         if (leftCur &&
@@ -2860,22 +2878,6 @@ def render_settings(store, cfg) -> str:
                + _tbtn("light", "라이트", _SUN)
                + _tbtn("dark", "다크", _MOON) + "</div>")
 
-    # ── 차단된 발신인 (편집 가능) ──
-    out.append("<h2>차단된 발신인</h2>")
-    out.append("<p class='dim'>이 패턴이 발신 주소에 포함되면 신호(개입·미답변·요약·디제스트)에서 "
-               "제외됩니다. 실제 수신 차단은 Outlook 규칙으로 병행하세요.</p>")
-    if cfg.blocked_senders:
-        rows = "".join(
-            "<div class='setrow'>"
-            f"<span class='mono'>{esc(addr)}</span>"
-            "<form method='post' action='/settings/unblock'>"
-            f"<input type='hidden' name='addr' value='{esc(addr)}'>"
-            "<button class='danger'>차단 해제</button></form></div>"
-            for addr in cfg.blocked_senders)
-        out.append(f"<div class='setlist'>{rows}</div>")
-    else:
-        out.append("<p class='empty'>차단된 발신인 없음</p>")
-
     # ── 판정 기준 (런타임 편집 → overrides.json 영구 저장) ──
     smd = cfg.opt("ai", "summary_max_days", default=1)
     def _num(name, val, note):
@@ -2930,7 +2932,7 @@ def render_settings(store, cfg) -> str:
         "<tr><th>본문 글자 크기(px)</th>"
         f"<td><input type='number' name='reading_font' value='{rf_val}' "
         "placeholder='16' min='12' step='1' style='width:80px'></td>"
-        "<td class='dim'>메일 본문 텍스트 크기 (기본 16 · 텍스트 메일 13, 변경 후 새로고침 시 반영)</td></tr>"
+        "<td class='dim'>메일 본문 표시 크기 (기본 16 · 최소 12 · 저장 즉시 반영)</td></tr>"
         "<tr><th>자동 동기화(분)</th>"
         f"<td><input type='number' name='sync_interval_min' value='{esc(str(sync_min))}' "
         "min='0' step='5' style='width:80px'></td>"
@@ -2941,6 +2943,22 @@ def render_settings(store, cfg) -> str:
         "<td class='dim'>인라인 이미지·서식 HTML 보존 기간 (기본 60 · 0=임베드 끔). "
         "경과분은 텍스트로 압축 — 늘려도 지난 것은 sync --full 로만 복구</td></tr>"
         "</table><button>저장</button></form>")
+
+    # ── 차단된 발신인 (편집 가능) ──
+    out.append("<h2>차단된 발신인</h2>")
+    out.append("<p class='dim'>이 패턴이 발신 주소에 포함되면 신호(개입·미답변·요약·디제스트)에서 "
+               "제외됩니다. 실제 수신 차단은 Outlook 규칙으로 병행하세요.</p>")
+    if cfg.blocked_senders:
+        rows = "".join(
+            "<div class='setrow'>"
+            f"<span class='mono'>{esc(addr)}</span>"
+            "<form method='post' action='/settings/unblock'>"
+            f"<input type='hidden' name='addr' value='{esc(addr)}'>"
+            "<button class='danger'>차단 해제</button></form></div>"
+            for addr in cfg.blocked_senders)
+        out.append(f"<div class='setlist'>{rows}</div>")
+    else:
+        out.append("<p class='empty'>차단된 발신인 없음</p>")
 
     # ── 노이즈 규칙 (발신자·제목) ──
     out.append("<h2>노이즈 규칙</h2>")
