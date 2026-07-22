@@ -1245,6 +1245,11 @@ def run_ai_layer(
     #    → PC config 무수정으로 이 라우팅이 동작. 진짜 미해결이면 graceful(결정론만).
     summary_backend = backend or cfg.ai_summary_backend
     classify_backend = cfg.ai_classify_backend
+    # 과거 날짜 백필: 그 날짜에 속한 작업만 실행(요약 갱신·수확·디제스트·하루 요약).
+    # 개입 분류·우선순위 주석은 '현재 열린 큐' 기준이고 인물 도시에 갱신은 현재
+    # 상태 유지보수라 오늘 실행에만 의미가 있다 — 생략해 과거 날짜 키로 주석이
+    # 저장되는 것도 막는다. (웹 진행 바 total 은 _start_review 가 4로 맞춘다.)
+    backfill = bool(det.get("date")) and det["date"] < date.today().isoformat()
     ai_text = note = None
     try:
         if progress:
@@ -1263,19 +1268,20 @@ def run_ai_layer(
     if progress:
         progress("오늘 메일 핵심 요약 중…")
     det["digest"] = ai_digest(store, cfg, det["digest"], backend=summary_backend)
-    # 경계 항목 분류(액션 필요?) — FP·FN 동시 축소. haiku.
-    if progress:
-        progress("개입 큐 AI 분류 중…")
-    det["intervention"] = ai_classify_intervention(
-        store, cfg, det["intervention"],
-        det.get("intervention_candidates", []), backend=classify_backend,
-        date_iso=persist_date or det.get("date"))
-    # 우선순위·사유·제안 주석 (재분류 아님) — 역시 haiku.
-    if progress:
-        progress("개입 큐 우선순위 정리 중…")
-    det["intervention"] = ai_refine_intervention(
-        store, cfg, det["intervention"], backend=classify_backend,
-        persist_date=persist_date)
+    if not backfill:
+        # 경계 항목 분류(액션 필요?) — FP·FN 동시 축소. haiku.
+        if progress:
+            progress("개입 큐 AI 분류 중…")
+        det["intervention"] = ai_classify_intervention(
+            store, cfg, det["intervention"],
+            det.get("intervention_candidates", []), backend=classify_backend,
+            date_iso=persist_date or det.get("date"))
+        # 우선순위·사유·제안 주석 (재분류 아님) — 역시 haiku.
+        if progress:
+            progress("개입 큐 우선순위 정리 중…")
+        det["intervention"] = ai_refine_intervention(
+            store, cfg, det["intervention"], backend=classify_backend,
+            persist_date=persist_date)
     # 하루 요약(Executive Summary) — 최종 큐·수확 결과 기준이라 맨 마지막. sonnet.
     if progress:
         progress("하루 요약 작성 중…")
@@ -1283,13 +1289,16 @@ def run_ai_layer(
                                           backend=summary_backend)
     # 인물 도시에 갱신(v2) — basis 이후 메시지 늘어난 상위 인물만 증분 재생성. sonnet.
     # 자체 graceful(백엔드 미설정·실패 시 0). run 당 상한으로 비용 통제.
-    if progress:
-        progress("인물 도시에 갱신 중…")
-    try:
-        n = int(cfg.opt("dossier", "refresh_max_per_run", default=6) or 6)
-        det["dossiers_updated"] = distill.refresh_people_dossiers(
-            store, cfg, backend=summary_backend, max_n=n)
-    except Exception:                          # 도시에 실패가 데일리를 막지 않음
+    if not backfill:
+        if progress:
+            progress("인물 도시에 갱신 중…")
+        try:
+            n = int(cfg.opt("dossier", "refresh_max_per_run", default=6) or 6)
+            det["dossiers_updated"] = distill.refresh_people_dossiers(
+                store, cfg, backend=summary_backend, max_n=n)
+        except Exception:                      # 도시에 실패가 데일리를 막지 않음
+            det["dossiers_updated"] = 0
+    else:
         det["dossiers_updated"] = 0
     if progress:
         progress("완료")

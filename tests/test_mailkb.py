@@ -2084,7 +2084,7 @@ class TestAutoReview(unittest.TestCase):
         self.calls = []
         self._orig = web._start_review
         # 실제 스레드 대신 호출만 기록(성공 반환)
-        web._start_review = lambda cfg, ai, today: (self.calls.append((ai, today)) or True)
+        web._start_review = lambda cfg, ai, day: (self.calls.append((ai, day)) or True)
 
     def tearDown(self):
         web._start_review = self._orig
@@ -3471,9 +3471,11 @@ class TestAILayer(unittest.TestCase):
         self.assertEqual(cfg2.ai_cmd("sonnet"), ["X"])
 
     def test_run_ai_layer_aierror_note_and_stages(self):
+        # 오늘 날짜로 실행 — 과거 날짜는 백필 한정(분류·정리·도시에 생략)이라 별도 테스트
+        d = date.today().isoformat()
         self.store.ingest([_rec("g1", "kim@corp.example", [ME], "건",
-                                "2026-07-20T09:00:00")])
-        det = review.deterministic(self.store, self.cfg, "2026-07-20")
+                                f"{d}T09:00:00")])
+        det = review.deterministic(self.store, self.cfg, d)
         stages = []
         with mock.patch.object(review, "ai_run",
                                side_effect=review.AIError("boom")):
@@ -3491,6 +3493,33 @@ class TestAILayer(unittest.TestCase):
         self.assertIn("하루 요약 작성 중…", stages)         # Executive Summary
         self.assertIn("인물 도시에 갱신 중…", stages)        # 도시에 v2
 
+    def test_run_ai_layer_backfill_scopes_to_date(self):
+        # 과거 날짜 실행은 그 날짜 작업만 — 개입 분류·우선순위 주석·인물 도시에 생략
+        self.store.ingest([_rec("b1", "kim@corp.example", [ME], "과거요청건",
+                                "2026-07-01T09:00:00", body="회신 부탁드립니다.")])
+        det = review.deterministic(self.store, self.cfg, "2026-07-01")
+        stages = []
+        with mock.patch.object(review, "ai_run", return_value="(응답)"), \
+             mock.patch.object(review, "ai_classify_intervention") as mcls, \
+             mock.patch.object(review, "ai_refine_intervention") as mref, \
+             mock.patch.object(distill, "refresh_people_dossiers") as mdos:
+            review.run_ai_layer(self.store, self.cfg, det,
+                                persist_date="2026-07-01",
+                                progress=stages.append)
+        mcls.assert_not_called()
+        mref.assert_not_called()
+        mdos.assert_not_called()
+        self.assertEqual(det["dossiers_updated"], 0)
+        self.assertNotIn("개입 큐 AI 분류 중…", stages)
+        self.assertNotIn("개입 큐 우선순위 정리 중…", stages)
+        self.assertNotIn("인물 도시에 갱신 중…", stages)
+        # 날짜 소속 작업 4단계는 실행
+        self.assertEqual(stages[0], "누적 요약 갱신 중…")
+        self.assertIn("결정·신호 수확 중…", stages)
+        self.assertIn("오늘 메일 핵심 요약 중…", stages)
+        self.assertIn("하루 요약 작성 중…", stages)
+        self.assertEqual(stages[-1], "완료")
+
     def test_run_ai_layer_routes_summary_and_classify_backends(self):
         # 요약/회고 → summary 백엔드(sonnet), 개입 분류/정제 → classify 백엔드(haiku)
         cfg = Config(
@@ -3501,9 +3530,10 @@ class TestAILayer(unittest.TestCase):
                          "haiku": {"cmd": ["H"]}},
             raw={"ai": {"summary_min_msgs": 1}},
         )
+        d = date.today().isoformat()   # 과거 날짜면 백필 한정으로 분류가 생략됨
         self.store.ingest([_rec("q1", "kim@corp.example", [ME], "요청건",
-                                "2026-07-20T09:00:00", body="회신 부탁드립니다.")])
-        det = review.deterministic(self.store, cfg, "2026-07-20")
+                                f"{d}T09:00:00", body="회신 부탁드립니다.")])
+        det = review.deterministic(self.store, cfg, d)
         seen = []   # (cmd0, prompt)
 
         def fake_run(cmd, prompt, **kw):
@@ -3511,7 +3541,7 @@ class TestAILayer(unittest.TestCase):
             return "(응답)"
 
         with mock.patch.object(review, "ai_run", side_effect=fake_run):
-            review.run_ai_layer(self.store, cfg, det, persist_date="2026-07-20")
+            review.run_ai_layer(self.store, cfg, det, persist_date=d)
         classify_cmds = {c for c, p in seen if "지금 내 액션이 필요한지" in p}
         summary_cmds = {c for c, p in seen if "스레드의 요약을 관리" in p}
         self.assertEqual(classify_cmds, {"H"})   # 분류 = haiku
@@ -3741,6 +3771,14 @@ class TestWeb(unittest.TestCase):
         self.assertNotIn("오늘 메일 정리", forms)
         self.assertNotIn("class='refine'", self.web._CSS)
         self.assertNotIn("/refine", self.web._APP_JS)
+
+    def test_daily_ai_button_carries_viewed_date(self):
+        # 과거 날짜 페이지의 'AI 요약'은 그 날짜를 실어 보낸다 → 그 날짜가 갱신됨
+        out = self.web.render_daily(self.cfg, "2026-07-01", today="2026-07-22")
+        self.assertIn("name='date' value='2026-07-01'", out)
+        self.assertIn("action='/review'", out)
+        # 날짜 미지정 폼(구 진입점)은 date 필드 없음 — 서버가 오늘로 처리
+        self.assertNotIn("name='date'", self.web._review_button_forms())
 
     def test_win_size_arg_clamps_and_defaults(self):
         # 창 크기 인자 정규화 — 신뢰 못 할 값을 --window-size 에 그대로 안 넣음

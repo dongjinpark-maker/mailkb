@@ -28,7 +28,7 @@ from .store import Store, image_cutoff_for
 
 # 데일리 생성 백그라운드 잡(단일) — 웹은 단일 스레드라 리뷰(수 초~수십 초)는 별 스레드로
 # step: 진행 단계(1~total, 0=미상/비-AI) — 대기 화면 프로그레스 바 재료
-_review_job = {"running": False, "msg": "", "step": 0, "total": 7}
+_review_job = {"running": False, "msg": "", "step": 0, "total": 7, "date": ""}
 _review_lock = threading.Lock()
 
 # 결정론 데일리 리뷰 자동 갱신(lazy-on-view) — 버튼 없이 오늘치를 배경 재생성한다.
@@ -1954,18 +1954,18 @@ def _job_progress(msg: str) -> None:
                 _review_job["step"] += 1
 
 
-def _run_review_job(cfg, ai: bool, today: str) -> None:
+def _run_review_job(cfg, ai: bool, day: str) -> None:
     from . import notes
     try:
         store = Store(cfg.db_path, cfg.my_addresses, cfg.my_names, noise=cfg)
         try:
-            det = review.deterministic(store, cfg, today)
+            det = review.deterministic(store, cfg, day)
             ai_text = note = None
             if ai:
                 # graceful — AI 실패해도 결정론 리뷰는 반드시 저장 (#10)
                 ai_text, note = review.run_ai_layer(
-                    store, cfg, det, persist_date=today, progress=_job_progress)
-            path = notes.write_daily(cfg, today, review.render(det, ai_text))
+                    store, cfg, det, persist_date=day, progress=_job_progress)
+            path = notes.write_daily(cfg, day, review.render(det, ai_text))
             if note:
                 msg = f"완료: {path.name} · {note}"
             else:
@@ -1978,12 +1978,15 @@ def _run_review_job(cfg, ai: bool, today: str) -> None:
         _review_job.update(running=False, msg=msg)
 
 
-def _start_review(cfg, ai: bool, today: str) -> bool:
+def _start_review(cfg, ai: bool, day: str) -> bool:
     with _review_lock:
         if _review_job["running"]:
             return False
-        _review_job.update(running=True, msg="준비 중…", step=0)
-    threading.Thread(target=_run_review_job, args=(cfg, ai, today), daemon=True).start()
+        # 과거 날짜 백필은 run_ai_layer 가 그 날짜 작업 4단계만 실행 — 진행 바 total 일치.
+        past = day < date.today().isoformat()
+        _review_job.update(running=True, msg="준비 중…", step=0,
+                           total=(4 if (ai and past) else 7), date=day)
+    threading.Thread(target=_run_review_job, args=(cfg, ai, day), daemon=True).start()
     return True
 
 
@@ -1999,7 +2002,7 @@ def _maybe_auto_review(cfg, today: str, max_rowid: int) -> None:
     with _auto_lock:
         if exists and _auto_review_basis.get(today) == max_rowid:
             return                       # 이 기준선으로 이미 생성됨
-    if _start_review(cfg, ai=False, today=today):   # 진행 중 잡 있으면 False → 다음 조회에 재시도
+    if _start_review(cfg, ai=False, day=today):   # 진행 중 잡 있으면 False → 다음 조회에 재시도
         with _auto_lock:
             _auto_review_basis[today] = max_rowid
 
@@ -2108,6 +2111,7 @@ def render_review_status(store=None):
     with _review_lock:
         running, msg = _review_job["running"], _review_job["msg"]
         step, total = _review_job["step"], _review_job["total"]
+        job_date = _review_job.get("date") or ""
     if running:
         if step:      # AI 단계 진행 중 — 채워지는 바 + "단계 i/N"
             pct = max(6, min(100, round(step * 100 / max(total, 1))))
@@ -2125,7 +2129,12 @@ def render_review_status(store=None):
                 "완료되면 자동 전환.</p>",
                 True)
     body = f"<div class='flash'>{esc(msg or '대기 중')}</div>" if msg else ""
-    links = ["<a href='/daily'>→ 오늘 데일리 보기</a>"]
+    # 완료 후 복귀는 실행한 그 날짜의 데일리로(과거 백필 포함)
+    if job_date:
+        links = [f"<a href='/records?tab=daily&date={esc(job_date)}'>"
+                 f"→ {esc(job_date)} 데일리 보기</a>"]
+    else:
+        links = ["<a href='/daily'>→ 오늘 데일리 보기</a>"]
     if store is not None:
         pend = store.decision_counts().get("candidate", 0)
         if pend:
@@ -3778,11 +3787,13 @@ def render_search(store, cfg, qs, today: str) -> str:
     return "\n".join(out)
 
 
-def _review_button_forms() -> str:
+def _review_button_forms(day: str | None = None) -> str:
     # 결정론 데일리 리뷰는 이제 버튼 없이 lazy-on-view 로 자동 생성(_maybe_auto_review).
-    # 남은 버튼은 'AI 요약' 하나 — 오늘치 리뷰에 AI 계층(요약·수확·주석)을 얹는다.
+    # 남은 버튼은 'AI 요약' 하나 — 보고 있는 날짜의 리뷰에 AI 계층을 얹는다.
+    # 과거 날짜면 run_ai_layer 가 그 날짜 작업(요약·수확·디제스트·하루 요약)만 실행.
+    dt = f"<input type='hidden' name='date' value='{esc(day)}'>" if day else ""
     return ("<form method='post' action='/review'><input type='hidden' name='ai' value='1'>"
-            "<button>AI 요약</button></form>")
+            f"{dt}<button>AI 요약</button></form>")
 
 
 def render_daily(cfg, day: str, today: str | None = None) -> str:
@@ -3800,7 +3811,7 @@ def render_daily(cfg, day: str, today: str | None = None) -> str:
     except ValueError:
         pass
     out = [f"<h1>데일리 리뷰 · {esc(day)}</h1>", nav,
-           "<div class='actions'>" + _review_button_forms() + "</div>"]
+           "<div class='actions'>" + _review_button_forms(day) + "</div>"]
     if md is None:
         out.append("<p class='empty'>해당 날짜에 저장된 리뷰가 없습니다.</p>")
     else:
@@ -4347,7 +4358,14 @@ class _Handler(BaseHTTPRequestHandler):
                 return                                # finally 가 store.close()
             if path == "/review":                     # 데일리 생성(백그라운드)
                 ai = bool((form.get("ai") or [""])[0])
-                _start_review(self.cfg, ai, today)
+                # 데일리 페이지가 실어 준 날짜 — 그 날짜의 리뷰를 (재)생성한다.
+                # 검증 실패·미래 날짜는 오늘로(필드 없는 구 진입점 호환 포함).
+                d = (form.get("date") or [""])[0].strip()
+                try:
+                    d = min(date.fromisoformat(d).isoformat(), today)
+                except ValueError:
+                    d = today
+                _start_review(self.cfg, ai, d)
                 location = "/review/status"
             elif path == "/sync":                     # 메일 동기화(백그라운드)
                 _start_sync(self.cfg)

@@ -330,9 +330,11 @@ def cmd_review(args) -> None:
               f"{cfg.ai_classify_backend}", file=sys.stderr, flush=True)
         # graceful — AI 가 실패해도 결정론 리뷰는 항상 출력·저장 (#10)
         # run_ai_layer 은 7개 작업 단계(요약·수확·디제스트·분류·정리·하루요약·도시에) 후 '완료'.
+        # 과거 --date 백필은 그 날짜 작업 4단계만(분류·정리·도시에 생략 — review 참조).
+        total = 4 if d < date.today().isoformat() else 7
         ai_text, note = review.run_ai_layer(
             store, cfg, det, backend=args.backend, persist_date=d,
-            progress=_StageProgress(7),
+            progress=_StageProgress(total),
         )
         if note:
             print(note, file=sys.stderr, flush=True)
