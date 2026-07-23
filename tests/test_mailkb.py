@@ -6892,8 +6892,12 @@ class TestBedrockRunAdapter(unittest.TestCase):
         orig = self.mod._make_client
         self.mod._make_client = factory
         out, err = io.StringIO(), io.StringIO()
+        # CA 환경변수를 비워 호스트 환경(실제 SSL_CERT_FILE 등)이 테스트에 새지 않게
+        clean = {k: "" for k in ("SSL_CERT_FILE", "AWS_CA_BUNDLE",
+                                 "REQUESTS_CA_BUNDLE", "MAILKB_BEDROCK_CA")}
         try:
-            with mock.patch("sys.stdin", io.StringIO(stdin_text)), \
+            with mock.patch.dict(os.environ, clean), \
+                 mock.patch("sys.stdin", io.StringIO(stdin_text)), \
                  mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
                 rc = self.mod.main(argv)
         finally:
@@ -6926,8 +6930,8 @@ class TestBedrockRunAdapter(unittest.TestCase):
         from types import SimpleNamespace
         calls, made = [], {}
 
-        def factory(region):
-            made["region"] = region
+        def factory(region, ca_bundle=None):
+            made["region"], made["ca"] = region, ca_bundle
             return self._client(calls, [SimpleNamespace(type="text", text="응답")])
         with mock.patch.dict(os.environ, {"AWS_REGION": ""}):
             rc, out, err = self._run(
@@ -6936,6 +6940,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(out, "응답")                 # stdout = 응답 텍스트만
         self.assertEqual(made["region"], "ap-northeast-2")
+        self.assertIsNone(made["ca"])                 # CA 미지정 시 기본(certifi) 유지
         self.assertEqual(calls[0]["model"], "anthropic.claude-haiku-4-5")
         self.assertEqual(calls[0]["max_tokens"], 512)
         self.assertEqual(calls[0]["messages"],
@@ -6946,21 +6951,56 @@ class TestBedrockRunAdapter(unittest.TestCase):
         from types import SimpleNamespace
         calls, made = [], {}
 
-        def factory(region):
+        def factory(region, ca_bundle=None):
             made["region"] = region
             return self._client(calls, [SimpleNamespace(type="text", text="ok")])
         rc, _, _ = self._run(["--region", "us-west-2"], "q", factory)
         self.assertEqual(rc, 0)
         self.assertEqual(made["region"], "us-west-2")  # config(cmd) 오버라이드 경로
 
+    def test_ca_bundle_path_precedence(self):
+        f = self.mod.resolve_ca_bundle
+        self.assertIsNone(f(None, {}))
+        self.assertEqual(f(None, {"SSL_CERT_FILE": "/a"}), "/a")
+        self.assertEqual(f("/cli", {"SSL_CERT_FILE": "/a"}), "/cli")  # --ca-bundle 우선
+        self.assertEqual(f(None, {"MAILKB_BEDROCK_CA": "/m",
+                                  "SSL_CERT_FILE": "/s"}), "/m")
+        self.assertEqual(f(None, {"AWS_CA_BUNDLE": "/aws",
+                                  "REQUESTS_CA_BUNDLE": "/r"}), "/aws")
+        self.assertIsNone(f("", {"SSL_CERT_FILE": ""}))              # 빈값=미지정
+
+    def test_ca_bundle_threaded_to_client(self):
+        from types import SimpleNamespace
+        calls, made = [], {}
+
+        def factory(region, ca_bundle=None):
+            made["ca"] = ca_bundle
+            return self._client(calls, [SimpleNamespace(type="text", text="ok")])
+        with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as fh:
+            fh.write("dummy-ca")            # 존재만 확인(실제 검증은 _make_client 안)
+            ca_path = fh.name
+        try:
+            rc, _, _ = self._run(["--ca-bundle", ca_path], "q", factory)
+        finally:
+            os.unlink(ca_path)
+        self.assertEqual(rc, 0)
+        self.assertEqual(made["ca"], ca_path)         # 회사 CA 가 클라이언트로 전달됨
+
+    def test_ca_bundle_missing_file_exits_2(self):
+        rc, _, err = self._run(["--ca-bundle", "/no/such/ca.pem"], "q",
+                               lambda r, ca_bundle=None: self.fail("호출 금지"))
+        self.assertEqual(rc, 2)                        # 파일 없으면 호출 전 종료
+        self.assertIn("CA 번들", err)
+
     def test_empty_prompt_exits_2(self):
-        rc, out, err = self._run([], "   \n", lambda r: self.fail("호출 금지"))
+        rc, out, err = self._run([], "   \n",
+                                 lambda r, ca_bundle=None: self.fail("호출 금지"))
         self.assertEqual(rc, 2)
         self.assertEqual(out, "")
         self.assertIn("빈 프롬프트", err)
 
     def test_credential_error_hints_sso_login(self):
-        def factory(region):
+        def factory(region, ca_bundle=None):
             raise Exception("ExpiredTokenException: security token is expired")
         rc, out, err = self._run([], "q", factory)
         self.assertEqual(rc, 1)
@@ -6969,7 +7009,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
 
     def test_connection_error_unwraps_chain_and_hints(self):
         # APIConnectionError 는 원인(SSL·프록시·DNS)을 감싼다 — 체인 노출 + 힌트
-        def factory(region):
+        def factory(region, ca_bundle=None):
             root = OSError("getaddrinfo failed")
             mid = ConnectionError("All connection attempts failed")
             mid.__cause__ = root
@@ -6983,14 +7023,15 @@ class TestBedrockRunAdapter(unittest.TestCase):
         self.assertIn("api.aws", err)
 
     def test_ssl_error_hints_corporate_ca(self):
-        def factory(region):
+        def factory(region, ca_bundle=None):
             raise Exception("SSL: CERTIFICATE_VERIFY_FAILED certificate verify failed")
         rc, _, err = self._run([], "q", factory)
         self.assertEqual(rc, 1)
-        self.assertIn("SSL_CERT_FILE", err)           # 사내 TLS 검사(CA) 힌트
+        self.assertIn("--ca-bundle", err)             # 사내 TLS 검사(CA) 처방
+        self.assertIn("SSL_CERT_FILE", err)
 
     def test_missing_sdk_exits_2_with_install_hint(self):
-        def factory(region):
+        def factory(region, ca_bundle=None):
             raise ModuleNotFoundError("No module named 'anthropic'")
         rc, _, err = self._run([], "q", factory)
         self.assertEqual(rc, 2)
@@ -7000,7 +7041,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
         from types import SimpleNamespace
         calls = []
         rc, out, err = self._run(
-            [], "q", lambda r: self._client(
+            [], "q", lambda r, ca_bundle=None: self._client(
                 calls, [SimpleNamespace(type="tool_use", text="")]))
         self.assertEqual(rc, 1)                       # ai_run 이 빈 응답=오류로 취급
         self.assertEqual(out, "")

@@ -14,6 +14,9 @@ ai_run 계약: 프롬프트를 stdin(utf-8)으로 받아 응답 텍스트만 std
 리전:   --region > AWS_REGION > 기본 ap-northeast-2(서울).
         config 오버라이드 = cmd 에 "--region", "<리전>" 을 덧붙인다.
 자격증명: 표준 AWS 체인(환경변수 → 프로필/SSO → 역할). SSO 는 `aws sso login` 선행.
+사내 TLS: 검사 프록시가 인증서를 재서명하면(CERTIFICATE_VERIFY_FAILED) 회사 CA PEM 을
+        --ca-bundle 인자 또는 SSL_CERT_FILE/MAILKB_BEDROCK_CA/AWS_CA_BUNDLE 환경변수로
+        지정한다. httpx 는 certifi 만 신뢰하므로 이 어댑터가 SSLContext 를 직접 구성한다.
 """
 from __future__ import annotations
 
@@ -35,10 +38,33 @@ def resolve_region(cli_region: str | None, env: dict | None = None) -> str:
     return cli_region or e.get("AWS_REGION") or DEFAULT_REGION
 
 
-def _make_client(region: str):
-    """지연 임포트 — anthropic 미설치 환경에서도 모듈 임포트·테스트가 가능하게."""
+def resolve_ca_bundle(cli_ca: str | None, env: dict | None = None) -> str | None:
+    """사내 TLS 검사 프록시용 CA PEM 경로 해석.
+    --ca-bundle > MAILKB_BEDROCK_CA > SSL_CERT_FILE > AWS_CA_BUNDLE >
+    REQUESTS_CA_BUNDLE. 빈 문자열은 미지정으로 취급(없으면 None)."""
+    e = os.environ if env is None else env
+    for v in (cli_ca, e.get("MAILKB_BEDROCK_CA"), e.get("SSL_CERT_FILE"),
+              e.get("AWS_CA_BUNDLE"), e.get("REQUESTS_CA_BUNDLE")):
+        if v:
+            return v
+    return None
+
+
+def _make_client(region: str, ca_bundle: str | None = None):
+    """지연 임포트 — anthropic 미설치 환경에서도 모듈 임포트·테스트가 가능하게.
+
+    ca_bundle 이 주어지면 그 PEM 만 신뢰 앵커로 하는 httpx 클라이언트를 만들어
+    SDK 에 넘긴다(사내 TLS 검사 프록시가 재서명한 인증서 검증). httpx 는 기본적으로
+    certifi 만 신뢰해 SSL_CERT_FILE 환경변수를 항상 존중하진 않으므로, SSLContext 를
+    직접 구성해 httpx 버전에 무관하게 회사 CA 가 반드시 적용되게 한다."""
     from anthropic import AnthropicBedrockMantle
-    return AnthropicBedrockMantle(aws_region=region)
+    kw = {"aws_region": region}
+    if ca_bundle:
+        import ssl
+        import httpx
+        ctx = ssl.create_default_context(cafile=ca_bundle)  # 회사 CA 만 신뢰 앵커로
+        kw["http_client"] = httpx.Client(verify=ctx)
+    return AnthropicBedrockMantle(**kw)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -53,6 +79,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--region", default=None,
                     help=f"기본: AWS_REGION 또는 {DEFAULT_REGION}")
     ap.add_argument("--max-tokens", type=int, default=4096)
+    ap.add_argument("--ca-bundle", default=None,
+                    help="사내 TLS 검사용 CA PEM 경로 "
+                         "(없으면 SSL_CERT_FILE 등 환경변수)")
     args = ap.parse_args(argv)
 
     prompt = sys.stdin.read()
@@ -61,8 +90,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     region = resolve_region(args.region)
+    ca = resolve_ca_bundle(args.ca_bundle)
+    if ca and not os.path.isfile(ca):
+        print(f"CA 번들 파일을 찾을 수 없음: {ca}", file=sys.stderr)
+        return 2
     try:
-        client = _make_client(region)
+        client = _make_client(region, ca)
         msg = client.messages.create(
             model=args.model,
             max_tokens=args.max_tokens,
@@ -86,8 +119,8 @@ def main(argv: list[str] | None = None) -> int:
             print("자격증명 문제로 보임 — aws sso login(또는 키/프로필 설정) 후 재시도",
                   file=sys.stderr)
         if "ssl" in low or "certificate" in low:
-            print("사내 TLS 검사(프록시 CA) 가능성 — 회사 CA 번들을 "
-                  "SSL_CERT_FILE 환경변수로 지정", file=sys.stderr)
+            print("사내 TLS 검사(프록시 CA) — 회사 CA PEM 을 --ca-bundle 인자나 "
+                  "SSL_CERT_FILE/MAILKB_BEDROCK_CA 환경변수로 지정", file=sys.stderr)
         elif any(k in low for k in ("connect", "getaddrinfo", "timed out",
                                     "timeout", "proxy", "unreachable")):
             print("네트워크 경로 문제 — ① HTTPS_PROXY 환경변수(사내 프록시) "
