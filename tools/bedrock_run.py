@@ -72,11 +72,27 @@ def main(argv: list[str] | None = None) -> int:
         print('anthropic 미설치 — pip install -U "anthropic[bedrock]"',
               file=sys.stderr)
         return 2
-    except Exception as e:  # noqa: BLE001 — 어떤 실패든 비0 종료 + 원인 한 줄이 계약
-        print(f"Bedrock 호출 실패({region}): {type(e).__name__}: {e}",
+    except Exception as e:  # noqa: BLE001 — 어떤 실패든 비0 종료 + 원인이 계약
+        # APIConnectionError 류는 진짜 원인(SSL·DNS·프록시)이 안에 감싸여 있다 —
+        # 예외 체인을 펼쳐야 사내망에서 원인을 특정할 수 있다.
+        chain, cur = [], e
+        while cur is not None and len(chain) < 5:
+            chain.append(f"{type(cur).__name__}: {cur}")
+            cur = cur.__cause__ or cur.__context__
+        print(f"Bedrock 호출 실패({region}): " + " <- ".join(chain),
               file=sys.stderr)
-        if any(k in f"{type(e).__name__} {e}".lower() for k in _CRED_HINTS):
+        low = " ".join(chain).lower()
+        if any(k in low for k in _CRED_HINTS):
             print("자격증명 문제로 보임 — aws sso login(또는 키/프로필 설정) 후 재시도",
+                  file=sys.stderr)
+        if "ssl" in low or "certificate" in low:
+            print("사내 TLS 검사(프록시 CA) 가능성 — 회사 CA 번들을 "
+                  "SSL_CERT_FILE 환경변수로 지정", file=sys.stderr)
+        elif any(k in low for k in ("connect", "getaddrinfo", "timed out",
+                                    "timeout", "proxy", "unreachable")):
+            print("네트워크 경로 문제 — ① HTTPS_PROXY 환경변수(사내 프록시) "
+                  "② 방화벽의 *.api.aws 허용 여부 확인 "
+                  "(claude CLI 가 되는 것과 별개 — 호스트·프록시 경로가 다름)",
                   file=sys.stderr)
         return 1
 

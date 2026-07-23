@@ -6967,6 +6967,28 @@ class TestBedrockRunAdapter(unittest.TestCase):
         self.assertEqual(out, "")                     # 실패 시 stdout 오염 금지
         self.assertIn("aws sso login", err)
 
+    def test_connection_error_unwraps_chain_and_hints(self):
+        # APIConnectionError 는 원인(SSL·프록시·DNS)을 감싼다 — 체인 노출 + 힌트
+        def factory(region):
+            root = OSError("getaddrinfo failed")
+            mid = ConnectionError("All connection attempts failed")
+            mid.__cause__ = root
+            top = Exception("APIConnectionError: Connection error.")
+            top.__cause__ = mid
+            raise top
+        rc, out, err = self._run([], "q", factory)
+        self.assertEqual(rc, 1)
+        self.assertIn("getaddrinfo failed", err)      # 최심부 원인이 보인다
+        self.assertIn("HTTPS_PROXY", err)             # 프록시/방화벽 힌트
+        self.assertIn("api.aws", err)
+
+    def test_ssl_error_hints_corporate_ca(self):
+        def factory(region):
+            raise Exception("SSL: CERTIFICATE_VERIFY_FAILED certificate verify failed")
+        rc, _, err = self._run([], "q", factory)
+        self.assertEqual(rc, 1)
+        self.assertIn("SSL_CERT_FILE", err)           # 사내 TLS 검사(CA) 힌트
+
     def test_missing_sdk_exits_2_with_install_hint(self):
         def factory(region):
             raise ModuleNotFoundError("No module named 'anthropic'")
