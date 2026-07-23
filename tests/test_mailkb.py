@@ -6872,5 +6872,118 @@ class TestNoisePolicy(unittest.TestCase):
         self.assertFalse(c.is_noise_sender_hard("spam@evil.example"))  # 외부는 policy
 
 
+class TestBedrockRunAdapter(unittest.TestCase):
+    """tools/bedrock_run.py — ai_run 계약(stdin→stdout·비0 종료) 목 검증.
+
+    anthropic 미설치 환경에서도 돌도록 클라이언트 생성(_make_client)을 교체한다.
+    실호출 없음 — 인자·리전 해석·오류 경로가 계약대로인지만 본다.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        p = Path(__file__).resolve().parent.parent / "tools" / "bedrock_run.py"
+        spec = importlib.util.spec_from_file_location("bedrock_run", p)
+        cls.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.mod)          # 지연 임포트라 anthropic 불필요
+
+    def _run(self, argv, stdin_text, factory):
+        import io
+        orig = self.mod._make_client
+        self.mod._make_client = factory
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with mock.patch("sys.stdin", io.StringIO(stdin_text)), \
+                 mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+                rc = self.mod.main(argv)
+        finally:
+            self.mod._make_client = orig
+        return rc, out.getvalue(), err.getvalue()
+
+    @staticmethod
+    def _client(calls, blocks):
+        from types import SimpleNamespace
+        msg = SimpleNamespace(
+            content=blocks,
+            usage=SimpleNamespace(input_tokens=10, output_tokens=5))
+
+        class _C:
+            class messages:
+                @staticmethod
+                def create(**kw):
+                    calls.append(kw)
+                    return msg
+        return _C()
+
+    def test_region_resolution_priority(self):
+        r = self.mod.resolve_region
+        self.assertEqual(r(None, {}), "ap-northeast-2")           # 기본 = 서울
+        self.assertEqual(r(None, {"AWS_REGION": "us-east-1"}), "us-east-1")
+        self.assertEqual(r("eu-west-1", {"AWS_REGION": "us-east-1"}), "eu-west-1")
+        self.assertEqual(r("", {"AWS_REGION": ""}), "ap-northeast-2")  # 빈값=미지정
+
+    def test_success_contract_and_default_region(self):
+        from types import SimpleNamespace
+        calls, made = [], {}
+
+        def factory(region):
+            made["region"] = region
+            return self._client(calls, [SimpleNamespace(type="text", text="응답")])
+        with mock.patch.dict(os.environ, {"AWS_REGION": ""}):
+            rc, out, err = self._run(
+                ["--model", "anthropic.claude-haiku-4-5", "--max-tokens", "512"],
+                "질문입니다", factory)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "응답")                 # stdout = 응답 텍스트만
+        self.assertEqual(made["region"], "ap-northeast-2")
+        self.assertEqual(calls[0]["model"], "anthropic.claude-haiku-4-5")
+        self.assertEqual(calls[0]["max_tokens"], 512)
+        self.assertEqual(calls[0]["messages"],
+                         [{"role": "user", "content": "질문입니다"}])
+        self.assertIn("usage: in=10 out=5", err)      # 진단은 stderr 로만
+
+    def test_region_flag_overrides(self):
+        from types import SimpleNamespace
+        calls, made = [], {}
+
+        def factory(region):
+            made["region"] = region
+            return self._client(calls, [SimpleNamespace(type="text", text="ok")])
+        rc, _, _ = self._run(["--region", "us-west-2"], "q", factory)
+        self.assertEqual(rc, 0)
+        self.assertEqual(made["region"], "us-west-2")  # config(cmd) 오버라이드 경로
+
+    def test_empty_prompt_exits_2(self):
+        rc, out, err = self._run([], "   \n", lambda r: self.fail("호출 금지"))
+        self.assertEqual(rc, 2)
+        self.assertEqual(out, "")
+        self.assertIn("빈 프롬프트", err)
+
+    def test_credential_error_hints_sso_login(self):
+        def factory(region):
+            raise Exception("ExpiredTokenException: security token is expired")
+        rc, out, err = self._run([], "q", factory)
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, "")                     # 실패 시 stdout 오염 금지
+        self.assertIn("aws sso login", err)
+
+    def test_missing_sdk_exits_2_with_install_hint(self):
+        def factory(region):
+            raise ModuleNotFoundError("No module named 'anthropic'")
+        rc, _, err = self._run([], "q", factory)
+        self.assertEqual(rc, 2)
+        self.assertIn("anthropic[bedrock]", err)
+
+    def test_empty_text_blocks_exit_1(self):
+        from types import SimpleNamespace
+        calls = []
+        rc, out, err = self._run(
+            [], "q", lambda r: self._client(
+                calls, [SimpleNamespace(type="tool_use", text="")]))
+        self.assertEqual(rc, 1)                       # ai_run 이 빈 응답=오류로 취급
+        self.assertEqual(out, "")
+        self.assertIn("텍스트 블록 없음", err)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
