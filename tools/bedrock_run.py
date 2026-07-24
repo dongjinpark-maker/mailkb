@@ -25,6 +25,12 @@ ai_run 계약: 프롬프트를 stdin(utf-8)으로 받아 응답 텍스트만 std
         직접 구성) 양쪽에 적용하므로, config 의 --ca-bundle 하나면 Windows 영구
         환경변수 상속 없이도 두 계층이 다 덮인다. 파일은 PEM(텍스트) — DER(바이너리)이면
         `openssl x509 -inform der -in c.crt -out c.pem` 로 변환.
+프록시: 사내 아웃바운드가 명시 프록시를 요구하면(pip 에 --proxy 가 필요한 환경) --proxy
+        http://proxy.corp:8080 을 준다. 어댑터가 HTTPS_PROXY/HTTP_PROXY 로 env 에 실어
+        httpx(Bedrock 호출)와 botocore(자격증명) 양쪽이 프록시를 타게 한다. 없으면
+        HTTPS_PROXY 등 환경변수를 따른다. config 예:
+        cmd = ["python","tools/bedrock_run.py","--ca-bundle","C:/x/ca.pem",
+               "--proxy","http://proxy.corp:8080","--model","anthropic.claude-sonnet-5"]
 """
 from __future__ import annotations
 
@@ -67,6 +73,25 @@ def _resolve_ca(cli_ca: str | None, env: dict | None = None):
 def resolve_ca_bundle(cli_ca: str | None, env: dict | None = None) -> str | None:
     """사내 TLS 검사 프록시용 CA PEM 경로. 순서: _CA_ENV_ORDER 참조."""
     return _resolve_ca(cli_ca, env)[0]
+
+
+# 프록시 탐색 순서(--proxy 다음). 사내 아웃바운드가 명시 프록시를 요구하면(pip
+# --proxy 가 필요한 환경) 이를 지정해야 AWS 로 나간다. httpx 는 trust_env=True 라
+# HTTPS_PROXY 를 읽고, botocore 도 같은 변수를 읽으므로 env 에 실으면 양쪽을 덮는다.
+_PROXY_ENV_ORDER = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                    "ALL_PROXY", "all_proxy")
+
+
+def _resolve_proxy(cli_proxy: str | None, env: dict | None = None):
+    """(url, 출처). 빈 문자열은 미지정으로 취급(없으면 (None, None))."""
+    e = os.environ if env is None else env
+    if cli_proxy:
+        return cli_proxy, "--proxy"
+    for name in _PROXY_ENV_ORDER:
+        v = e.get(name)
+        if v:
+            return v, name
+    return None, None
 
 
 def _make_client(region: str, ca_bundle: str | None = None,
@@ -113,6 +138,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--legacy", action="store_true",
                     help="레거시 Bedrock(bedrock-runtime.amazonaws.com) 사용 — "
                          ".api.aws 가 막힌 사내망용. 모델 ID 는 global./apac. 접두사 필요")
+    ap.add_argument("--proxy", default=None,
+                    help="사내 명시 프록시 URL(예: http://proxy.corp:8080). "
+                         "없으면 HTTPS_PROXY 등 환경변수")
     args = ap.parse_args(argv)
 
     prompt = sys.stdin.read()
@@ -132,6 +160,15 @@ def main(argv: list[str] | None = None) -> int:
         # 호출 두 계층을 다 덮는다(Windows 영구 환경변수 상속에 의존하지 않음).
         # anthropic/botocore 는 _make_client 안에서 지연 임포트되므로 여기 설정이 먼저.
         os.environ["AWS_CA_BUNDLE"] = ca
+
+    proxy, proxy_src = _resolve_proxy(args.proxy)
+    proxy_note = f"{proxy} ({proxy_src})" if proxy else "미지정(직접 연결)"
+    if proxy:
+        # httpx(trust_env)·botocore 둘 다 HTTPS_PROXY/HTTP_PROXY 를 읽으므로 env 에
+        # 실으면 자격증명·Bedrock 호출 양쪽이 프록시를 탄다. 명시 지정이라 Windows
+        # 환경변수 상속(CA 와 같은 문제)에 안 걸린다.
+        os.environ["HTTPS_PROXY"] = proxy
+        os.environ["HTTP_PROXY"] = proxy
     try:
         client = _make_client(region, ca, legacy=args.legacy)
         msg = client.messages.create(
@@ -155,6 +192,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Bedrock 호출 실패({region}, {endpoint}): " + " <- ".join(chain),
               file=sys.stderr)
         print(f"CA: {ca_note}", file=sys.stderr)   # 어느 CA 를 잡았는지(미지정이면 상속 문제)
+        print(f"프록시: {proxy_note}", file=sys.stderr)  # 미지정인데 pip 이 --proxy 필요 환경이면 의심
         low = " ".join(chain).lower()
         if any(k in low for k in ("inference profile", "on-demand throughput",
                                   "on demand throughput")):
@@ -182,18 +220,20 @@ def main(argv: list[str] | None = None) -> int:
             print("사내 TLS 검사(프록시 CA) — 회사 CA(PEM)를 지정하라.", file=sys.stderr)
             if ca:
                 # CA 를 이미 줬고 botocore 용 AWS_CA_BUNDLE 도 실었는데(위 CA 줄)도
-                # 실패 → CA 파일 자체가 프록시의 실제 발급 체인이 아니거나 불완전.
-                print("  · CA 는 자격증명·호출 양쪽에 적용됨(위 CA 줄). 그래도 "
-                      "실패하면 그 CA 가 프록시의 실제 발급 CA 가 아니거나 체인이 "
-                      "불완전한 것 — IT 에 루트+중간 CA 전체 PEM 을 요청하라.",
+                # 실패 → CA 파일 자체가 프록시 발급 체인이 아니거나, 프록시 미경유로
+                # 다른(직접 경로) 인증서를 만난 것.
+                print("  · CA 는 양쪽에 적용됨(위 CA 줄). 그래도 실패면 (a) 그 CA 가 "
+                      "프록시의 실제 발급 CA/전체 체인이 아니거나 (b) 명시 프록시 미경유 "
+                      "— pip 에 --proxy 가 필요한 환경이면 --proxy 도 함께 지정하라.",
                       file=sys.stderr)
             else:
-                print("  · --ca-bundle 인자로 회사 CA(PEM) 를 지정하라 "
-                      "(어댑터가 자격증명·호출 양쪽에 적용한다).", file=sys.stderr)
+                print("  · --ca-bundle 로 회사 CA(PEM)를, 명시 프록시 환경이면 "
+                      "--proxy 도 함께 지정하라(어댑터가 양쪽 계층에 적용).",
+                      file=sys.stderr)
         elif any(k in low for k in ("connect", "getaddrinfo", "timed out",
                                     "timeout", "proxy", "unreachable")):
-            print("네트워크 경로 문제 — ① HTTPS_PROXY 환경변수(사내 프록시) "
-                  "② 방화벽의 *.api.aws 허용 여부 확인 "
+            print("네트워크 경로 문제 — ① --proxy(사내 명시 프록시, pip --proxy 필요 "
+                  "환경이면 거의 확실) ② 방화벽의 *.api.aws 허용 여부 "
                   "(claude CLI 가 되는 것과 별개 — 호스트·프록시 경로가 다름)",
                   file=sys.stderr)
         return 1

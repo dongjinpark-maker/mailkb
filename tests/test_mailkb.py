@@ -6965,10 +6965,12 @@ class TestBedrockRunAdapter(unittest.TestCase):
         orig = self.mod._make_client
         self.mod._make_client = factory
         out, err = io.StringIO(), io.StringIO()
-        # CA 환경변수를 비워 호스트 환경(실제 SSL_CERT_FILE 등)이 테스트에 새지 않게 —
-        # env_over 로 특정 변수만 다시 주입(예: AWS_CA_BUNDLE 상속 검증).
-        clean = {k: "" for k in ("SSL_CERT_FILE", "AWS_CA_BUNDLE",
-                                 "REQUESTS_CA_BUNDLE", "MAILKB_BEDROCK_CA")}
+        # CA·프록시 환경변수를 비워 호스트 환경이 테스트에 새지 않게 —
+        # env_over 로 특정 변수만 다시 주입(예: AWS_CA_BUNDLE·HTTPS_PROXY 검증).
+        clean = {k: "" for k in (
+            "SSL_CERT_FILE", "AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE",
+            "MAILKB_BEDROCK_CA", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY",
+            "http_proxy", "ALL_PROXY", "all_proxy")}
         if env_over:
             clean.update(env_over)
         try:
@@ -7033,6 +7035,49 @@ class TestBedrockRunAdapter(unittest.TestCase):
         rc, _, _ = self._run(["--region", "us-west-2"], "q", factory)
         self.assertEqual(rc, 0)
         self.assertEqual(made["region"], "us-west-2")  # config(cmd) 오버라이드 경로
+
+    def test_proxy_resolution_priority(self):
+        f = self.mod._resolve_proxy
+        self.assertEqual(f(None, {}), (None, None))
+        self.assertEqual(f(None, {"HTTPS_PROXY": "http://p:8080"}),
+                         ("http://p:8080", "HTTPS_PROXY"))
+        self.assertEqual(f("http://cli:1", {"HTTPS_PROXY": "http://p:8080"}),
+                         ("http://cli:1", "--proxy"))
+        self.assertEqual(f(None, {"HTTP_PROXY": "http://p:3128"}),
+                         ("http://p:3128", "HTTP_PROXY"))
+        self.assertEqual(f("", {"HTTPS_PROXY": ""}), (None, None))  # 빈값=미지정
+
+    def test_proxy_seeded_into_env_for_both_layers(self):
+        # --proxy 는 httpx(trust_env)·botocore 가 읽게 HTTPS_PROXY/HTTP_PROXY env 에 실린다
+        from types import SimpleNamespace
+        calls, seen = [], {}
+
+        def factory(region, ca_bundle=None, legacy=False):
+            seen["https"] = os.environ.get("HTTPS_PROXY")
+            seen["http"] = os.environ.get("HTTP_PROXY")
+            return self._client(calls, [SimpleNamespace(type="text", text="ok")])
+        rc, _, _ = self._run(["--proxy", "http://proxy.corp:8080"], "q", factory,
+                             env_over={"HTTPS_PROXY": "", "HTTP_PROXY": ""})
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen["https"], "http://proxy.corp:8080")
+        self.assertEqual(seen["http"], "http://proxy.corp:8080")
+
+    def test_failure_reports_proxy(self):
+        def factory(region, ca_bundle=None, legacy=False):
+            raise Exception("APIConnectionError: Connection error.")
+        rc, _, err = self._run(["--proxy", "http://proxy.corp:8080"], "q", factory,
+                               env_over={"HTTPS_PROXY": "", "HTTP_PROXY": ""})
+        self.assertEqual(rc, 1)
+        self.assertIn("프록시: http://proxy.corp:8080 (--proxy)", err)
+        self.assertIn("--proxy", err)               # 힌트에도 프록시 언급
+
+    def test_failure_reports_proxy_unset(self):
+        def factory(region, ca_bundle=None, legacy=False):
+            raise Exception("APIConnectionError: Connection error.")
+        rc, _, err = self._run([], "q", factory,
+                               env_over={"HTTPS_PROXY": "", "HTTP_PROXY": ""})
+        self.assertEqual(rc, 1)
+        self.assertIn("프록시: 미지정", err)          # 명시 프록시 미경유 표시
 
     def test_legacy_flag_selects_client(self):
         from types import SimpleNamespace
@@ -7174,7 +7219,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
         rc, out, err = self._run([], "q", factory)
         self.assertEqual(rc, 1)
         self.assertIn("getaddrinfo failed", err)      # 최심부 원인이 보인다
-        self.assertIn("HTTPS_PROXY", err)             # 프록시/방화벽 힌트
+        self.assertIn("--proxy", err)                 # 프록시/방화벽 힌트
         self.assertIn("api.aws", err)
 
     def test_ssl_error_hints_corporate_ca(self):
@@ -7183,7 +7228,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
         rc, _, err = self._run([], "q", factory)
         self.assertEqual(rc, 1)
         self.assertIn("--ca-bundle", err)             # 사내 TLS 검사(CA) 처방
-        self.assertIn("양쪽에 적용", err)              # 어댑터가 두 계층에 적용함을 안내
+        self.assertIn("--proxy", err)                 # 명시 프록시 환경 함께 안내
         self.assertNotIn("openssl", err)              # 검증 실패는 포맷 문제 아님
 
     def test_ca_bundle_seeds_aws_ca_bundle_for_botocore(self):
