@@ -15,10 +15,12 @@ ai_run 계약: 프롬프트를 stdin(utf-8)으로 받아 응답 텍스트만 std
         config 오버라이드 = cmd 에 "--region", "<리전>" 을 덧붙인다.
 자격증명: 표준 AWS 체인(환경변수 → 프로필/SSO → 역할). SSO 는 `aws sso login` 선행.
 사내 TLS: 검사 프록시가 인증서를 재서명하면(CERTIFICATE_VERIFY_FAILED) 회사 CA 를
-        --ca-bundle 인자 또는 SSL_CERT_FILE/MAILKB_BEDROCK_CA/AWS_CA_BUNDLE 환경변수로
-        지정한다. 파일은 PEM(텍스트) 이어야 하며 .crt/.pem/.cer 확장자는 무관 — DER
-        (바이너리)이면 `openssl x509 -inform der -in c.crt -out c.pem` 로 변환한다.
-        httpx 는 certifi 만 신뢰하므로 이 어댑터가 SSLContext 를 직접 구성한다.
+        --ca-bundle 인자(권장) 또는 AWS_CA_BUNDLE/SSL_CERT_FILE/MAILKB_BEDROCK_CA
+        환경변수로 지정한다. 어댑터는 이 CA 를 자격증명 계층(botocore: SSO·STS —
+        AWS_CA_BUNDLE 만 읽음)과 Bedrock 호출(httpx — certifi 만 신뢰하므로 SSLContext
+        직접 구성) 양쪽에 적용하므로, config 의 --ca-bundle 하나면 Windows 영구
+        환경변수 상속 없이도 두 계층이 다 덮인다. 파일은 PEM(텍스트) — DER(바이너리)이면
+        `openssl x509 -inform der -in c.crt -out c.pem` 로 변환.
 """
 from __future__ import annotations
 
@@ -108,6 +110,12 @@ def main(argv: list[str] | None = None) -> int:
     if ca and not os.path.isfile(ca):
         print(f"CA 번들 파일을 찾을 수 없음: {ca} ({ca_src})", file=sys.stderr)
         return 2
+    if ca:
+        # 자격증명 계층(botocore: SSO·STS)은 AWS_CA_BUNDLE 환경변수만 읽는다.
+        # 해석한 CA 를 이 프로세스 env 에 실어, --ca-bundle 하나로 자격증명·Bedrock
+        # 호출 두 계층을 다 덮는다(Windows 영구 환경변수 상속에 의존하지 않음).
+        # anthropic/botocore 는 _make_client 안에서 지연 임포트되므로 여기 설정이 먼저.
+        os.environ["AWS_CA_BUNDLE"] = ca
     try:
         client = _make_client(region, ca)
         msg = client.messages.create(
@@ -142,17 +150,15 @@ def main(argv: list[str] | None = None) -> int:
         elif "ssl" in low or "certificate" in low:
             print("사내 TLS 검사(프록시 CA) — 회사 CA(PEM)를 지정하라.", file=sys.stderr)
             if ca:
-                # CA 를 이미 줬는데도 인증서 오류 → 이 계층이 아니라 자격증명 계층에서
-                # 난 것. --ca-bundle 은 Bedrock 호출(httpx)에만 적용되고, botocore
-                # (SSO·STS)는 AWS_CA_BUNDLE 환경변수를 별도로 읽는다.
-                print("  · Bedrock 호출용 CA 는 적용됨(위 CA 줄). 그래도 실패하면 "
-                      "자격증명 계층(botocore: SSO·STS)이 별도로 AWS_CA_BUNDLE "
-                      "환경변수를 요구한다 — 같은 CA 를 AWS_CA_BUNDLE 로도 설정하고 "
-                      "프로세스를 재시작하라.", file=sys.stderr)
-            else:
-                print("  · --ca-bundle 인자 또는 AWS_CA_BUNDLE/SSL_CERT_FILE "
-                      "환경변수로 지정(AWS_CA_BUNDLE 은 자격증명·호출 양쪽을 덮음).",
+                # CA 를 이미 줬고 botocore 용 AWS_CA_BUNDLE 도 실었는데(위 CA 줄)도
+                # 실패 → CA 파일 자체가 프록시의 실제 발급 체인이 아니거나 불완전.
+                print("  · CA 는 자격증명·호출 양쪽에 적용됨(위 CA 줄). 그래도 "
+                      "실패하면 그 CA 가 프록시의 실제 발급 CA 가 아니거나 체인이 "
+                      "불완전한 것 — IT 에 루트+중간 CA 전체 PEM 을 요청하라.",
                       file=sys.stderr)
+            else:
+                print("  · --ca-bundle 인자로 회사 CA(PEM) 를 지정하라 "
+                      "(어댑터가 자격증명·호출 양쪽에 적용한다).", file=sys.stderr)
         elif any(k in low for k in ("connect", "getaddrinfo", "timed out",
                                     "timeout", "proxy", "unreachable")):
             print("네트워크 경로 문제 — ① HTTPS_PROXY 환경변수(사내 프록시) "

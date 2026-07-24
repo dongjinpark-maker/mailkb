@@ -7074,12 +7074,29 @@ class TestBedrockRunAdapter(unittest.TestCase):
         rc, _, err = self._run([], "q", factory)
         self.assertEqual(rc, 1)
         self.assertIn("--ca-bundle", err)             # 사내 TLS 검사(CA) 처방
-        self.assertIn("SSL_CERT_FILE", err)
+        self.assertIn("양쪽에 적용", err)              # 어댑터가 두 계층에 적용함을 안내
         self.assertNotIn("openssl", err)              # 검증 실패는 포맷 문제 아님
 
-    def test_ca_set_but_cert_fails_points_to_botocore_env(self):
-        # --ca-bundle 을 줬는데도 인증서 오류 → 자격증명 계층(botocore)이 원인.
-        # AWS_CA_BUNDLE(환경변수)를 별도로 설정하라는 힌트가 나와야 한다.
+    def test_ca_bundle_seeds_aws_ca_bundle_for_botocore(self):
+        # --ca-bundle 은 botocore(자격증명)도 보게 프로세스 env(AWS_CA_BUNDLE)에 실린다
+        from types import SimpleNamespace
+        calls, seen = [], {}
+
+        def factory(region, ca_bundle=None):
+            seen["env"] = os.environ.get("AWS_CA_BUNDLE")   # _make_client 시점의 env
+            return self._client(calls, [SimpleNamespace(type="text", text="ok")])
+        with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as fh:
+            fh.write("x")
+            ca_path = fh.name
+        try:
+            rc, _, _ = self._run(["--ca-bundle", ca_path], "q", factory)
+        finally:
+            os.unlink(ca_path)
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen["env"], ca_path)        # botocore 가 읽을 env 에 실림
+
+    def test_ca_set_but_cert_fails_points_to_chain(self):
+        # CA 를 줬는데도 인증서 오류 → CA 자체(발급 체인) 문제로 안내
         def factory(region, ca_bundle=None):
             raise Exception("SSLCertVerificationError: certificate verify failed: "
                             "unable to get local issuer certificate")
@@ -7091,8 +7108,8 @@ class TestBedrockRunAdapter(unittest.TestCase):
         finally:
             os.unlink(ca_path)
         self.assertEqual(rc, 1)
-        self.assertIn("botocore", err)                # 원인 계층 지목
-        self.assertIn("AWS_CA_BUNDLE", err)           # 환경변수 처방
+        self.assertIn("양쪽에 적용됨", err)            # 두 계층 모두 적용했음을 알림
+        self.assertIn("발급 CA", err)                 # 그래도 실패면 체인 문제
 
     def test_der_ca_format_error_hints_conversion(self):
         # DER(바이너리) CA 를 주면 로드 단계에서 'PEM lib' — 변환 안내가 나와야
