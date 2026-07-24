@@ -6,11 +6,15 @@ ai_run 계약: 프롬프트를 stdin(utf-8)으로 받아 응답 텍스트만 std
 이 스크립트만 의존한다 — mailkb 코어(stdlib-only)는 무변경.
 
 설치:   pip install -U "anthropic[bedrock]"
-등록:   data/config.toml 예시
+등록:   data/config.toml 예시 (신 엔드포인트)
         [ai.backends.bedrock-sonnet]
         cmd = ["python", "tools/bedrock_run.py", "--model", "anthropic.claude-sonnet-5"]
         [ai.backends.bedrock-haiku]
         cmd = ["python", "tools/bedrock_run.py", "--model", "anthropic.claude-haiku-4-5"]
+레거시: 사내 방화벽이 .api.aws 를 막으면 --legacy(=bedrock-runtime.amazonaws.com).
+        모델 ID 에 리전 추론 프로파일 접두사가 필요하다(서울=APAC → global. 또는 apac.):
+        cmd = ["python", "tools/bedrock_run.py", "--legacy",
+               "--model", "global.anthropic.claude-sonnet-5"]
 리전:   --region > AWS_REGION > 기본 ap-northeast-2(서울).
         config 오버라이드 = cmd 에 "--region", "<리전>" 을 덧붙인다.
 자격증명: 표준 AWS 체인(환경변수 → 프로필/SSO → 역할). SSO 는 `aws sso login` 선행.
@@ -65,21 +69,30 @@ def resolve_ca_bundle(cli_ca: str | None, env: dict | None = None) -> str | None
     return _resolve_ca(cli_ca, env)[0]
 
 
-def _make_client(region: str, ca_bundle: str | None = None):
+def _make_client(region: str, ca_bundle: str | None = None,
+                 legacy: bool = False):
     """지연 임포트 — anthropic 미설치 환경에서도 모듈 임포트·테스트가 가능하게.
+
+    legacy=True 면 AnthropicBedrock(레거시: bedrock-runtime.{region}.amazonaws.com,
+    클래식 AWS 도메인)을, 아니면 AnthropicBedrockMantle(신: bedrock-mantle.{region}.
+    api.aws)을 쓴다. 사내 방화벽이 .api.aws 를 막고 *.amazonaws.com 만 허용하면
+    레거시가 필요하다. 두 클라이언트 모두 aws_region·http_client 를 받는다.
 
     ca_bundle 이 주어지면 그 PEM 만 신뢰 앵커로 하는 httpx 클라이언트를 만들어
     SDK 에 넘긴다(사내 TLS 검사 프록시가 재서명한 인증서 검증). httpx 는 기본적으로
     certifi 만 신뢰해 SSL_CERT_FILE 환경변수를 항상 존중하진 않으므로, SSLContext 를
     직접 구성해 httpx 버전에 무관하게 회사 CA 가 반드시 적용되게 한다."""
-    from anthropic import AnthropicBedrockMantle
+    if legacy:
+        from anthropic import AnthropicBedrock as _Client
+    else:
+        from anthropic import AnthropicBedrockMantle as _Client
     kw = {"aws_region": region}
     if ca_bundle:
         import ssl
         import httpx
         ctx = ssl.create_default_context(cafile=ca_bundle)  # 회사 CA 만 신뢰 앵커로
         kw["http_client"] = httpx.Client(verify=ctx)
-    return AnthropicBedrockMantle(**kw)
+    return _Client(**kw)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -97,6 +110,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--ca-bundle", default=None,
                     help="사내 TLS 검사용 CA PEM 경로 "
                          "(없으면 SSL_CERT_FILE 등 환경변수)")
+    ap.add_argument("--legacy", action="store_true",
+                    help="레거시 Bedrock(bedrock-runtime.amazonaws.com) 사용 — "
+                         ".api.aws 가 막힌 사내망용. 모델 ID 는 global./apac. 접두사 필요")
     args = ap.parse_args(argv)
 
     prompt = sys.stdin.read()
@@ -117,7 +133,7 @@ def main(argv: list[str] | None = None) -> int:
         # anthropic/botocore 는 _make_client 안에서 지연 임포트되므로 여기 설정이 먼저.
         os.environ["AWS_CA_BUNDLE"] = ca
     try:
-        client = _make_client(region, ca)
+        client = _make_client(region, ca, legacy=args.legacy)
         msg = client.messages.create(
             model=args.model,
             max_tokens=args.max_tokens,
@@ -134,10 +150,25 @@ def main(argv: list[str] | None = None) -> int:
         while cur is not None and len(chain) < 5:
             chain.append(f"{type(cur).__name__}: {cur}")
             cur = cur.__cause__ or cur.__context__
-        print(f"Bedrock 호출 실패({region}): " + " <- ".join(chain),
+        endpoint = ("bedrock-runtime.*.amazonaws.com(레거시)" if args.legacy
+                    else "bedrock-mantle.*.api.aws(신)")
+        print(f"Bedrock 호출 실패({region}, {endpoint}): " + " <- ".join(chain),
               file=sys.stderr)
         print(f"CA: {ca_note}", file=sys.stderr)   # 어느 CA 를 잡았는지(미지정이면 상속 문제)
         low = " ".join(chain).lower()
+        if any(k in low for k in ("inference profile", "on-demand throughput",
+                                  "on demand throughput")):
+            # 레거시 4.5+ 모델은 리전 추론 프로파일 접두사가 필요.
+            print("모델 ID 에 추론 프로파일 접두사 필요 — --model 을 global.<모델> "
+                  "또는 apac.<모델>(서울=APAC) 로 (예: global.anthropic.claude-sonnet-5)",
+                  file=sys.stderr)
+        if (any(k in low for k in ("connect", "getaddrinfo", "timed out",
+                                   "timeout", "unreachable", "refused"))
+                and not args.legacy):
+            # .api.aws 도달 실패 — 사내 방화벽이 이 도메인을 막았을 가능성.
+            print("신 엔드포인트(.api.aws) 연결 실패 — 사내 방화벽이 이 도메인을 "
+                  "막았을 수 있다. --legacy(bedrock-runtime.amazonaws.com)로 재시도.",
+                  file=sys.stderr)
         if any(k in low for k in _CRED_HINTS):
             print("자격증명 문제로 보임 — aws sso login(또는 키/프로필 설정) 후 재시도",
                   file=sys.stderr)

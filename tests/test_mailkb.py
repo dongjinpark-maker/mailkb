@@ -6933,7 +6933,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
         from types import SimpleNamespace
         calls, made = [], {}
 
-        def factory(region, ca_bundle=None):
+        def factory(region, ca_bundle=None, legacy=False):
             made["region"], made["ca"] = region, ca_bundle
             return self._client(calls, [SimpleNamespace(type="text", text="응답")])
         with mock.patch.dict(os.environ, {"AWS_REGION": ""}):
@@ -6954,12 +6954,48 @@ class TestBedrockRunAdapter(unittest.TestCase):
         from types import SimpleNamespace
         calls, made = [], {}
 
-        def factory(region, ca_bundle=None):
+        def factory(region, ca_bundle=None, legacy=False):
             made["region"] = region
             return self._client(calls, [SimpleNamespace(type="text", text="ok")])
         rc, _, _ = self._run(["--region", "us-west-2"], "q", factory)
         self.assertEqual(rc, 0)
         self.assertEqual(made["region"], "us-west-2")  # config(cmd) 오버라이드 경로
+
+    def test_legacy_flag_selects_client(self):
+        from types import SimpleNamespace
+        calls, made = [], {}
+
+        def factory(region, ca_bundle=None, legacy=False):
+            made["legacy"] = legacy
+            return self._client(calls, [SimpleNamespace(type="text", text="ok")])
+        rc, _, _ = self._run(["--legacy"], "q", factory)
+        self.assertEqual(rc, 0)
+        self.assertTrue(made["legacy"])               # --legacy → AnthropicBedrock
+        rc, _, _ = self._run([], "q", factory)
+        self.assertEqual(rc, 0)
+        self.assertFalse(made["legacy"])              # 기본 → Mantle
+
+    def test_legacy_inference_profile_hint(self):
+        def factory(region, ca_bundle=None, legacy=False):
+            raise Exception(
+                "Invocation of model ID anthropic.claude-sonnet-5 with on-demand "
+                "throughput isn't supported. Retry your request with the ID or ARN "
+                "of an inference profile that contains this model.")
+        rc, _, err = self._run(["--legacy", "--model", "anthropic.claude-sonnet-5"],
+                               "q", factory)
+        self.assertEqual(rc, 1)
+        self.assertIn("추론 프로파일", err)            # 접두사 필요 안내
+        self.assertIn("global.", err)
+        self.assertIn("레거시", err)                   # 실패 줄에 엔드포인트 표시
+
+    def test_mantle_connect_fail_suggests_legacy(self):
+        # 신 엔드포인트(.api.aws) 연결 실패 → --legacy 재시도 안내
+        def factory(region, ca_bundle=None, legacy=False):
+            raise Exception("APIConnectionError: Connection error.")
+        rc, _, err = self._run([], "q", factory)
+        self.assertEqual(rc, 1)
+        self.assertIn("--legacy", err)
+        self.assertIn(".api.aws", err)
 
     def test_ca_bundle_path_precedence(self):
         f = self.mod.resolve_ca_bundle
@@ -6976,7 +7012,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
         from types import SimpleNamespace
         calls, made = [], {}
 
-        def factory(region, ca_bundle=None):
+        def factory(region, ca_bundle=None, legacy=False):
             made["ca"] = ca_bundle
             return self._client(calls, [SimpleNamespace(type="text", text="ok")])
         with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as fh:
@@ -6991,7 +7027,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
 
     def test_ca_bundle_missing_file_exits_2(self):
         rc, _, err = self._run(["--ca-bundle", "/no/such/ca.pem"], "q",
-                               lambda r, ca_bundle=None: self.fail("호출 금지"))
+                               lambda r, ca_bundle=None, legacy=False: self.fail("호출 금지"))
         self.assertEqual(rc, 2)                        # 파일 없으면 호출 전 종료
         self.assertIn("CA 번들", err)
 
@@ -7000,7 +7036,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
         from types import SimpleNamespace
         calls, made = [], {}
 
-        def factory(region, ca_bundle=None):
+        def factory(region, ca_bundle=None, legacy=False):
             made["ca"] = ca_bundle
             return self._client(calls, [SimpleNamespace(type="text", text="ok")])
         with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as fh:
@@ -7016,7 +7052,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
 
     def test_failure_reports_resolved_ca_source(self):
         # 실패 시 어느 CA 를 잡았는지 표시 — env 상속 여부를 눈으로 확인
-        def factory(region, ca_bundle=None):
+        def factory(region, ca_bundle=None, legacy=False):
             raise Exception("APIConnectionError: Connection error.")
         with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as fh:
             fh.write("x")
@@ -7032,7 +7068,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
 
     def test_failure_reports_ca_unset(self):
         # CA 미지정이면 '미지정' 표시 — 환경변수가 프로세스에 안 실린 흔한 케이스
-        def factory(region, ca_bundle=None):
+        def factory(region, ca_bundle=None, legacy=False):
             raise Exception("APIConnectionError: Connection error.")
         rc, _, err = self._run([], "q", factory)
         self.assertEqual(rc, 1)
@@ -7040,13 +7076,13 @@ class TestBedrockRunAdapter(unittest.TestCase):
 
     def test_empty_prompt_exits_2(self):
         rc, out, err = self._run([], "   \n",
-                                 lambda r, ca_bundle=None: self.fail("호출 금지"))
+                                 lambda r, ca_bundle=None, legacy=False: self.fail("호출 금지"))
         self.assertEqual(rc, 2)
         self.assertEqual(out, "")
         self.assertIn("빈 프롬프트", err)
 
     def test_credential_error_hints_sso_login(self):
-        def factory(region, ca_bundle=None):
+        def factory(region, ca_bundle=None, legacy=False):
             raise Exception("ExpiredTokenException: security token is expired")
         rc, out, err = self._run([], "q", factory)
         self.assertEqual(rc, 1)
@@ -7055,7 +7091,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
 
     def test_connection_error_unwraps_chain_and_hints(self):
         # APIConnectionError 는 원인(SSL·프록시·DNS)을 감싼다 — 체인 노출 + 힌트
-        def factory(region, ca_bundle=None):
+        def factory(region, ca_bundle=None, legacy=False):
             root = OSError("getaddrinfo failed")
             mid = ConnectionError("All connection attempts failed")
             mid.__cause__ = root
@@ -7069,7 +7105,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
         self.assertIn("api.aws", err)
 
     def test_ssl_error_hints_corporate_ca(self):
-        def factory(region, ca_bundle=None):
+        def factory(region, ca_bundle=None, legacy=False):
             raise Exception("SSL: CERTIFICATE_VERIFY_FAILED certificate verify failed")
         rc, _, err = self._run([], "q", factory)
         self.assertEqual(rc, 1)
@@ -7082,7 +7118,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
         from types import SimpleNamespace
         calls, seen = [], {}
 
-        def factory(region, ca_bundle=None):
+        def factory(region, ca_bundle=None, legacy=False):
             seen["env"] = os.environ.get("AWS_CA_BUNDLE")   # _make_client 시점의 env
             return self._client(calls, [SimpleNamespace(type="text", text="ok")])
         with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as fh:
@@ -7097,7 +7133,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
 
     def test_ca_set_but_cert_fails_points_to_chain(self):
         # CA 를 줬는데도 인증서 오류 → CA 자체(발급 체인) 문제로 안내
-        def factory(region, ca_bundle=None):
+        def factory(region, ca_bundle=None, legacy=False):
             raise Exception("SSLCertVerificationError: certificate verify failed: "
                             "unable to get local issuer certificate")
         with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as fh:
@@ -7117,7 +7153,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
             fh.write(b"\x30\x82\x01\x0a")             # DER 바이트(파일은 존재)
             ca_path = fh.name
 
-        def factory(region, ca_bundle=None):
+        def factory(region, ca_bundle=None, legacy=False):
             raise Exception("[SSL] PEM lib (_ssl.c:4321)")
         try:
             rc, out, err = self._run(["--ca-bundle", ca_path], "q", factory)
@@ -7148,7 +7184,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
             os.unlink(der.name)
 
     def test_missing_sdk_exits_2_with_install_hint(self):
-        def factory(region, ca_bundle=None):
+        def factory(region, ca_bundle=None, legacy=False):
             raise ModuleNotFoundError("No module named 'anthropic'")
         rc, _, err = self._run([], "q", factory)
         self.assertEqual(rc, 2)
@@ -7158,7 +7194,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
         from types import SimpleNamespace
         calls = []
         rc, out, err = self._run(
-            [], "q", lambda r, ca_bundle=None: self._client(
+            [], "q", lambda r, ca_bundle=None, legacy=False: self._client(
                 calls, [SimpleNamespace(type="tool_use", text="")]))
         self.assertEqual(rc, 1)                       # ai_run 이 빈 응답=오류로 취급
         self.assertEqual(out, "")
