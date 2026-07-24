@@ -6946,11 +6946,11 @@ class TestNoisePolicy(unittest.TestCase):
 
 
 class TestBedrockRunAdapter(unittest.TestCase):
-    """tools/bedrock_run.py — ai_run 계약(stdin→stdout·비0 종료) 목 검증.
+    """tools/bedrock_run.py(레거시 Bedrock 최소 어댑터) — ai_run 계약 목 검증.
 
-    anthropic 미설치 환경에서도 돌도록 클라이언트 생성(_make_client)을 교체한다.
-    실호출 없음 — 인자·리전 해석·오류 경로가 계약대로인지만 본다.
-    """
+    확인된 사내 조합: 레거시 엔드포인트(AnthropicBedrock) + --insecure + --proxy,
+    모델 global.anthropic.claude-sonnet-5. anthropic 미설치에서도 돌도록
+    _make_client 를 교체(실호출 없음)."""
 
     @classmethod
     def setUpClass(cls):
@@ -6965,12 +6965,8 @@ class TestBedrockRunAdapter(unittest.TestCase):
         orig = self.mod._make_client
         self.mod._make_client = factory
         out, err = io.StringIO(), io.StringIO()
-        # CA·프록시 환경변수를 비워 호스트 환경이 테스트에 새지 않게 —
-        # env_over 로 특정 변수만 다시 주입(예: AWS_CA_BUNDLE·HTTPS_PROXY 검증).
-        clean = {k: "" for k in (
-            "SSL_CERT_FILE", "AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE",
-            "MAILKB_BEDROCK_CA", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY",
-            "http_proxy", "ALL_PROXY", "all_proxy")}
+        clean = {k: "" for k in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY",
+                                 "http_proxy", "AWS_REGION")}
         if env_over:
             clean.update(env_over)
         try:
@@ -6985,9 +6981,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
     @staticmethod
     def _client(calls, blocks):
         from types import SimpleNamespace
-        msg = SimpleNamespace(
-            content=blocks,
-            usage=SimpleNamespace(input_tokens=10, output_tokens=5))
+        msg = SimpleNamespace(content=blocks)
 
         class _C:
             class messages:
@@ -6997,291 +6991,63 @@ class TestBedrockRunAdapter(unittest.TestCase):
                     return msg
         return _C()
 
-    def test_region_resolution_priority(self):
-        r = self.mod.resolve_region
-        self.assertEqual(r(None, {}), "ap-northeast-2")           # 기본 = 서울
-        self.assertEqual(r(None, {"AWS_REGION": "us-east-1"}), "us-east-1")
-        self.assertEqual(r("eu-west-1", {"AWS_REGION": "us-east-1"}), "eu-west-1")
-        self.assertEqual(r("", {"AWS_REGION": ""}), "ap-northeast-2")  # 빈값=미지정
-
-    def test_success_contract_and_default_region(self):
+    def test_defaults_model_and_region(self):
         from types import SimpleNamespace
         calls, made = [], {}
 
-        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
-            made["region"], made["ca"] = region, ca_bundle
+        def factory(region, proxy=None, insecure=False):
+            made["region"], made["proxy"], made["insecure"] = region, proxy, insecure
             return self._client(calls, [SimpleNamespace(type="text", text="응답")])
-        with mock.patch.dict(os.environ, {"AWS_REGION": ""}):
-            rc, out, err = self._run(
-                ["--model", "anthropic.claude-haiku-4-5", "--max-tokens", "512"],
-                "질문입니다", factory)
+        rc, out, _ = self._run([], "질문입니다", factory)
         self.assertEqual(rc, 0)
-        self.assertEqual(out, "응답")                 # stdout = 응답 텍스트만
-        self.assertEqual(made["region"], "ap-northeast-2")
-        self.assertIsNone(made["ca"])                 # CA 미지정 시 기본(certifi) 유지
-        self.assertEqual(calls[0]["model"], "anthropic.claude-haiku-4-5")
-        self.assertEqual(calls[0]["max_tokens"], 512)
+        self.assertEqual(out, "응답")                       # stdout = 텍스트만
+        self.assertEqual(made["region"], "ap-northeast-2")  # 기본 서울
+        self.assertTrue(made["insecure"])                   # 기본 검증 끔
+        self.assertIsNone(made["proxy"])                    # 기본 프록시 미설정
+        self.assertEqual(calls[0]["model"], "global.anthropic.claude-sonnet-5")
         self.assertEqual(calls[0]["messages"],
                          [{"role": "user", "content": "질문입니다"}])
-        self.assertIn("usage: in=10 out=5", err)      # 진단은 stderr 로만
 
-    def test_region_flag_overrides(self):
+    def test_secure_flag_enables_verify(self):
         from types import SimpleNamespace
         calls, made = [], {}
 
-        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
-            made["region"] = region
+        def factory(region, proxy=None, insecure=False):
+            made["insecure"] = insecure
             return self._client(calls, [SimpleNamespace(type="text", text="ok")])
-        rc, _, _ = self._run(["--region", "us-west-2"], "q", factory)
+        rc, _, _ = self._run(["--secure"], "q", factory)
         self.assertEqual(rc, 0)
-        self.assertEqual(made["region"], "us-west-2")  # config(cmd) 오버라이드 경로
+        self.assertFalse(made["insecure"])                  # --secure → 검증 켬
 
-    def test_proxy_resolution_priority(self):
-        f = self.mod._resolve_proxy
-        self.assertEqual(f(None, {}), (None, None))
-        self.assertEqual(f(None, {"HTTPS_PROXY": "http://p:8080"}),
-                         ("http://p:8080", "HTTPS_PROXY"))
-        self.assertEqual(f("http://cli:1", {"HTTPS_PROXY": "http://p:8080"}),
-                         ("http://cli:1", "--proxy"))
-        self.assertEqual(f(None, {"HTTP_PROXY": "http://p:3128"}),
-                         ("http://p:3128", "HTTP_PROXY"))
-        self.assertEqual(f("", {"HTTPS_PROXY": ""}), (None, None))  # 빈값=미지정
-
-    def test_proxy_seeded_into_env_for_both_layers(self):
-        # --proxy 는 httpx(trust_env)·botocore 가 읽게 HTTPS_PROXY/HTTP_PROXY env 에 실린다
-        from types import SimpleNamespace
-        calls, seen = [], {}
-
-        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
-            seen["https"] = os.environ.get("HTTPS_PROXY")
-            seen["http"] = os.environ.get("HTTP_PROXY")
-            return self._client(calls, [SimpleNamespace(type="text", text="ok")])
-        rc, _, _ = self._run(["--proxy", "http://proxy.corp:8080"], "q", factory,
-                             env_over={"HTTPS_PROXY": "", "HTTP_PROXY": ""})
-        self.assertEqual(rc, 0)
-        self.assertEqual(seen["https"], "http://proxy.corp:8080")
-        self.assertEqual(seen["http"], "http://proxy.corp:8080")
-
-    def test_failure_reports_proxy(self):
-        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
-            raise Exception("APIConnectionError: Connection error.")
-        rc, _, err = self._run(["--proxy", "http://proxy.corp:8080"], "q", factory,
-                               env_over={"HTTPS_PROXY": "", "HTTP_PROXY": ""})
-        self.assertEqual(rc, 1)
-        self.assertIn("프록시: http://proxy.corp:8080 (--proxy)", err)
-        self.assertIn("--proxy", err)               # 힌트에도 프록시 언급
-
-    def test_failure_reports_proxy_unset(self):
-        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
-            raise Exception("APIConnectionError: Connection error.")
-        rc, _, err = self._run([], "q", factory,
-                               env_over={"HTTPS_PROXY": "", "HTTP_PROXY": ""})
-        self.assertEqual(rc, 1)
-        self.assertIn("프록시: 미지정", err)          # 명시 프록시 미경유 표시
-
-    def test_legacy_flag_selects_client(self):
+    def test_explicit_proxy_passed(self):
         from types import SimpleNamespace
         calls, made = [], {}
 
-        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
-            made["legacy"] = legacy
+        def factory(region, proxy=None, insecure=False):
+            made["proxy"] = proxy
             return self._client(calls, [SimpleNamespace(type="text", text="ok")])
-        rc, _, _ = self._run(["--legacy"], "q", factory)
+        rc, _, _ = self._run(
+            ["--proxy", "http://proxy.corp:8080", "--region", "us-west-2",
+             "--max-tokens", "512"], "q", factory)
         self.assertEqual(rc, 0)
-        self.assertTrue(made["legacy"])               # --legacy → AnthropicBedrock
-        rc, _, _ = self._run([], "q", factory)
-        self.assertEqual(rc, 0)
-        self.assertFalse(made["legacy"])              # 기본 → Mantle
+        self.assertEqual(made["proxy"], "http://proxy.corp:8080")
+        self.assertEqual(calls[0]["max_tokens"], 512)
 
-    def test_legacy_inference_profile_hint(self):
-        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
-            raise Exception(
-                "Invocation of model ID anthropic.claude-sonnet-5 with on-demand "
-                "throughput isn't supported. Retry your request with the ID or ARN "
-                "of an inference profile that contains this model.")
-        rc, _, err = self._run(["--legacy", "--model", "anthropic.claude-sonnet-5"],
-                               "q", factory)
-        self.assertEqual(rc, 1)
-        self.assertIn("추론 프로파일", err)            # 접두사 필요 안내
-        self.assertIn("global.", err)
-        self.assertIn("레거시", err)                   # 실패 줄에 엔드포인트 표시
-
-    def test_mantle_connect_fail_suggests_legacy(self):
-        # 신 엔드포인트(.api.aws) 연결 실패 → --legacy 재시도 안내
-        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
-            raise Exception("APIConnectionError: Connection error.")
-        rc, _, err = self._run([], "q", factory)
-        self.assertEqual(rc, 1)
-        self.assertIn("--legacy", err)
-        self.assertIn(".api.aws", err)
-
-    def test_ca_bundle_path_precedence(self):
-        f = self.mod.resolve_ca_bundle
-        self.assertIsNone(f(None, {}))
-        self.assertEqual(f(None, {"SSL_CERT_FILE": "/a"}), "/a")
-        self.assertEqual(f("/cli", {"SSL_CERT_FILE": "/a"}), "/cli")  # --ca-bundle 우선
-        self.assertEqual(f(None, {"MAILKB_BEDROCK_CA": "/m",
-                                  "SSL_CERT_FILE": "/s"}), "/m")
-        self.assertEqual(f(None, {"AWS_CA_BUNDLE": "/aws",
-                                  "REQUESTS_CA_BUNDLE": "/r"}), "/aws")
-        self.assertIsNone(f("", {"SSL_CERT_FILE": ""}))              # 빈값=미지정
-
-    def test_ca_bundle_threaded_to_client(self):
+    def test_env_proxy_not_forced(self):
+        # env HTTPS_PROXY 가 있어도 --proxy 없으면 명시 전달 안 함(httpx trust_env 가 읽음)
         from types import SimpleNamespace
         calls, made = [], {}
 
-        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
-            made["ca"] = ca_bundle
+        def factory(region, proxy=None, insecure=False):
+            made["proxy"] = proxy
             return self._client(calls, [SimpleNamespace(type="text", text="ok")])
-        with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as fh:
-            fh.write("dummy-ca")            # 존재만 확인(실제 검증은 _make_client 안)
-            ca_path = fh.name
-        try:
-            rc, _, _ = self._run(["--ca-bundle", ca_path], "q", factory)
-        finally:
-            os.unlink(ca_path)
+        rc, _, _ = self._run([], "q", factory,
+                             env_over={"HTTPS_PROXY": "http://env:3128"})
         self.assertEqual(rc, 0)
-        self.assertEqual(made["ca"], ca_path)         # 회사 CA 가 클라이언트로 전달됨
+        self.assertIsNone(made["proxy"])                    # env 폴백/강제 없음
 
-    def test_ca_bundle_missing_file_exits_2(self):
-        rc, _, err = self._run(["--ca-bundle", "/no/such/ca.pem"], "q",
-                               lambda r, ca_bundle=None, legacy=False, insecure=False, proxy=None: self.fail("호출 금지"))
-        self.assertEqual(rc, 2)                        # 파일 없으면 호출 전 종료
-        self.assertIn("CA 번들", err)
-
-    def test_uses_existing_aws_ca_bundle_env(self):
-        # PC 에 이미 있는 AWS_CA_BUNDLE 을 --ca-bundle 없이도 자동으로 집어 쓴다
-        from types import SimpleNamespace
-        calls, made = [], {}
-
-        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
-            made["ca"] = ca_bundle
-            return self._client(calls, [SimpleNamespace(type="text", text="ok")])
-        with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as fh:
-            fh.write("dummy-ca")
-            ca_path = fh.name
-        try:
-            rc, _, _ = self._run([], "q", factory,
-                                 env_over={"AWS_CA_BUNDLE": ca_path})
-        finally:
-            os.unlink(ca_path)
-        self.assertEqual(rc, 0)
-        self.assertEqual(made["ca"], ca_path)          # env 값이 그대로 전달됨
-
-    def test_failure_reports_resolved_ca_source(self):
-        # 실패 시 어느 CA 를 잡았는지 표시 — env 상속 여부를 눈으로 확인
-        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
-            raise Exception("APIConnectionError: Connection error.")
-        with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as fh:
-            fh.write("x")
-            ca_path = fh.name
-        try:
-            rc, _, err = self._run([], "q", factory,
-                                   env_over={"AWS_CA_BUNDLE": ca_path})
-        finally:
-            os.unlink(ca_path)
-        self.assertEqual(rc, 1)
-        self.assertIn("AWS_CA_BUNDLE", err)            # 출처 표시
-        self.assertIn(ca_path, err)
-
-    def test_failure_reports_ca_unset(self):
-        # CA 미지정이면 '미지정' 표시 — 환경변수가 프로세스에 안 실린 흔한 케이스
-        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
-            raise Exception("APIConnectionError: Connection error.")
-        rc, _, err = self._run([], "q", factory)
-        self.assertEqual(rc, 1)
-        self.assertIn("CA: 미지정", err)
-
-    def test_empty_prompt_exits_2(self):
-        rc, out, err = self._run([], "   \n",
-                                 lambda r, ca_bundle=None, legacy=False, insecure=False, proxy=None: self.fail("호출 금지"))
-        self.assertEqual(rc, 2)
-        self.assertEqual(out, "")
-        self.assertIn("빈 프롬프트", err)
-
-    def test_credential_error_hints_sso_login(self):
-        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
-            raise Exception("ExpiredTokenException: security token is expired")
-        rc, out, err = self._run([], "q", factory)
-        self.assertEqual(rc, 1)
-        self.assertEqual(out, "")                     # 실패 시 stdout 오염 금지
-        self.assertIn("aws sso login", err)
-
-    def test_connection_error_unwraps_chain_and_hints(self):
-        # APIConnectionError 는 원인(SSL·프록시·DNS)을 감싼다 — 체인 노출 + 힌트
-        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
-            root = OSError("getaddrinfo failed")
-            mid = ConnectionError("All connection attempts failed")
-            mid.__cause__ = root
-            top = Exception("APIConnectionError: Connection error.")
-            top.__cause__ = mid
-            raise top
-        rc, out, err = self._run([], "q", factory)
-        self.assertEqual(rc, 1)
-        self.assertIn("getaddrinfo failed", err)      # 최심부 원인이 보인다
-        self.assertIn("--proxy", err)                 # 프록시/방화벽 힌트
-        self.assertIn("api.aws", err)
-
-    def test_ssl_error_hints_corporate_ca(self):
-        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
-            raise Exception("SSL: CERTIFICATE_VERIFY_FAILED certificate verify failed")
-        rc, _, err = self._run([], "q", factory)
-        self.assertEqual(rc, 1)
-        self.assertIn("Windows 인증서 저장소", err)    # OS 저장소 신뢰(claude CLI 동일)
-        self.assertIn("AWS_CA_BUNDLE", err)           # 자격증명 계층 처방
-        self.assertIn("--proxy", err)                 # 명시 프록시 환경 함께 안내
-        self.assertNotIn("openssl", err)              # 검증 실패는 포맷 문제 아님
-
-    def test_ca_bundle_seeds_aws_ca_bundle_for_botocore(self):
-        # --ca-bundle 은 botocore(자격증명)도 보게 프로세스 env(AWS_CA_BUNDLE)에 실린다
-        from types import SimpleNamespace
-        calls, seen = [], {}
-
-        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
-            seen["env"] = os.environ.get("AWS_CA_BUNDLE")   # _make_client 시점의 env
-            return self._client(calls, [SimpleNamespace(type="text", text="ok")])
-        with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as fh:
-            fh.write("x")
-            ca_path = fh.name
-        try:
-            rc, _, _ = self._run(["--ca-bundle", ca_path], "q", factory)
-        finally:
-            os.unlink(ca_path)
-        self.assertEqual(rc, 0)
-        self.assertEqual(seen["env"], ca_path)        # botocore 가 읽을 env 에 실림
-
-    def test_ca_set_but_cert_fails_points_to_chain(self):
-        # CA 를 줬는데도 인증서 오류 → 발급 체인/자격증명 계층/프록시 후보 안내
-        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
-            raise Exception("SSLCertVerificationError: certificate verify failed: "
-                            "unable to get local issuer certificate")
-        with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as fh:
-            fh.write("x")
-            ca_path = fh.name
-        try:
-            rc, _, err = self._run(["--ca-bundle", ca_path], "q", factory)
-        finally:
-            os.unlink(ca_path)
-        self.assertEqual(rc, 1)
-        self.assertIn("발급 체인", err)                # 루트+중간 전체 필요 안내
-        self.assertIn("AWS_CA_BUNDLE", err)           # 자격증명 계층 후보
-
-    def test_win_root_certs_empty_off_windows(self):
-        # 비-Windows 에서는 시스템 저장소 열거가 빈 리스트(플랫폼 가드)
-        if sys.platform == "win32":
-            self.skipTest("Windows 에서는 실제 저장소를 읽으므로 스킵")
-        self.assertEqual(self.mod._win_root_certs(), [])
-
-    def test_ssl_context_builds_and_skips_bad_certs(self):
-        # _ssl_context: 기본(공개/시스템 루트) 컨텍스트 생성 + 불량 DER 은 건너뜀
-        import ssl
-        ctx = self.mod._ssl_context(None, enum_win=lambda: [b"not-a-cert"])
-        self.assertIsInstance(ctx, ssl.SSLContext)
-        # ca_bundle 없이도 검증 모드는 유지(공개 루트 신뢰)
-        self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
-
-    def test_make_client_passes_ca_path_and_proxy_directly(self):
-        # --ca-bundle → verify=<경로> 문자열 직접(실환경 확인 방식), proxy 도 명시 전달
+    def test_make_client_verify_false_default(self):
+        # _make_client 기본: httpx verify=False(검증 끔), proxy 주면 proxy= 직접
         import sys as _sys
         from types import SimpleNamespace
         cap = {}
@@ -7294,100 +7060,31 @@ class TestBedrockRunAdapter(unittest.TestCase):
             def __init__(self, **kw):
                 cap["client_kw"] = kw
         fake_httpx = SimpleNamespace(Client=_FakeHttpx)
-        fake_anth = SimpleNamespace(AnthropicBedrockMantle=_FakeClient,
-                                    AnthropicBedrock=_FakeClient)
+        fake_anth = SimpleNamespace(AnthropicBedrock=_FakeClient)
         with mock.patch.dict(_sys.modules, {"httpx": fake_httpx,
                                             "anthropic": fake_anth}):
-            self.mod._make_client("ap-northeast-2", ca_bundle="/x/ca.pem",
-                                  proxy="http://p:8080")
-        self.assertEqual(cap.get("verify"), "/x/ca.pem")   # SSLContext 아닌 경로 문자열
+            self.mod._make_client("ap-northeast-2", proxy="http://p:8080")
+        self.assertIs(cap.get("verify"), False)             # 기본 insecure
         self.assertEqual(cap.get("proxy"), "http://p:8080")
+        self.assertEqual(cap["client_kw"]["aws_region"], "ap-northeast-2")
 
-    def test_proxy_passed_explicitly_to_client(self):
-        # 프록시는 httpx.Client 에 '명시' 지정되게 _make_client 로 전달된다(env 아님)
-        from types import SimpleNamespace
-        calls, seen = [], {}
-
-        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
-            seen["proxy"] = proxy
-            return self._client(calls, [SimpleNamespace(type="text", text="ok")])
-        rc, _, _ = self._run(["--proxy", "http://proxy.corp:8080"], "q", factory)
-        self.assertEqual(rc, 0)
-        self.assertEqual(seen["proxy"], "http://proxy.corp:8080")   # 명시 전달
-
-    def test_insecure_flag_disables_verify(self):
-        # --insecure → _make_client 에 insecure=True 전달 + 경고 출력
-        from types import SimpleNamespace
-        calls, seen = [], {}
-
-        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
-            seen["insecure"] = insecure
-            return self._client(calls, [SimpleNamespace(type="text", text="ok")])
-        rc, _, err = self._run(["--insecure"], "q", factory)
-        self.assertEqual(rc, 0)
-        self.assertTrue(seen["insecure"])
-        self.assertIn("TLS 검증 비활성", err)          # 경고
-        # 기본은 insecure=False
-        rc, _, _ = self._run([], "q", factory)
-        self.assertFalse(seen["insecure"])
-
-    def test_ssl_context_prefers_truststore_when_available(self):
-        # truststore 가 임포트되면 그 SSLContext 를 쓴다(OS 검증, claude CLI 와 동일)
-        import ssl
-        import sys as _sys
-        sentinel = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-
-        class _FakeTruststore:
-            def SSLContext(self, proto):
-                return sentinel
-        with mock.patch.dict(_sys.modules, {"truststore": _FakeTruststore()}):
-            ctx = self.mod._ssl_context(None)
-        self.assertIs(ctx, sentinel)                   # truststore 컨텍스트 사용
-
-    def test_win_store_to_pem_none_when_empty(self):
-        # 저장소가 비면(비-Windows·읽기 실패) None — botocore 는 자체 번들로 폴백
-        self.assertIsNone(self.mod._win_store_to_pem(enum_win=lambda: []))
-        # 불량 DER 만 있으면 PEM 변환 실패로 None
-        self.assertIsNone(self.mod._win_store_to_pem(enum_win=lambda: [b"bad"]))
-
-    def test_der_ca_format_error_hints_conversion(self):
-        # DER(바이너리) CA 를 주면 로드 단계에서 'PEM lib' — 변환 안내가 나와야
-        with tempfile.NamedTemporaryFile("wb", suffix=".crt", delete=False) as fh:
-            fh.write(b"\x30\x82\x01\x0a")             # DER 바이트(파일은 존재)
-            ca_path = fh.name
-
-        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
-            raise Exception("[SSL] PEM lib (_ssl.c:4321)")
-        try:
-            rc, out, err = self._run(["--ca-bundle", ca_path], "q", factory)
-        finally:
-            os.unlink(ca_path)
-        self.assertEqual(rc, 1)
+    def test_empty_prompt_exits_2(self):
+        rc, out, err = self._run([], "   \n",
+                                 lambda r, proxy=None, insecure=False: self.fail("호출 금지"))
+        self.assertEqual(rc, 2)
         self.assertEqual(out, "")
-        self.assertIn("openssl x509 -inform der", err)  # DER→PEM 변환 명령
-        self.assertNotIn("사내 TLS 검사(프록시 CA)", err)  # 포맷 힌트만(중복 억제)
+        self.assertIn("빈 프롬프트", err)
 
-    def test_make_client_loads_pem_rejects_der(self):
-        # 실제 _make_client 로 CA 로드 경로 검증 — anthropic 없으면 스킵.
-        # PEM 은 SSLContext 생성까지 성공(그 뒤 anthropic 임포트에서 멈춤),
-        # DER 바이트는 그 전에 ssl.SSLError 로 실패한다.
-        try:
-            import ssl  # noqa: F401
-        except Exception:
-            self.skipTest("ssl 모듈 없음")
-        import ssl
-        # 자체 서명 CA PEM 1개 생성(외부 의존 없이 stdlib 로는 못 만드므로,
-        # PEM 파싱만 확인: 잘못된 PEM 은 SSLError, 형식만 보는 것으로 한정)
-        der = tempfile.NamedTemporaryFile("wb", suffix=".crt", delete=False)
-        der.write(b"\x30\x82\x01\x0a\x02\x82"); der.close()
-        try:
-            with self.assertRaises(ssl.SSLError):
-                ssl.create_default_context(cafile=der.name)  # DER → 로드 실패
-        finally:
-            os.unlink(der.name)
+    def test_call_failure_exits_1(self):
+        def factory(region, proxy=None, insecure=False):
+            raise Exception("boom")
+        rc, out, err = self._run([], "q", factory)
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, "")                           # 실패 시 stdout 오염 금지
+        self.assertIn("Bedrock 호출 실패", err)
 
-    def test_missing_sdk_exits_2_with_install_hint(self):
-        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
+    def test_missing_sdk_exits_2(self):
+        def factory(region, proxy=None, insecure=False):
             raise ModuleNotFoundError("No module named 'anthropic'")
         rc, _, err = self._run([], "q", factory)
         self.assertEqual(rc, 2)
@@ -7397,12 +7094,11 @@ class TestBedrockRunAdapter(unittest.TestCase):
         from types import SimpleNamespace
         calls = []
         rc, out, err = self._run(
-            [], "q", lambda r, ca_bundle=None, legacy=False, insecure=False, proxy=None: self._client(
+            [], "q", lambda r, proxy=None, insecure=False: self._client(
                 calls, [SimpleNamespace(type="tool_use", text="")]))
-        self.assertEqual(rc, 1)                       # ai_run 이 빈 응답=오류로 취급
+        self.assertEqual(rc, 1)
         self.assertEqual(out, "")
         self.assertIn("텍스트 블록 없음", err)
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
