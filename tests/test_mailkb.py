@@ -7227,7 +7227,8 @@ class TestBedrockRunAdapter(unittest.TestCase):
             raise Exception("SSL: CERTIFICATE_VERIFY_FAILED certificate verify failed")
         rc, _, err = self._run([], "q", factory)
         self.assertEqual(rc, 1)
-        self.assertIn("--ca-bundle", err)             # 사내 TLS 검사(CA) 처방
+        self.assertIn("Windows 인증서 저장소", err)    # OS 저장소 신뢰(claude CLI 동일)
+        self.assertIn("AWS_CA_BUNDLE", err)           # 자격증명 계층 처방
         self.assertIn("--proxy", err)                 # 명시 프록시 환경 함께 안내
         self.assertNotIn("openssl", err)              # 검증 실패는 포맷 문제 아님
 
@@ -7250,7 +7251,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
         self.assertEqual(seen["env"], ca_path)        # botocore 가 읽을 env 에 실림
 
     def test_ca_set_but_cert_fails_points_to_chain(self):
-        # CA 를 줬는데도 인증서 오류 → CA 자체(발급 체인) 문제로 안내
+        # CA 를 줬는데도 인증서 오류 → 발급 체인/자격증명 계층/프록시 후보 안내
         def factory(region, ca_bundle=None, legacy=False):
             raise Exception("SSLCertVerificationError: certificate verify failed: "
                             "unable to get local issuer certificate")
@@ -7262,8 +7263,28 @@ class TestBedrockRunAdapter(unittest.TestCase):
         finally:
             os.unlink(ca_path)
         self.assertEqual(rc, 1)
-        self.assertIn("양쪽에 적용됨", err)            # 두 계층 모두 적용했음을 알림
-        self.assertIn("발급 CA", err)                 # 그래도 실패면 체인 문제
+        self.assertIn("발급 체인", err)                # 루트+중간 전체 필요 안내
+        self.assertIn("AWS_CA_BUNDLE", err)           # 자격증명 계층 후보
+
+    def test_win_root_certs_empty_off_windows(self):
+        # 비-Windows 에서는 시스템 저장소 열거가 빈 리스트(플랫폼 가드)
+        if sys.platform == "win32":
+            self.skipTest("Windows 에서는 실제 저장소를 읽으므로 스킵")
+        self.assertEqual(self.mod._win_root_certs(), [])
+
+    def test_ssl_context_builds_and_skips_bad_certs(self):
+        # _ssl_context: 기본(공개/시스템 루트) 컨텍스트 생성 + 불량 DER 은 건너뜀
+        import ssl
+        ctx = self.mod._ssl_context(None, enum_win=lambda: [b"not-a-cert"])
+        self.assertIsInstance(ctx, ssl.SSLContext)
+        # ca_bundle 없이도 검증 모드는 유지(공개 루트 신뢰)
+        self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
+
+    def test_win_store_to_pem_none_when_empty(self):
+        # 저장소가 비면(비-Windows·읽기 실패) None — botocore 는 자체 번들로 폴백
+        self.assertIsNone(self.mod._win_store_to_pem(enum_win=lambda: []))
+        # 불량 DER 만 있으면 PEM 변환 실패로 None
+        self.assertIsNone(self.mod._win_store_to_pem(enum_win=lambda: [b"bad"]))
 
     def test_der_ca_format_error_hints_conversion(self):
         # DER(바이너리) CA 를 주면 로드 단계에서 'PEM lib' — 변환 안내가 나와야

@@ -18,13 +18,12 @@ ai_run 계약: 프롬프트를 stdin(utf-8)으로 받아 응답 텍스트만 std
 리전:   --region > AWS_REGION > 기본 ap-northeast-2(서울).
         config 오버라이드 = cmd 에 "--region", "<리전>" 을 덧붙인다.
 자격증명: 표준 AWS 체인(환경변수 → 프로필/SSO → 역할). SSO 는 `aws sso login` 선행.
-사내 TLS: 검사 프록시가 인증서를 재서명하면(CERTIFICATE_VERIFY_FAILED) 회사 CA 를
-        --ca-bundle 인자(권장) 또는 AWS_CA_BUNDLE/SSL_CERT_FILE/MAILKB_BEDROCK_CA
-        환경변수로 지정한다. 어댑터는 이 CA 를 자격증명 계층(botocore: SSO·STS —
-        AWS_CA_BUNDLE 만 읽음)과 Bedrock 호출(httpx — certifi 만 신뢰하므로 SSLContext
-        직접 구성) 양쪽에 적용하므로, config 의 --ca-bundle 하나면 Windows 영구
-        환경변수 상속 없이도 두 계층이 다 덮인다. 파일은 PEM(텍스트) — DER(바이너리)이면
-        `openssl x509 -inform der -in c.crt -out c.pem` 로 변환.
+사내 TLS: Windows 에서는 시스템 인증서 저장소(ROOT·CA — 회사 CA 가 GPO 로 배포됨,
+        claude CLI 가 쓰는 그것)를 신뢰 집합에 자동 추가하므로 보통 별도 설정이
+        필요 없다. 그래도 CERTIFICATE_VERIFY_FAILED 면 회사 CA PEM 을 --ca-bundle
+        (또는 AWS_CA_BUNDLE 등 환경변수)로 명시한다 — 어댑터가 httpx(Bedrock 호출)와
+        botocore(자격증명, AWS_CA_BUNDLE 만 읽음) 양쪽에 적용. 파일은 PEM(텍스트) —
+        DER(바이너리)이면 `openssl x509 -inform der -in c.crt -out c.pem` 로 변환.
 프록시: 사내 아웃바운드가 명시 프록시를 요구하면(pip 에 --proxy 가 필요한 환경) --proxy
         http://proxy.corp:8080 을 준다. 어댑터가 HTTPS_PROXY/HTTP_PROXY 로 env 에 실어
         httpx(Bedrock 호출)와 botocore(자격증명) 양쪽이 프록시를 타게 한다. 없으면
@@ -94,6 +93,72 @@ def _resolve_proxy(cli_proxy: str | None, env: dict | None = None):
     return None, None
 
 
+def _win_root_certs() -> list:
+    """Windows 시스템 인증서 저장소(ROOT·CA)의 CA 를 DER 로 반환.
+
+    회사 CA 는 보통 GPO 로 Windows ROOT 저장소에 배포된다 — claude CLI·브라우저가
+    이걸 신뢰해 동작한다. Python httpx 는 certifi(공개 루트)만 봐 이 저장소를
+    놓치므로, 여기서 명시적으로 긁어 온다. 비-Windows 는 빈 리스트."""
+    if sys.platform != "win32":
+        return []
+    import ssl
+    out = []
+    for store in ("ROOT", "CA"):
+        try:
+            for cert, enc, _trust in ssl.enum_certificates(store):
+                if enc == "x509_asn":            # DER 인코딩만
+                    out.append(cert)
+        except Exception:                        # 저장소 접근 실패는 무시(가능한 것만)
+            pass
+    return out
+
+
+def _win_store_to_pem(enum_win=None) -> str | None:
+    """Windows 저장소 CA 를 임시 PEM 파일로 내보내고 경로 반환(없으면 None).
+
+    botocore(자격증명 계층)는 우리 SSLContext 를 안 쓰고 AWS_CA_BUNDLE/자체 번들만
+    본다 — 이 PEM 을 AWS_CA_BUNDLE 로 지정하면 botocore 도 Windows 저장소의 회사
+    CA(claude CLI 가 쓰는 그것)를 신뢰한다. atexit 로 정리(호출당 파일 누적 방지)."""
+    import ssl
+    ders = _win_root_certs() if enum_win is None else enum_win()
+    pems = []
+    for der in ders:
+        try:
+            # DER_cert_to_PEM_cert 는 검증 없이 base64 만 함 → load 로 유효성 확인 후 변환
+            ssl.create_default_context().load_verify_locations(cadata=der)
+            pems.append(ssl.DER_cert_to_PEM_cert(der))
+        except (ssl.SSLError, ValueError, TypeError):
+            pass
+    if not pems:
+        return None
+    import atexit
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix=".pem", prefix="mailkb-winca-")
+    with os.fdopen(fd, "w", encoding="ascii") as f:
+        f.write("".join(pems))
+    atexit.register(lambda: os.path.exists(path) and os.remove(path))
+    return path
+
+
+def _ssl_context(ca_bundle: str | None = None, enum_win=None):
+    """신뢰 앵커 = 공개/시스템 루트 + Windows 저장소(회사 CA 포함) + 명시 --ca-bundle.
+
+    create_default_context(cafile=...)로 '그 CA 하나만' 신뢰하게 만들면 프록시
+    재서명 인증서의 체인이 하나라도 빠질 때 실패한다. 대신 기본 컨텍스트(공개·
+    시스템 루트)에 Windows 저장소와 회사 CA 를 '추가'해 claude CLI 와 같은 신뢰
+    집합을 만든다. enum_win 은 테스트용 주입(기본은 _win_root_certs)."""
+    import ssl
+    ctx = ssl.create_default_context()           # 공개 + (플랫폼) 시스템 루트
+    for der in (_win_root_certs() if enum_win is None else enum_win()):
+        try:
+            ctx.load_verify_locations(cadata=der)   # DER bytes = cadata
+        except ssl.SSLError:                     # 불량/중복 인증서는 건너뜀
+            pass
+    if ca_bundle:
+        ctx.load_verify_locations(cafile=ca_bundle)   # 명시 회사 CA(추가)
+    return ctx
+
+
 def _make_client(region: str, ca_bundle: str | None = None,
                  legacy: bool = False):
     """지연 임포트 — anthropic 미설치 환경에서도 모듈 임포트·테스트가 가능하게.
@@ -103,20 +168,17 @@ def _make_client(region: str, ca_bundle: str | None = None,
     api.aws)을 쓴다. 사내 방화벽이 .api.aws 를 막고 *.amazonaws.com 만 허용하면
     레거시가 필요하다. 두 클라이언트 모두 aws_region·http_client 를 받는다.
 
-    ca_bundle 이 주어지면 그 PEM 만 신뢰 앵커로 하는 httpx 클라이언트를 만들어
-    SDK 에 넘긴다(사내 TLS 검사 프록시가 재서명한 인증서 검증). httpx 는 기본적으로
-    certifi 만 신뢰해 SSL_CERT_FILE 환경변수를 항상 존중하진 않으므로, SSLContext 를
-    직접 구성해 httpx 버전에 무관하게 회사 CA 가 반드시 적용되게 한다."""
+    Windows 또는 --ca-bundle 지정 시 커스텀 SSLContext 를 쓴다 — httpx 는 certifi
+    만 신뢰해 Windows 저장소의 회사 CA(claude CLI 가 쓰는 그것)를 놓치므로, 그
+    저장소 + 명시 CA 를 신뢰 집합에 추가한다(_ssl_context)."""
     if legacy:
         from anthropic import AnthropicBedrock as _Client
     else:
         from anthropic import AnthropicBedrockMantle as _Client
     kw = {"aws_region": region}
-    if ca_bundle:
-        import ssl
+    if ca_bundle or sys.platform == "win32":
         import httpx
-        ctx = ssl.create_default_context(cafile=ca_bundle)  # 회사 CA 만 신뢰 앵커로
-        kw["http_client"] = httpx.Client(verify=ctx)
+        kw["http_client"] = httpx.Client(verify=_ssl_context(ca_bundle))
     return _Client(**kw)
 
 
@@ -160,6 +222,13 @@ def main(argv: list[str] | None = None) -> int:
         # 호출 두 계층을 다 덮는다(Windows 영구 환경변수 상속에 의존하지 않음).
         # anthropic/botocore 는 _make_client 안에서 지연 임포트되므로 여기 설정이 먼저.
         os.environ["AWS_CA_BUNDLE"] = ca
+    elif sys.platform == "win32" and not os.environ.get("AWS_CA_BUNDLE"):
+        # --ca-bundle 미지정 + Windows → 시스템 저장소를 임시 PEM 으로 내보내
+        # botocore 도 회사 CA 를 신뢰(httpx 는 _ssl_context 가 이미 저장소를 신뢰).
+        win_pem = _win_store_to_pem()
+        if win_pem:
+            os.environ["AWS_CA_BUNDLE"] = win_pem
+            ca_note = f"{win_pem} (Windows 저장소)"
 
     proxy, proxy_src = _resolve_proxy(args.proxy)
     proxy_note = f"{proxy} ({proxy_src})" if proxy else "미지정(직접 연결)"
@@ -217,19 +286,13 @@ def main(argv: list[str] | None = None) -> int:
                   "이어야 한다. DER(바이너리 .crt/.cer)이면 변환: "
                   "openssl x509 -inform der -in corp.crt -out corp.pem", file=sys.stderr)
         elif "ssl" in low or "certificate" in low:
-            print("사내 TLS 검사(프록시 CA) — 회사 CA(PEM)를 지정하라.", file=sys.stderr)
-            if ca:
-                # CA 를 이미 줬고 botocore 용 AWS_CA_BUNDLE 도 실었는데(위 CA 줄)도
-                # 실패 → CA 파일 자체가 프록시 발급 체인이 아니거나, 프록시 미경유로
-                # 다른(직접 경로) 인증서를 만난 것.
-                print("  · CA 는 양쪽에 적용됨(위 CA 줄). 그래도 실패면 (a) 그 CA 가 "
-                      "프록시의 실제 발급 CA/전체 체인이 아니거나 (b) 명시 프록시 미경유 "
-                      "— pip 에 --proxy 가 필요한 환경이면 --proxy 도 함께 지정하라.",
-                      file=sys.stderr)
-            else:
-                print("  · --ca-bundle 로 회사 CA(PEM)를, 명시 프록시 환경이면 "
-                      "--proxy 도 함께 지정하라(어댑터가 양쪽 계층에 적용).",
-                      file=sys.stderr)
+            print("인증서 검증 실패 — Windows 인증서 저장소 + 회사 CA 를 신뢰하는데도 "
+                  "실패했다(claude CLI 와 같은 신뢰 집합).", file=sys.stderr)
+            print("  · 남은 원인 후보: (a) botocore(자격증명 계층)가 별도 경로로 "
+                  "인증서 검증에 실패 — AWS_CA_BUNDLE 로 회사 CA 지정 (b) 그 CA 가 "
+                  "프록시 발급 체인의 루트+중간 전체가 아님 (c) 명시 프록시 미경유 "
+                  "— pip 에 --proxy 가 필요한 환경이면 --proxy 함께 지정.",
+                  file=sys.stderr)
         elif any(k in low for k in ("connect", "getaddrinfo", "timed out",
                                     "timeout", "proxy", "unreachable")):
             print("네트워크 경로 문제 — ① --proxy(사내 명시 프록시, pip --proxy 필요 "
