@@ -918,30 +918,32 @@ class Store:
         return row["value"] if row else None
 
     def ingest(self, records, progress=None,
-               image_cutoff: str | None = None) -> SyncStats:
+               image_cutoff: str | None = None,
+               chunk_size: int = 100) -> SyncStats:
         """MailRecord 스트림을 인덱싱. 시간순 입력을 가정.
 
         progress(stats) 가 주어지면 레코드마다 호출된다(CLI 라이브 카운터용).
         image_cutoff(YYYY-MM-DD): 이 날짜 이전 메일은 인라인 이미지를 임베드하지
         않는다(대량 백필에서 곧 프룬될 이미지 낭비 방지). None 이면 게이트 없음.
+
+        chunk_size: 이 통수마다 커밋해 쓰기 잠금을 놓는다. 배치 전체를 한
+        트랜잭션으로 묶으면 Outlook COM fetch(제너레이터)가 트랜잭션 안에서 도는
+        동안(수십 초) 잠금을 쥐어, UI 쓰기(플래그·숨김·신호 토글)가 busy_timeout
+        후 'database is locked' 로 실패한다. **불변식: 청크 커밋마다 어휘 피처와
+        last_sync 워터마크를 함께 커밋한다** — 크래시가 나도 정합적 prefix 만
+        남고 다음 sync 가 이어받는다(message_id UNIQUE 로 멱등). 이렇게 쪼갠 ingest
+        는 '작은 sync 를 N 번 연속 실행'과 동일하다(증분 경로 상시 사용과 같은 계약).
         """
         stats = SyncStats()
         max_seen = self.last_sync() or ""
         self._pending_term_ids: list[int] = []
-        try:
-            for rec in records:
-                stats.fetched += 1
-                if self._insert(rec, stats, image_cutoff):
-                    stats.inserted += 1
-                else:
-                    stats.skipped += 1
-                if rec.sent_on > max_seen:
-                    max_seen = rec.sent_on
-                if progress:
-                    progress(stats)
+
+        def _flush() -> None:
+            # 파생 어휘(피처·bag) 동기화 + 워터마크 전진을 한 커밋으로 — 이 셋이
+            # 같은 트랜잭션이라야 크래시에도 커밋된 메일이 어휘·워터마크와 어긋나지 않음.
             self._sync_term_features(self._pending_term_ids)
             self._sync_term_bags(self._pending_term_ids)
-            self._word_background_cache.clear()
+            self._pending_term_ids = []
             if max_seen:
                 self.db.execute(
                     "INSERT INTO sync_state(key, value) VALUES('last_sync', ?) "
@@ -949,9 +951,28 @@ class Store:
                     (max_seen,),
                 )
             self.db.commit()
+
+        try:
+            since_commit = 0
+            for rec in records:
+                stats.fetched += 1
+                if self._insert(rec, stats, image_cutoff):
+                    stats.inserted += 1
+                    since_commit += 1
+                else:
+                    stats.skipped += 1
+                if rec.sent_on > max_seen:
+                    max_seen = rec.sent_on
+                if progress:
+                    progress(stats)
+                if chunk_size and since_commit >= chunk_size:
+                    _flush()                  # 잠금 해제 지점 — UI 쓰기가 끼어들 수 있음
+                    since_commit = 0
+            _flush()                          # 잔여 + 워터마크·버전 스탬프(0통이어도)
+            self._word_background_cache.clear()
             return stats
         except Exception:
-            self.db.rollback()
+            self.db.rollback()                # 미커밋 청크만 되돌림(앞 청크는 유지)
             raise
 
     def _insert(self, rec: MailRecord, stats: SyncStats,

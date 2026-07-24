@@ -585,6 +585,79 @@ class TestStore(unittest.TestCase):
         ])
         self.assertEqual(self.store.stats()["threads"], 1)
 
+    # ── 청크 커밋(잠금 완화) — 결과 불변 + 크래시 정합성 ──
+    @staticmethod
+    def _corpus(n=7):
+        # 여러 발신자·날짜에 걸친 수신 메일(어휘 피처가 실제로 쌓이게 본문 있음)
+        recs = []
+        for i in range(n):
+            who = ("kim@c", "lee@c", "park@c")[i % 3]
+            recs.append(_rec(
+                f"k{i}", who, [ME], f"검토 요청 {i}",
+                f"2026-07-{(i % 27) + 1:02d}T09:{i % 60:02d}:00",
+                body=f"양자화 커널 검토 부탁드립니다 사안{i}"))
+        return recs
+
+    def _term_snapshot(self, store):
+        # 파생 어휘 테이블 전체 덤프 — 청크 여부와 무관하게 동일해야 한다
+        snap = {}
+        for tbl in ("message_term_features", "message_term_bags",
+                    "message_term_subject_delta", "person_term_window"):
+            snap[tbl] = sorted(
+                tuple(r) for r in store.db.execute(f"SELECT * FROM {tbl}"))
+        snap["last_sync"] = store.last_sync()
+        snap["messages"] = store.db.execute(
+            "SELECT COUNT(*) FROM messages").fetchone()[0]
+        return snap
+
+    def test_chunked_ingest_matches_single_commit(self):
+        # 청크 커밋(chunk_size=2)이 단일 커밋(큰 chunk)과 최종 상태 동일 — 결과 불변
+        recs = self._corpus(7)
+        self.store.ingest(list(recs), chunk_size=1000)   # 사실상 1회 커밋
+        base = self._term_snapshot(self.store)
+
+        tmp2 = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp2.cleanup)
+        s2 = Store(Path(tmp2.name) / "t2.sqlite", [ME])
+        self.addCleanup(s2.close)
+        s2.ingest(list(recs), chunk_size=2)              # 여러 번 flush
+        self.assertEqual(self._term_snapshot(s2), base)
+
+    def test_chunked_ingest_equals_consecutive_syncs(self):
+        # 청크 ingest ≡ 작은 sync 를 연속 실행 (불변식 직접 검증)
+        recs = self._corpus(6)
+        self.store.ingest(list(recs), chunk_size=2)
+        chunked = self._term_snapshot(self.store)
+
+        tmp2 = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp2.cleanup)
+        s2 = Store(Path(tmp2.name) / "t2.sqlite", [ME])
+        self.addCleanup(s2.close)
+        for pos in range(0, len(recs), 2):               # 2통씩 별도 sync
+            s2.ingest(list(recs[pos:pos + 2]), chunk_size=1000)
+        self.assertEqual(self._term_snapshot(s2), chunked)
+
+    def test_chunked_ingest_crash_leaves_consistent_prefix(self):
+        # 배치 도중 예외 → 완료된 청크는 커밋·워터마크 전진, 미완 청크만 롤백
+        recs = self._corpus(4)
+
+        def gen():
+            for r in recs:            # 2통씩 flush → rec0..3 커밋 후
+                yield r
+            raise RuntimeError("COM 끊김 흉내")   # 그 다음 통에서 크래시
+
+        with self.assertRaises(RuntimeError):
+            self.store.ingest(gen(), chunk_size=2)
+        # 완료된 청크(4통)는 살아남고 워터마크도 그만큼 전진(다음 sync 가 이어받음)
+        self.assertEqual(self.store.db.execute(
+            "SELECT COUNT(*) FROM messages").fetchone()[0], 4)
+        self.assertEqual(self.store.last_sync(), recs[2].sent_on
+                         if recs[2].sent_on > recs[3].sent_on else recs[3].sent_on)
+        # 커밋된 메일은 어휘 피처도 갖춤(부분집합 누락 없음)
+        feat = self.store.db.execute(
+            "SELECT COUNT(*) FROM message_term_features").fetchone()[0]
+        self.assertEqual(feat, 4)
+
     def test_threads_last_date_index(self):
         # 스레드 목록 정렬용 인덱스 존재 + 플래너가 실제 사용(전수 스캔+임시정렬 회피)
         idx = {r["name"] for r in self.store.db.execute(
