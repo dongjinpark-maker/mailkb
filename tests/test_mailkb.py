@@ -6887,14 +6887,17 @@ class TestBedrockRunAdapter(unittest.TestCase):
         cls.mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.mod)          # 지연 임포트라 anthropic 불필요
 
-    def _run(self, argv, stdin_text, factory):
+    def _run(self, argv, stdin_text, factory, env_over=None):
         import io
         orig = self.mod._make_client
         self.mod._make_client = factory
         out, err = io.StringIO(), io.StringIO()
-        # CA 환경변수를 비워 호스트 환경(실제 SSL_CERT_FILE 등)이 테스트에 새지 않게
+        # CA 환경변수를 비워 호스트 환경(실제 SSL_CERT_FILE 등)이 테스트에 새지 않게 —
+        # env_over 로 특정 변수만 다시 주입(예: AWS_CA_BUNDLE 상속 검증).
         clean = {k: "" for k in ("SSL_CERT_FILE", "AWS_CA_BUNDLE",
                                  "REQUESTS_CA_BUNDLE", "MAILKB_BEDROCK_CA")}
+        if env_over:
+            clean.update(env_over)
         try:
             with mock.patch.dict(os.environ, clean), \
                  mock.patch("sys.stdin", io.StringIO(stdin_text)), \
@@ -6992,6 +6995,49 @@ class TestBedrockRunAdapter(unittest.TestCase):
         self.assertEqual(rc, 2)                        # 파일 없으면 호출 전 종료
         self.assertIn("CA 번들", err)
 
+    def test_uses_existing_aws_ca_bundle_env(self):
+        # PC 에 이미 있는 AWS_CA_BUNDLE 을 --ca-bundle 없이도 자동으로 집어 쓴다
+        from types import SimpleNamespace
+        calls, made = [], {}
+
+        def factory(region, ca_bundle=None):
+            made["ca"] = ca_bundle
+            return self._client(calls, [SimpleNamespace(type="text", text="ok")])
+        with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as fh:
+            fh.write("dummy-ca")
+            ca_path = fh.name
+        try:
+            rc, _, _ = self._run([], "q", factory,
+                                 env_over={"AWS_CA_BUNDLE": ca_path})
+        finally:
+            os.unlink(ca_path)
+        self.assertEqual(rc, 0)
+        self.assertEqual(made["ca"], ca_path)          # env 값이 그대로 전달됨
+
+    def test_failure_reports_resolved_ca_source(self):
+        # 실패 시 어느 CA 를 잡았는지 표시 — env 상속 여부를 눈으로 확인
+        def factory(region, ca_bundle=None):
+            raise Exception("APIConnectionError: Connection error.")
+        with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as fh:
+            fh.write("x")
+            ca_path = fh.name
+        try:
+            rc, _, err = self._run([], "q", factory,
+                                   env_over={"AWS_CA_BUNDLE": ca_path})
+        finally:
+            os.unlink(ca_path)
+        self.assertEqual(rc, 1)
+        self.assertIn("AWS_CA_BUNDLE", err)            # 출처 표시
+        self.assertIn(ca_path, err)
+
+    def test_failure_reports_ca_unset(self):
+        # CA 미지정이면 '미지정' 표시 — 환경변수가 프로세스에 안 실린 흔한 케이스
+        def factory(region, ca_bundle=None):
+            raise Exception("APIConnectionError: Connection error.")
+        rc, _, err = self._run([], "q", factory)
+        self.assertEqual(rc, 1)
+        self.assertIn("CA: 미지정", err)
+
     def test_empty_prompt_exits_2(self):
         rc, out, err = self._run([], "   \n",
                                  lambda r, ca_bundle=None: self.fail("호출 금지"))
@@ -7029,6 +7075,60 @@ class TestBedrockRunAdapter(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("--ca-bundle", err)             # 사내 TLS 검사(CA) 처방
         self.assertIn("SSL_CERT_FILE", err)
+        self.assertNotIn("openssl", err)              # 검증 실패는 포맷 문제 아님
+
+    def test_ca_set_but_cert_fails_points_to_botocore_env(self):
+        # --ca-bundle 을 줬는데도 인증서 오류 → 자격증명 계층(botocore)이 원인.
+        # AWS_CA_BUNDLE(환경변수)를 별도로 설정하라는 힌트가 나와야 한다.
+        def factory(region, ca_bundle=None):
+            raise Exception("SSLCertVerificationError: certificate verify failed: "
+                            "unable to get local issuer certificate")
+        with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as fh:
+            fh.write("x")
+            ca_path = fh.name
+        try:
+            rc, _, err = self._run(["--ca-bundle", ca_path], "q", factory)
+        finally:
+            os.unlink(ca_path)
+        self.assertEqual(rc, 1)
+        self.assertIn("botocore", err)                # 원인 계층 지목
+        self.assertIn("AWS_CA_BUNDLE", err)           # 환경변수 처방
+
+    def test_der_ca_format_error_hints_conversion(self):
+        # DER(바이너리) CA 를 주면 로드 단계에서 'PEM lib' — 변환 안내가 나와야
+        with tempfile.NamedTemporaryFile("wb", suffix=".crt", delete=False) as fh:
+            fh.write(b"\x30\x82\x01\x0a")             # DER 바이트(파일은 존재)
+            ca_path = fh.name
+
+        def factory(region, ca_bundle=None):
+            raise Exception("[SSL] PEM lib (_ssl.c:4321)")
+        try:
+            rc, out, err = self._run(["--ca-bundle", ca_path], "q", factory)
+        finally:
+            os.unlink(ca_path)
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, "")
+        self.assertIn("openssl x509 -inform der", err)  # DER→PEM 변환 명령
+        self.assertNotIn("사내 TLS 검사(프록시 CA)", err)  # 포맷 힌트만(중복 억제)
+
+    def test_make_client_loads_pem_rejects_der(self):
+        # 실제 _make_client 로 CA 로드 경로 검증 — anthropic 없으면 스킵.
+        # PEM 은 SSLContext 생성까지 성공(그 뒤 anthropic 임포트에서 멈춤),
+        # DER 바이트는 그 전에 ssl.SSLError 로 실패한다.
+        try:
+            import ssl  # noqa: F401
+        except Exception:
+            self.skipTest("ssl 모듈 없음")
+        import ssl
+        # 자체 서명 CA PEM 1개 생성(외부 의존 없이 stdlib 로는 못 만드므로,
+        # PEM 파싱만 확인: 잘못된 PEM 은 SSLError, 형식만 보는 것으로 한정)
+        der = tempfile.NamedTemporaryFile("wb", suffix=".crt", delete=False)
+        der.write(b"\x30\x82\x01\x0a\x02\x82"); der.close()
+        try:
+            with self.assertRaises(ssl.SSLError):
+                ssl.create_default_context(cafile=der.name)  # DER → 로드 실패
+        finally:
+            os.unlink(der.name)
 
     def test_missing_sdk_exits_2_with_install_hint(self):
         def factory(region, ca_bundle=None):

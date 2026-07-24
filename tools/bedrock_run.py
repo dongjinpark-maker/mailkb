@@ -14,9 +14,11 @@ ai_run 계약: 프롬프트를 stdin(utf-8)으로 받아 응답 텍스트만 std
 리전:   --region > AWS_REGION > 기본 ap-northeast-2(서울).
         config 오버라이드 = cmd 에 "--region", "<리전>" 을 덧붙인다.
 자격증명: 표준 AWS 체인(환경변수 → 프로필/SSO → 역할). SSO 는 `aws sso login` 선행.
-사내 TLS: 검사 프록시가 인증서를 재서명하면(CERTIFICATE_VERIFY_FAILED) 회사 CA PEM 을
+사내 TLS: 검사 프록시가 인증서를 재서명하면(CERTIFICATE_VERIFY_FAILED) 회사 CA 를
         --ca-bundle 인자 또는 SSL_CERT_FILE/MAILKB_BEDROCK_CA/AWS_CA_BUNDLE 환경변수로
-        지정한다. httpx 는 certifi 만 신뢰하므로 이 어댑터가 SSLContext 를 직접 구성한다.
+        지정한다. 파일은 PEM(텍스트) 이어야 하며 .crt/.pem/.cer 확장자는 무관 — DER
+        (바이너리)이면 `openssl x509 -inform der -in c.crt -out c.pem` 로 변환한다.
+        httpx 는 certifi 만 신뢰하므로 이 어댑터가 SSLContext 를 직접 구성한다.
 """
 from __future__ import annotations
 
@@ -38,16 +40,27 @@ def resolve_region(cli_region: str | None, env: dict | None = None) -> str:
     return cli_region or e.get("AWS_REGION") or DEFAULT_REGION
 
 
-def resolve_ca_bundle(cli_ca: str | None, env: dict | None = None) -> str | None:
-    """사내 TLS 검사 프록시용 CA PEM 경로 해석.
-    --ca-bundle > MAILKB_BEDROCK_CA > SSL_CERT_FILE > AWS_CA_BUNDLE >
-    REQUESTS_CA_BUNDLE. 빈 문자열은 미지정으로 취급(없으면 None)."""
+# CA 탐색 환경변수 순서(--ca-bundle 다음). AWS_CA_BUNDLE 은 botocore(자격증명
+# 계층)도 네이티브로 읽으므로, 이 하나만 설정하면 자격증명·Bedrock 호출 양쪽을 덮는다.
+_CA_ENV_ORDER = ("MAILKB_BEDROCK_CA", "SSL_CERT_FILE",
+                 "AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE")
+
+
+def _resolve_ca(cli_ca: str | None, env: dict | None = None):
+    """(경로, 출처) — 출처는 '--ca-bundle' 또는 환경변수명(진단용). 빈 문자열은 미지정."""
     e = os.environ if env is None else env
-    for v in (cli_ca, e.get("MAILKB_BEDROCK_CA"), e.get("SSL_CERT_FILE"),
-              e.get("AWS_CA_BUNDLE"), e.get("REQUESTS_CA_BUNDLE")):
+    if cli_ca:
+        return cli_ca, "--ca-bundle"
+    for name in _CA_ENV_ORDER:
+        v = e.get(name)
         if v:
-            return v
-    return None
+            return v, name
+    return None, None
+
+
+def resolve_ca_bundle(cli_ca: str | None, env: dict | None = None) -> str | None:
+    """사내 TLS 검사 프록시용 CA PEM 경로. 순서: _CA_ENV_ORDER 참조."""
+    return _resolve_ca(cli_ca, env)[0]
 
 
 def _make_client(region: str, ca_bundle: str | None = None):
@@ -90,9 +103,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     region = resolve_region(args.region)
-    ca = resolve_ca_bundle(args.ca_bundle)
+    ca, ca_src = _resolve_ca(args.ca_bundle)
+    ca_note = f"{ca} ({ca_src})" if ca else "미지정(기본 certifi)"
     if ca and not os.path.isfile(ca):
-        print(f"CA 번들 파일을 찾을 수 없음: {ca}", file=sys.stderr)
+        print(f"CA 번들 파일을 찾을 수 없음: {ca} ({ca_src})", file=sys.stderr)
         return 2
     try:
         client = _make_client(region, ca)
@@ -114,13 +128,31 @@ def main(argv: list[str] | None = None) -> int:
             cur = cur.__cause__ or cur.__context__
         print(f"Bedrock 호출 실패({region}): " + " <- ".join(chain),
               file=sys.stderr)
+        print(f"CA: {ca_note}", file=sys.stderr)   # 어느 CA 를 잡았는지(미지정이면 상속 문제)
         low = " ".join(chain).lower()
         if any(k in low for k in _CRED_HINTS):
             print("자격증명 문제로 보임 — aws sso login(또는 키/프로필 설정) 후 재시도",
                   file=sys.stderr)
-        if "ssl" in low or "certificate" in low:
-            print("사내 TLS 검사(프록시 CA) — 회사 CA PEM 을 --ca-bundle 인자나 "
-                  "SSL_CERT_FILE/MAILKB_BEDROCK_CA 환경변수로 지정", file=sys.stderr)
+        if any(k in low for k in ("pem lib", "no start line",
+                                  "unable to load certificate")):
+            # CA 파일을 열긴 했으나 파싱 실패 — 보통 DER(바이너리) .crt/.cer 를 준 경우.
+            print("CA 파일을 읽지 못함 — PEM(텍스트, '-----BEGIN CERTIFICATE-----')"
+                  "이어야 한다. DER(바이너리 .crt/.cer)이면 변환: "
+                  "openssl x509 -inform der -in corp.crt -out corp.pem", file=sys.stderr)
+        elif "ssl" in low or "certificate" in low:
+            print("사내 TLS 검사(프록시 CA) — 회사 CA(PEM)를 지정하라.", file=sys.stderr)
+            if ca:
+                # CA 를 이미 줬는데도 인증서 오류 → 이 계층이 아니라 자격증명 계층에서
+                # 난 것. --ca-bundle 은 Bedrock 호출(httpx)에만 적용되고, botocore
+                # (SSO·STS)는 AWS_CA_BUNDLE 환경변수를 별도로 읽는다.
+                print("  · Bedrock 호출용 CA 는 적용됨(위 CA 줄). 그래도 실패하면 "
+                      "자격증명 계층(botocore: SSO·STS)이 별도로 AWS_CA_BUNDLE "
+                      "환경변수를 요구한다 — 같은 CA 를 AWS_CA_BUNDLE 로도 설정하고 "
+                      "프로세스를 재시작하라.", file=sys.stderr)
+            else:
+                print("  · --ca-bundle 인자 또는 AWS_CA_BUNDLE/SSL_CERT_FILE "
+                      "환경변수로 지정(AWS_CA_BUNDLE 은 자격증명·호출 양쪽을 덮음).",
+                      file=sys.stderr)
         elif any(k in low for k in ("connect", "getaddrinfo", "timed out",
                                     "timeout", "proxy", "unreachable")):
             print("네트워크 경로 문제 — ① HTTPS_PROXY 환경변수(사내 프록시) "
