@@ -7008,7 +7008,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
         from types import SimpleNamespace
         calls, made = [], {}
 
-        def factory(region, ca_bundle=None, legacy=False):
+        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
             made["region"], made["ca"] = region, ca_bundle
             return self._client(calls, [SimpleNamespace(type="text", text="응답")])
         with mock.patch.dict(os.environ, {"AWS_REGION": ""}):
@@ -7029,7 +7029,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
         from types import SimpleNamespace
         calls, made = [], {}
 
-        def factory(region, ca_bundle=None, legacy=False):
+        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
             made["region"] = region
             return self._client(calls, [SimpleNamespace(type="text", text="ok")])
         rc, _, _ = self._run(["--region", "us-west-2"], "q", factory)
@@ -7052,7 +7052,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
         from types import SimpleNamespace
         calls, seen = [], {}
 
-        def factory(region, ca_bundle=None, legacy=False):
+        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
             seen["https"] = os.environ.get("HTTPS_PROXY")
             seen["http"] = os.environ.get("HTTP_PROXY")
             return self._client(calls, [SimpleNamespace(type="text", text="ok")])
@@ -7063,7 +7063,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
         self.assertEqual(seen["http"], "http://proxy.corp:8080")
 
     def test_failure_reports_proxy(self):
-        def factory(region, ca_bundle=None, legacy=False):
+        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
             raise Exception("APIConnectionError: Connection error.")
         rc, _, err = self._run(["--proxy", "http://proxy.corp:8080"], "q", factory,
                                env_over={"HTTPS_PROXY": "", "HTTP_PROXY": ""})
@@ -7072,7 +7072,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
         self.assertIn("--proxy", err)               # 힌트에도 프록시 언급
 
     def test_failure_reports_proxy_unset(self):
-        def factory(region, ca_bundle=None, legacy=False):
+        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
             raise Exception("APIConnectionError: Connection error.")
         rc, _, err = self._run([], "q", factory,
                                env_over={"HTTPS_PROXY": "", "HTTP_PROXY": ""})
@@ -7083,7 +7083,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
         from types import SimpleNamespace
         calls, made = [], {}
 
-        def factory(region, ca_bundle=None, legacy=False):
+        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
             made["legacy"] = legacy
             return self._client(calls, [SimpleNamespace(type="text", text="ok")])
         rc, _, _ = self._run(["--legacy"], "q", factory)
@@ -7094,7 +7094,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
         self.assertFalse(made["legacy"])              # 기본 → Mantle
 
     def test_legacy_inference_profile_hint(self):
-        def factory(region, ca_bundle=None, legacy=False):
+        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
             raise Exception(
                 "Invocation of model ID anthropic.claude-sonnet-5 with on-demand "
                 "throughput isn't supported. Retry your request with the ID or ARN "
@@ -7108,7 +7108,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
 
     def test_mantle_connect_fail_suggests_legacy(self):
         # 신 엔드포인트(.api.aws) 연결 실패 → --legacy 재시도 안내
-        def factory(region, ca_bundle=None, legacy=False):
+        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
             raise Exception("APIConnectionError: Connection error.")
         rc, _, err = self._run([], "q", factory)
         self.assertEqual(rc, 1)
@@ -7130,7 +7130,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
         from types import SimpleNamespace
         calls, made = [], {}
 
-        def factory(region, ca_bundle=None, legacy=False):
+        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
             made["ca"] = ca_bundle
             return self._client(calls, [SimpleNamespace(type="text", text="ok")])
         with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as fh:
@@ -7145,7 +7145,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
 
     def test_ca_bundle_missing_file_exits_2(self):
         rc, _, err = self._run(["--ca-bundle", "/no/such/ca.pem"], "q",
-                               lambda r, ca_bundle=None, legacy=False: self.fail("호출 금지"))
+                               lambda r, ca_bundle=None, legacy=False, insecure=False, proxy=None: self.fail("호출 금지"))
         self.assertEqual(rc, 2)                        # 파일 없으면 호출 전 종료
         self.assertIn("CA 번들", err)
 
@@ -7154,7 +7154,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
         from types import SimpleNamespace
         calls, made = [], {}
 
-        def factory(region, ca_bundle=None, legacy=False):
+        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
             made["ca"] = ca_bundle
             return self._client(calls, [SimpleNamespace(type="text", text="ok")])
         with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as fh:
@@ -7170,7 +7170,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
 
     def test_failure_reports_resolved_ca_source(self):
         # 실패 시 어느 CA 를 잡았는지 표시 — env 상속 여부를 눈으로 확인
-        def factory(region, ca_bundle=None, legacy=False):
+        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
             raise Exception("APIConnectionError: Connection error.")
         with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as fh:
             fh.write("x")
@@ -7186,7 +7186,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
 
     def test_failure_reports_ca_unset(self):
         # CA 미지정이면 '미지정' 표시 — 환경변수가 프로세스에 안 실린 흔한 케이스
-        def factory(region, ca_bundle=None, legacy=False):
+        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
             raise Exception("APIConnectionError: Connection error.")
         rc, _, err = self._run([], "q", factory)
         self.assertEqual(rc, 1)
@@ -7194,13 +7194,13 @@ class TestBedrockRunAdapter(unittest.TestCase):
 
     def test_empty_prompt_exits_2(self):
         rc, out, err = self._run([], "   \n",
-                                 lambda r, ca_bundle=None, legacy=False: self.fail("호출 금지"))
+                                 lambda r, ca_bundle=None, legacy=False, insecure=False, proxy=None: self.fail("호출 금지"))
         self.assertEqual(rc, 2)
         self.assertEqual(out, "")
         self.assertIn("빈 프롬프트", err)
 
     def test_credential_error_hints_sso_login(self):
-        def factory(region, ca_bundle=None, legacy=False):
+        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
             raise Exception("ExpiredTokenException: security token is expired")
         rc, out, err = self._run([], "q", factory)
         self.assertEqual(rc, 1)
@@ -7209,7 +7209,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
 
     def test_connection_error_unwraps_chain_and_hints(self):
         # APIConnectionError 는 원인(SSL·프록시·DNS)을 감싼다 — 체인 노출 + 힌트
-        def factory(region, ca_bundle=None, legacy=False):
+        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
             root = OSError("getaddrinfo failed")
             mid = ConnectionError("All connection attempts failed")
             mid.__cause__ = root
@@ -7223,7 +7223,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
         self.assertIn("api.aws", err)
 
     def test_ssl_error_hints_corporate_ca(self):
-        def factory(region, ca_bundle=None, legacy=False):
+        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
             raise Exception("SSL: CERTIFICATE_VERIFY_FAILED certificate verify failed")
         rc, _, err = self._run([], "q", factory)
         self.assertEqual(rc, 1)
@@ -7237,7 +7237,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
         from types import SimpleNamespace
         calls, seen = [], {}
 
-        def factory(region, ca_bundle=None, legacy=False):
+        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
             seen["env"] = os.environ.get("AWS_CA_BUNDLE")   # _make_client 시점의 env
             return self._client(calls, [SimpleNamespace(type="text", text="ok")])
         with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as fh:
@@ -7252,7 +7252,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
 
     def test_ca_set_but_cert_fails_points_to_chain(self):
         # CA 를 줬는데도 인증서 오류 → 발급 체인/자격증명 계층/프록시 후보 안내
-        def factory(region, ca_bundle=None, legacy=False):
+        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
             raise Exception("SSLCertVerificationError: certificate verify failed: "
                             "unable to get local issuer certificate")
         with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as fh:
@@ -7280,6 +7280,70 @@ class TestBedrockRunAdapter(unittest.TestCase):
         # ca_bundle 없이도 검증 모드는 유지(공개 루트 신뢰)
         self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
 
+    def test_make_client_passes_ca_path_and_proxy_directly(self):
+        # --ca-bundle → verify=<경로> 문자열 직접(실환경 확인 방식), proxy 도 명시 전달
+        import sys as _sys
+        from types import SimpleNamespace
+        cap = {}
+
+        class _FakeHttpx:
+            def __init__(self, **kw):
+                cap.update(kw)
+
+        class _FakeClient:
+            def __init__(self, **kw):
+                cap["client_kw"] = kw
+        fake_httpx = SimpleNamespace(Client=_FakeHttpx)
+        fake_anth = SimpleNamespace(AnthropicBedrockMantle=_FakeClient,
+                                    AnthropicBedrock=_FakeClient)
+        with mock.patch.dict(_sys.modules, {"httpx": fake_httpx,
+                                            "anthropic": fake_anth}):
+            self.mod._make_client("ap-northeast-2", ca_bundle="/x/ca.pem",
+                                  proxy="http://p:8080")
+        self.assertEqual(cap.get("verify"), "/x/ca.pem")   # SSLContext 아닌 경로 문자열
+        self.assertEqual(cap.get("proxy"), "http://p:8080")
+
+    def test_proxy_passed_explicitly_to_client(self):
+        # 프록시는 httpx.Client 에 '명시' 지정되게 _make_client 로 전달된다(env 아님)
+        from types import SimpleNamespace
+        calls, seen = [], {}
+
+        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
+            seen["proxy"] = proxy
+            return self._client(calls, [SimpleNamespace(type="text", text="ok")])
+        rc, _, _ = self._run(["--proxy", "http://proxy.corp:8080"], "q", factory)
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen["proxy"], "http://proxy.corp:8080")   # 명시 전달
+
+    def test_insecure_flag_disables_verify(self):
+        # --insecure → _make_client 에 insecure=True 전달 + 경고 출력
+        from types import SimpleNamespace
+        calls, seen = [], {}
+
+        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
+            seen["insecure"] = insecure
+            return self._client(calls, [SimpleNamespace(type="text", text="ok")])
+        rc, _, err = self._run(["--insecure"], "q", factory)
+        self.assertEqual(rc, 0)
+        self.assertTrue(seen["insecure"])
+        self.assertIn("TLS 검증 비활성", err)          # 경고
+        # 기본은 insecure=False
+        rc, _, _ = self._run([], "q", factory)
+        self.assertFalse(seen["insecure"])
+
+    def test_ssl_context_prefers_truststore_when_available(self):
+        # truststore 가 임포트되면 그 SSLContext 를 쓴다(OS 검증, claude CLI 와 동일)
+        import ssl
+        import sys as _sys
+        sentinel = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+        class _FakeTruststore:
+            def SSLContext(self, proto):
+                return sentinel
+        with mock.patch.dict(_sys.modules, {"truststore": _FakeTruststore()}):
+            ctx = self.mod._ssl_context(None)
+        self.assertIs(ctx, sentinel)                   # truststore 컨텍스트 사용
+
     def test_win_store_to_pem_none_when_empty(self):
         # 저장소가 비면(비-Windows·읽기 실패) None — botocore 는 자체 번들로 폴백
         self.assertIsNone(self.mod._win_store_to_pem(enum_win=lambda: []))
@@ -7292,7 +7356,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
             fh.write(b"\x30\x82\x01\x0a")             # DER 바이트(파일은 존재)
             ca_path = fh.name
 
-        def factory(region, ca_bundle=None, legacy=False):
+        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
             raise Exception("[SSL] PEM lib (_ssl.c:4321)")
         try:
             rc, out, err = self._run(["--ca-bundle", ca_path], "q", factory)
@@ -7323,7 +7387,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
             os.unlink(der.name)
 
     def test_missing_sdk_exits_2_with_install_hint(self):
-        def factory(region, ca_bundle=None, legacy=False):
+        def factory(region, ca_bundle=None, legacy=False, insecure=False, proxy=None):
             raise ModuleNotFoundError("No module named 'anthropic'")
         rc, _, err = self._run([], "q", factory)
         self.assertEqual(rc, 2)
@@ -7333,7 +7397,7 @@ class TestBedrockRunAdapter(unittest.TestCase):
         from types import SimpleNamespace
         calls = []
         rc, out, err = self._run(
-            [], "q", lambda r, ca_bundle=None, legacy=False: self._client(
+            [], "q", lambda r, ca_bundle=None, legacy=False, insecure=False, proxy=None: self._client(
                 calls, [SimpleNamespace(type="tool_use", text="")]))
         self.assertEqual(rc, 1)                       # ai_run 이 빈 응답=오류로 취급
         self.assertEqual(out, "")
