@@ -431,9 +431,11 @@ def deterministic(store: Store, cfg: Config, date_iso: str | None = None) -> dic
         "promises": proms,
         # 어제 대비 상태판 변화 — 리포트의 핵심. 무거우면 호출부가 빼도 된다.
         "shift": state_shift(store, cfg, d, now=now_map),
-        # 머리글이 다룰 '오늘의 한 건' — 선정은 결정론, 문장만 AI 가 쓴다
-        "headline": headline(store, now_map, d, {p["thread_id"] for p in proms}),
+        # 머리글 후보(최대 HEADLINE_TOP) — 선정은 결정론, 문장만 AI 가 쓴다.
+        # headline(첫 항목)은 옛 호출부 호환용이다.
+        "headlines": headlines(store, now_map, d, {p["thread_id"] for p in proms}),
     }
+    det["headline"] = det["headlines"][0] if det["headlines"] else None
     # 그날 이미 받아 둔 AI 산출을 다시 얹는다 — **호출은 하지 않는다**(되읽기).
     # 이게 없으면 배경 결정론 재생성이 AI 절을 지운다(restore_ai_layer 주석 참고).
     restore_ai_layer(store, cfg, d, det)
@@ -457,8 +459,34 @@ def _worth_reporting(t: dict, promise_tids: set) -> bool:
             or t.get("deadline"))
 
 
+HEADLINE_TOP = 3            # 머리글 후보 상한 — 주간(EXEC_TOP 5)보다 하루는 짧다
+
+
+def headlines(store: Store, now: dict, day: str, ptids: set,
+              top: int = HEADLINE_TOP) -> list[dict]:
+    """오늘 리포트의 머리글 후보 — 오늘 움직인 스레드 중 무거운 순 최대 top 건.
+
+    **한 건이 아니라 여러 건이다**(2026-08-22). 8/15 의 '한 건을 중심으로 한 문단'
+    계약은 "3~5문장으로 전부 훑던" 요약이 경과 나열이 되는 문체 문제를 건수
+    제한으로 푼 과교정이었다 — 하루에 중요한 일이 둘 이상인 게 정상이고, 그때
+    둘째는 그냥 사라졌다. 주간 보고(OVERVIEW, 최대 5건·건당 한 문장)와 같은 모양으로
+    맞춘다: 나열을 막는 장치는 건수가 아니라 문장 규칙이다.
+
+    선정은 여전히 결정론이다 — AI 는 문장만 쓴다. 가볍게 논의되는 것뿐이면 빈
+    목록이고, 그러면 머리글은 '특이사항 없음'이 된다."""
+    tids = set(store.threads_active_between(day, day))
+    cands = [t for t in now.values()
+             if t["thread_id"] in tids and _worth_reporting(t, ptids)]
+    # **순위 기준은 상태판 score 하나다**(2026-08-22 사용자 결정). 머리글 전용
+    # 보정층(핑퐁 상한·상태 가산)을 잠깐 뒀다가 걷어냈다 — 기준이 둘이면 주간과
+    # 일간이 다른 순서를 말하고, 어느 쪽이 맞는지 판정할 근거가 없다. 점수식을
+    # 손볼 일이 있으면 weekly 의 그 식을 고쳐 양쪽에 함께 적용한다.
+    cands.sort(key=lambda t: (t.get("score", 0), t.get("last") or ""), reverse=True)
+    return cands[:top]
+
+
 def headline(store: Store, now: dict, day: str, ptids: set) -> dict | None:
-    """오늘 리포트의 '한 건' — 오늘 움직인 스레드 중 가장 무거운 것.
+    """오늘 리포트의 '한 건' — headlines() 의 첫 항목(옛 호출부·테스트 호환).
 
     **선정은 결정론이다.** AI 에게 고르게 하면 '무엇이 중요한가'가 문장 생성에
     끌려간다(주간의 문체 표본을 결정론으로 고르는 것과 같은 이유). 가볍게
@@ -472,12 +500,8 @@ def headline(store: Store, now: dict, day: str, ptids: set) -> dict | None:
     발신·언급·직접수신한 스레드만 담고 있어(weekly.deterministic), 참조만 걸린
     대량 공지는 여기 못 들어온다. 내 발신 여부는 점수에 이미 실려 있다
     (`sent * 2` + 그 뒤 답장이 `replies * 4`)."""
-    tids = set(store.threads_active_between(day, day))
-    cands = [t for t in now.values()
-             if t["thread_id"] in tids and _worth_reporting(t, ptids)]
-    if not cands:
-        return None
-    return max(cands, key=lambda t: (t.get("score", 0), t.get("last") or ""))
+    top = headlines(store, now, day, ptids, top=1)
+    return top[0] if top else None
 
 
 def state_shift(store: Store, cfg: Config, day: str, now: dict | None = None) -> dict:
@@ -1163,16 +1187,29 @@ THREAD_DIGEST = """다음은 오늘 활동이 있었던 '업무' 메일 스레�
 EXEC_SUMMARY = """당신은 상위 management 가 읽는 하루 보고의 머리글을 쓴다.
 
 규칙 (한국어):
-- 아래 [오늘의 한 건]을 중심으로 **한 문단(2~3문장)**만 쓴다.
-- '무엇이 어떻게 됐고, 그래서 지금 무엇이 필요한가'가 드러나야 한다. 경과 나열이
-  아니라 판단이 서는 문장이어야 한다.
-- [오늘 확정·변경]·[내 활동]은 그 한 건을 설명하는 데 필요할 때만 곁들인다.
+- 아래 [오늘의 후보]는 중요한 것부터 최대 3건이다. **후보마다 불릿 하나**를 쓴다
+  ("- " 로 시작, 후보 순서 그대로). 후보가 하나면 불릿도 하나다.
+- 불릿 머리는 **굵은 짧은 제목 (#번호)**: 이고, 그 뒤에 '무엇이 어떻게 됐고,
+  그래서 지금 무엇이 필요한가'가 드러나는 문장을 쓴다. 경과 나열이 아니라
+  판단이 서는 문장이어야 한다.
+- **높임말(합니다체)로 쓴다** — 상위 보고 문서다. "~했다"·"~이다" 같은 평서체를
+  쓰지 않는다.
+- **한 문장에 사실 하나.** 절을 "~하고, ~했으며, ~예정이고" 로 잇지 말고 문장을
+  나눈다.
+- 불릿 하나는 **줄바꿈 없는 한 덩어리**다. 보통 두세 문장이고, 필요하면 **다섯
+  문장**까지 쓴다. 불릿 안에서 줄을 바꾸거나 문단을 나누지 마라.
+- 후보가 보고할 가치가 없다고 보면 그 불릿을 뺀다. 전부 뺄 수는 없다(최소 1건).
+- [오늘 확정·변경]·[내 활동]은 후보를 설명하는 데 필요할 때만 곁들인다.
 - 아래에 없는 사실·수치·스레드 번호를 만들지 마라. 스레드 언급엔 (#번호) 표기.
 - [문체 표본]은 **어조·문장 길이·용어**만 따르는 참고다. 거기 적힌 사실·수치·
   인명·일정을 이 요약에 가져오지 마라.
-- 제목·머리말·인사말 금지, 본문만.
+- 제목·머리말·인사말 금지, 불릿만.
 
-[오늘의 한 건]
+형식 예(내용은 예시일 뿐이다):
+- **양자화 방식 (#123)**: QAT 로 확정됐고, 킥오프에서 폴백 판정 시점을 정해야 합니다. 비용 산정 회신이 아직 없어 승인 전에 킥오프를 미룰지 판단이 필요합니다.
+- **B0 타이밍 (#456)**: hold 위반 대응이 마무리됐고 제 쪽 확인만 남았습니다.
+
+[오늘의 후보 — 중요한 것부터]
 {headline}
 
 [오늘 확정·변경]
@@ -1199,15 +1236,18 @@ EXEC_REVISE = """당신은 상위 management 가 읽는 하루 보고의 머리�
 검토 기준:
 - 재료에 없는 사실·수치·인명·스레드 번호가 섞였는가 → 뺀다.
 - 경과 나열에 그치는가 → '그래서 지금 무엇이 필요한가'가 서게 고친다.
+- 한 문장이 절 서넛을 이어 길어졌는가 → 문장을 나눈다(한 문장에 사실 하나).
 - 재료에 있는데 빠뜨린 결정적 사실(결정·기한·막힌 지점)이 있는가 → 넣는다.
-- 한 문단(2~3문장)·한국어·제목/머리말 없음은 그대로 지킨다.
+- 모양은 그대로 지킨다: **후보마다 불릿 하나**(최대 3개, 후보 순서), 불릿 머리는
+  굵은 제목 (#번호), 불릿 하나는 **줄바꿈 없는 한 덩어리**(길어도 다섯 문장),
+  한국어 **높임말(합니다체)**, 제목/머리말 없음. 평서체가 섞였으면 고친다.
 - **고칠 것이 없으면 초안을 그대로 출력한다.** 다르게 쓰기 위해 다르게 쓰지 마라.
-- **검토 소감·수정 설명·구분선(---) 금지.** 최종 본문 한 문단만 출력한다.
+- **검토 소감·수정 설명·구분선(---) 금지.** 최종 불릿만 출력한다.
 
 [초안]
 {draft}
 
-[오늘의 한 건]
+[오늘의 후보 — 중요한 것부터]
 {headline}
 
 [오늘 확정·변경]
@@ -1746,28 +1786,67 @@ def _headline_block(store: Store, det: dict) -> str:
     이 절만 그 다섯에서 빠져 있었다**. 콜 1회짜리 절이라 예산도 함께 올린다.
     평탄화(개행 제거)는 절단 **뒤에** 한다 — 순서가 바뀌면 표 행 경계를 지키는
     로직이 개행을 잃어 무력해진다."""
-    h = det.get("headline")
-    if not h:
+    hs = _headline_list(det)
+    if not hs:
         return "(오늘 보고할 만한 건이 없다)"
-    who = max(h["people"], key=h["people"].get) if h.get("people") else ""
-    head = f"[#{h['thread_id']}] {h.get('subject') or ''} · 상태 {h.get('state') or ''}"
-    if h.get("state_note"):
-        head += f"({h['state_note']})"
-    if who:
-        head += f" · 상대 {who}"
-    out = [head]
-    rows = store.db.execute(
-        "SELECT is_sent, sent_on, new_content FROM messages "
-        "WHERE thread_id=? ORDER BY sent_on DESC LIMIT ?",
-        (h["thread_id"], _HEADLINE_MSGS)).fetchall()
-    for r in reversed(rows):
-        # 자르고 나서 평탄화한다(줄바꿈은 표시상 불필요하지만, 자르기 전에
-        # 없애면 표 행 경계 보호가 죽는다). 중략 표시는 그대로 남긴다.
-        body = " ".join(smart_truncate(
-            strip_preserved(r["new_content"] or ""), _HEADLINE_BODY).split())
-        if body:
-            out.append(f"- {'내 발신' if r['is_sent'] else '수신'} "
-                       f"{(r['sent_on'] or '')[:16]}: {body}")
+    # 예산은 건수와 무관하게 건당 6통 × 2,000자 그대로다(사용자 결정 2026-08-22) —
+    # 후보가 셋이면 입력이 최대 36,000자인데, 콜 1회짜리 절이고 줄이면 결론이
+    # 먼저 잘린다. 앞뒤를 나눠 담는 절단(smart_truncate)은 그대로다.
+    n_msgs, n_body = _HEADLINE_MSGS, _HEADLINE_BODY
+    out = []
+    for i, h in enumerate(hs, 1):
+        who = max(h["people"], key=h["people"].get) if h.get("people") else ""
+        head = (f"▶ 후보 {i}  [#{h['thread_id']}] {h.get('subject') or ''}"
+                f" · 상태 {h.get('state') or ''}")
+        if h.get("state_note"):
+            head += f"({h['state_note']})"
+        if who:
+            head += f" · 상대 {who}"
+        out.append(head)
+        rows = store.db.execute(
+            "SELECT is_sent, sent_on, new_content FROM messages "
+            "WHERE thread_id=? ORDER BY sent_on DESC LIMIT ?",
+            (h["thread_id"], n_msgs)).fetchall()
+        for r in reversed(rows):
+            # 자르고 나서 평탄화한다(줄바꿈은 표시상 불필요하지만, 자르기 전에
+            # 없애면 표 행 경계 보호가 죽는다). 중략 표시는 그대로 남긴다.
+            body = " ".join(smart_truncate(
+                strip_preserved(r["new_content"] or ""), n_body).split())
+            if body:
+                out.append(f"- {'내 발신' if r['is_sent'] else '수신'} "
+                           f"{(r['sent_on'] or '')[:16]}: {body}")
+        out.append("")
+    return "\n".join(out).rstrip()
+
+
+def _headline_list(det: dict) -> list[dict]:
+    """머리글 후보 목록 — headlines 가 있으면 그것, 없으면 옛 headline 하나."""
+    hs = det.get("headlines")
+    if hs is None:
+        h = det.get("headline")
+        hs = [h] if h else []
+    return [h for h in hs if h]
+
+
+def _normalize_exec(text: str) -> str:
+    """모델 출력의 불릿 모양을 계약에 맞춘다 — **불릿 하나 = 줄바꿈 없는 한 줄**.
+
+    모델이 불릿 안에서 줄을 바꾸거나(둘째 문단을 다른 줄에) 빈 줄을 넣으면, 웹
+    렌더러는 그 줄을 목록 밖 문단으로 떨어뜨려 목록이 끊긴다. 여기서 불릿에 딸린
+    줄을 전부 그 불릿 줄에 공백으로 이어 붙인다(2026-08-22 사용자: 첫째·둘째
+    문단은 붙여 쓴다). 불릿이 하나도 없으면(옛 한 문단 출력) 손대지 않는다."""
+    lines = [ln.rstrip() for ln in text.strip().splitlines()]
+    if not any(ln.lstrip().startswith("- ") for ln in lines):
+        return text.strip()
+    out: list[str] = []
+    for ln in lines:
+        st = ln.strip()
+        if not st:
+            continue                       # 불릿 사이 빈 줄은 버린다(목록이 끊긴다)
+        if st.startswith("- ") or not out:
+            out.append(st)
+        else:
+            out[-1] = out[-1] + " " + st   # 불릿에 딸린 줄 — 같은 줄로 잇는다
     return "\n".join(out)
 
 
@@ -1813,8 +1892,8 @@ def ai_exec_summary(store: Store, cfg: Config, det: dict,
     **2패스는 되면 좋은 것이지 필수가 아니다**(2026-08-15) — 고쳐쓰기가 실패하거나
     빈 답을 주면 **초안을 그대로 쓴다.** 사용자가 잃는 것은 '조금 더 나은 문장'이지
     머리글 자체가 아니다. 취소(AICancelled)는 여기서도 삼키지 않는다."""
-    if not det.get("headline"):
-        return "", "none"          # 고를 만한 한 건이 없다 = 특이사항 없음
+    if not _headline_list(det):
+        return "", "none"          # 고를 만한 건이 없다 = 특이사항 없음
     try:
         cmd = cfg.ai_cmd(backend)
     except SystemExit:
@@ -1827,13 +1906,13 @@ def ai_exec_summary(store: Store, cfg: Config, det: dict,
     except AIError as e:
         _notify_error(on_error, e)         # 삼키는 자리가 곧 보고 자리
         return "", "failed"
-    text = strip_meta_preamble(strip_summary_header(out))
+    text = _normalize_exec(strip_meta_preamble(strip_summary_header(out)))
     if not text:
         return "", "failed"
     try:
         out2 = ai_run(cmd, EXEC_REVISE.format(draft=text, **facts),
                       on_event=on_event, cancel=cancel)
-        revised = strip_meta_preamble(strip_summary_header(out2))
+        revised = _normalize_exec(strip_meta_preamble(strip_summary_header(out2)))
     except AIError:
         # **on_error 를 부르지 않는다** — 고쳐쓰기가 실패해도 초안이 그대로
         # 실리므로 사용자가 잃은 것이 없다. 여기서 실패를 보고하면 회고 화면이
@@ -2084,7 +2163,7 @@ def run_ai_layer(
             store, cfg, det, backend=summary_backend,
             on_event=on_event, cancel=cancel, on_error=fails.append)
         # 재실행이 실패했다고 **이미 받아 둔 요약을 지우지 않는다** — 사용자가
-        # 잃는 것은 '오늘의 한 건'이지 실패 사실이 아니다. 성공하면 물론 갱신한다.
+        # 잃는 것은 오늘의 머리글이지 실패 사실이 아니다. 성공하면 물론 갱신한다.
         if head_state == "ok" or not (det.get("exec_summary") or "").strip():
             det["exec_summary"], det["exec_state"] = head, head_state
         # 한 콜이라도 실패했으면 말한다 — 세 단계가 각자 삼키므로 여기서 안

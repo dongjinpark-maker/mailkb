@@ -8670,8 +8670,8 @@ class TestAILayer(unittest.TestCase):
         self.assertIn("내 회신으로 요청 종결: [#4] D요청", p)
         self.assertIn("B안 확정 (#2)", p)
         self.assertIn("[#9] C안 채택", p)
-        # 대상 1건이 프롬프트의 중심이다(결정론 선정, 문장만 AI)
-        self.assertIn("[오늘의 한 건]", p)
+        # 후보(결정론 선정)가 프롬프트의 중심이다 — 문장만 AI 가 쓴다
+        self.assertIn("[오늘의 후보 — 중요한 것부터]", p)
         self.assertIn("[#7] 회신건", p)
         self.assertIn("문체 표본", p)
         # '그 외 흐름'은 뺐다 — 3~5문장으로 전부 훑던 옛 계약의 재료였다
@@ -8737,6 +8737,56 @@ class TestAILayer(unittest.TestCase):
         # 관여도 필터는 상태판(now)이 이미 건다 — 거기 없는 스레드는 안 뽑힌다
         self.assertIsNone(review.headline(self.store, {}, day, set()))
 
+    def test_headlines_are_several_and_not_ranked_by_ping_pong(self):
+        # 하루에 중요한 일이 둘 이상인 게 정상이다(2026-08-22 사용자). 8/15 의
+        # '한 건' 계약은 나열 문체를 건수 제한으로 푼 과교정이었다 — 주간처럼
+        # 여러 건, 건당 불릿 하나. 순위는 핑퐁 횟수가 독점하지 못하게 접는다.
+        day = "2026-07-20"
+        self.store.ingest([_rec(f"h{i}", "kim@corp.example", [ME], f"건{i}",
+                                f"{day}T0{i}:00:00", body="본문") for i in range(1, 5)])
+        tid = {r["subject"]: r["thread_id"] for r in self.store.db.execute(
+            "SELECT subject, thread_id FROM messages")}
+        mk = lambda sub, **kw: {"thread_id": tid[sub], "subject": sub, "last": day,
+                                "deadline": 0, "replies": 0, "state": "마무리",
+                                "people": {"김": 1}, **kw}
+        now = {
+            tid["건1"]: mk("건1", score=52, replies=7),          # 회식 7번 핑퐁
+            tid["건2"]: mk("건2", score=23, state="내 차례"),    # 결정 요청, 내 차례
+            tid["건3"]: mk("건3", score=14),
+            tid["건4"]: mk("건4", score=3),                      # 사소 — 보고 제외
+        }
+        got = review.headlines(self.store, now, day, set())
+        self.assertEqual([t["subject"] for t in got], ["건1", "건2", "건3"])  # 최대 3
+        # 순위 기준은 상태판 score **하나**다 — 머리글 전용 보정층을 두지 않는다.
+        # 이 변경은 1등을 바꾸는 게 아니라 **둘째·셋째가 사라지지 않게** 하는 것이다.
+        self.assertEqual(review.headline(self.store, now, day, set())["subject"], "건1")
+        import inspect
+        self.assertNotIn("_headline_rank", inspect.getsource(review.headlines))
+        # 재료 블록은 후보마다 하나, 번호가 붙는다
+        det = {"headlines": got}
+        block = review._headline_block(self.store, det)
+        self.assertIn("▶ 후보 1  [#", block)
+        self.assertIn("▶ 후보 3  [#", block)
+        # 옛 det(headline 하나)도 그대로 읽힌다
+        self.assertIn("▶ 후보 1", review._headline_block(self.store, {"headline": got[1]}))
+
+    def test_exec_output_is_normalized_for_the_renderer(self):
+        # 불릿 하나 = 줄바꿈 없는 한 줄(첫째·둘째 문단을 붙여 쓴다 — 2026-08-22).
+        # 모델이 줄을 바꾸거나 빈 줄을 넣으면 렌더러가 목록을 끊는다 — 이어 붙인다.
+        raw = ("- **양자화 (#1)**: QAT 로 확정됐습니다.\n\n"
+               "비용 산정이 없어 킥오프를 미룰지 판단이 필요합니다.\n\n"
+               "- **타이밍 (#2)**: 확인만 남았습니다.\n")
+        norm = review._normalize_exec(raw)
+        self.assertEqual(norm.split("\n"), [
+            "- **양자화 (#1)**: QAT 로 확정됐습니다. 비용 산정이 없어 킥오프를 미룰지 판단이 필요합니다.",
+            "- **타이밍 (#2)**: 확인만 남았습니다."])
+        from mailkb import web
+        html = web._md_to_html("## Executive Summary\n" + norm)
+        self.assertEqual(html.count("<li>"), 2)               # 불릿 둘, 끊기지 않음
+        self.assertNotIn("<p>", html.split("<ul>", 1)[1])      # 목록 밖으로 샌 문단 없음
+        # 옛 한 문단 출력은 손대지 않는다
+        self.assertEqual(review._normalize_exec("한 문단 요약이다."), "한 문단 요약이다.")
+
     def test_exec_summary_drops_the_reviewers_remark(self):
         # 2패스가 "[초안]은 …" 같은 **검토 소감**을 먼저 쓰고 `---` 뒤에 본문을
         # 놓는 출력이 실제로 나왔다 — 화면의 Executive Summary 자리에 소감이
@@ -8795,7 +8845,7 @@ class TestAILayer(unittest.TestCase):
         self.assertEqual(len(seen), 2)
         # 고쳐쓰기에도 **재료를 다시 준다** — 초안만 주면 없는 사실로 매끄럽게 만든다
         self.assertIn("초안 본문.", seen[1])
-        self.assertIn("[오늘의 한 건]", seen[1])
+        self.assertIn("[오늘의 후보 — 중요한 것부터]", seen[1])
         self.assertIn("B안 확정 (#2)", seen[1])
 
         # 고쳐쓰기 실패는 on_error 로 보고하지 않는다 — 초안이 온전히 실리므로
