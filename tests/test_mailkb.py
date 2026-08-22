@@ -16980,14 +16980,17 @@ class TestWeekly(unittest.TestCase):
         self.assertNotIn("지난 차수", self.weekly.board_facts(dict(det, last_round=None)))
 
     def test_executive_summary_lists_items_and_falls_back(self):
-        # 사용자 확정: 일간 1건 · 주간 5건. AI 가 없으면 비운다(결정론 흉내는
-        # 읽는 값이 없다).
+        # 사용자 확정: 일간 3건 · 주간 7건(2026-08-22). AI 가 없으면 비운다
+        # (결정론 흉내는 읽는 값이 없다).
         det = {"start": "2026-07-08", "end": "2026-07-14", "weeks": 1, "items": [],
                "stat": {"threads": 0, "sent": 0, "named": 0, "direct": 0}}
         many = [f"항목 {i}" for i in range(self.weekly.EXEC_TOP + 2)]
         md = self.weekly.render(det, {"summary": many, "calls": 1})
         self.assertIn("- 항목 0", md)
-        self.assertNotIn("항목 5", md)                     # EXEC_TOP 상한
+        self.assertIn(f"- 항목 {self.weekly.EXEC_TOP - 1}", md)
+        self.assertNotIn(f"항목 {self.weekly.EXEC_TOP}", md)   # EXEC_TOP 상한
+        # 요약 재료는 토픽에서 나온다 — 토픽이 적으면 항목을 못 채운다
+        self.assertGreaterEqual(self.weekly.MAX_TOPICS, self.weekly.EXEC_TOP)
         # AI 를 안 돌리면 절 자체가 없다
         self.assertNotIn("Executive Summary", self.weekly.render(det, None))
         # 돌렸는데 비면 이유를 말한다 — 일간과 같은 문구 표를 쓴다
@@ -17309,10 +17312,15 @@ class TestWeekly(unittest.TestCase):
         out = web.render_weekly(self.cfg, {})
         self.assertIn("저장된 주간 보고가 없습니다", out)
         self.assertIn("보고 만들기", out)
-        # 버튼 위 안내도 소요 시간을 약속하지 않는다 — 카드가 '1~3분', 여기가
-        # '2~5분' 이라 같은 작업을 두 화면이 다르게 말하고 있었다(2026-07-29).
         self.assertIn(f"AI 최대 {self.weekly.MAX_AI_CALLS}콜", out)
-        self.assertNotIn("보통", out)
+        # 소요 시간은 **한 상수에서만** 나온다 — 카드가 '1~3분', 여기가 '2~5분' 이라
+        # 두 화면이 다르게 말한 적이 있어 표기를 없앴었다(2026-07-29). 실측 근거가
+        # 생겨 되살리되(2026-08-22) 진입 문구와 대기 카드가 같은 값을 쓰는지 잰다.
+        self.assertIn(web._WEEKLY_ETA, out)
+        with mock.patch.dict(web._weekly_job, {"running": True, "stage": "쓰는 중"}):
+            card, running = web.render_weekly_status(self.cfg)
+        self.assertTrue(running)
+        self.assertIn(web._WEEKLY_ETA, card)
 
     def test_weekly_tab_lists_past_reports(self):
         for d in ("2026-07-14", "2026-06-30", "2026-06-16"):

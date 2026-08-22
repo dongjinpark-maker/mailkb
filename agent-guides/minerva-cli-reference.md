@@ -201,7 +201,7 @@ AI 산출은 넣지 않는다). 환경 점검용 `diagnose` 와 다른 명령이
 | `init` | 데이터 홈·설정 파일 생성 |
 | `sync [--source --since --full]` | 사서함을 읽어 DB·파생 상태 갱신 — Windows Outlook COM, 수 분 걸릴 수 있다 |
 | `note <스레드ID>` | vault 에 지식 노트 템플릿 생성 — **쌓기만 하는** 작업이라 자율 실행 예외 |
-| `review [--date --ai]` | 일간 회고 — vault 에 파일을 쓴다. `--ai` 는 4콜 고정 |
+| `review [--date --ai]` | 일간 회고 — vault 에 파일을 쓴다. `--ai` 는 4콜 고정(수 분) |
 | `weekly [--weeks --ai]` | 주간 보고 — **`--ai` 없이도** vault 에 파일을 쓴다 |
 | `hide <스레드ID> [--undo]` | 표시·추적 판정이 바뀌고 **AI 재료에서도 빠진다**(아래) |
 | `block` / `unblock <주소>` | 로컬 차단 목록 변경 (Outlook 수신 규칙은 안 만든다) |

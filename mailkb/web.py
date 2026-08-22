@@ -104,9 +104,15 @@ _aisearch_lock = threading.Lock()
 _sync_job = _new_job(msg="", n=0)
 _sync_lock = threading.Lock()
 
-# 주간 보고 백그라운드 잡(단일) — 원문 카드·토픽 서술·근거 검증으로 AI 최대 17콜.
+# 주간 보고 백그라운드 잡(단일) — 원문 카드·토픽 서술·근거 검증으로 AI 최대 20콜
+# (weekly.MAX_AI_CALLS — 토픽 수에 따라 움직인다).
 # 요청 스레드에서 돌리면 단일 스레드 서버가 그동안 멈춘다. /weekly/status 폴링으로
 # 진행("토픽 3/5 서술 중…")을 흘린다 — weekly 엔진이 내보내는 메시지 그대로.
+# 주간 소요 시간 안내 — **여기 한 곳에서만** 만든다. 2026-07-29 에 대기 카드가
+# "1~3분", 진입 문구가 "2~5분" 이라 같은 작업을 두 화면이 다르게 말했고, 그래서
+# 시간 표기를 통째로 없앴었다. 실측(데모·sonnet, 2026-08-22: 13~17콜에 1,108~1,654초)
+# 으로 근거가 생겨 되살리되 상수로 묶는다.
+_WEEKLY_ETA = "보통 20~30분"
 _weekly_job = _new_job(weeks=1, date="")
 _weekly_lock = threading.Lock()
 
@@ -6498,7 +6504,8 @@ def _review_button_forms(day: str | None = None) -> str:
     # 과거 날짜면 run_ai_layer 가 그 날짜 작업(요약·수확·디제스트·하루 요약)만 실행.
     dt = f"<input type='hidden' name='date' value='{esc(day)}'>" if day else ""
     return ("<form method='post' action='/review'><input type='hidden' name='ai' value='1'>"
-            f"{dt}<button class='aibtn ghost'>AI 회고</button></form>")
+            f"{dt}<button class='aibtn ghost'>AI 회고</button>"
+            " <span class='dim'>· AI 4콜 · 수 분</span></form>")
 
 
 _DONE_KINDS = (("promise", "내 약속"), ("stalled", "오래 멈춘 스레드"),
@@ -7138,7 +7145,8 @@ def render_weekly(cfg, qs, store=None) -> str:
            "<button class='aibtn'>보고 만들기</button></form></div>",
            "<p class='dim'>내가 관여한 사안(내 발신·나 지목·직접 수신)을 토픽으로 묶어 "
            "진행·이슈·향후로 정리합니다. 기간 내 원문을 소배치로 읽고 근거를 재검증합니다. "
-           f"AI 최대 {weekly_mod.MAX_AI_CALLS}콜.</p>"]
+           f"AI 최대 {weekly_mod.MAX_AI_CALLS}콜 · <b>{_WEEKLY_ETA}</b> 걸립니다"
+           " — 배경에서 도니 다른 화면을 봐도 됩니다.</p>"]
 
     if cur:
         # 인접 차수 이동 — 일간(render_daily)은 날짜 산술로 ◀▶ 를 만들지만 주간은
@@ -7190,6 +7198,7 @@ def render_weekly_status(cfg, store=None) -> tuple:
                     live=_job_live_line(st), preview=_job_preview(st),
                     model=st.get("model") or "",
                     hint="토픽을 묶고 사안별로 진행·이슈·향후를 씁니다 — "
+                         f"콜이 많아 {_WEEKLY_ETA} 걸립니다(멈춘 것이 아닙니다). "
                          "완료되면 자동 전환. "
                          + _cancel_hint(st.get("stream", False)),
                     cancel_action="/weekly/cancel",
