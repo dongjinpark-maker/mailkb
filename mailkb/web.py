@@ -104,15 +104,37 @@ _aisearch_lock = threading.Lock()
 _sync_job = _new_job(msg="", n=0)
 _sync_lock = threading.Lock()
 
-# 주간 보고 백그라운드 잡(단일) — 원문 카드·토픽 서술·근거 검증으로 AI 최대 20콜
-# (weekly.MAX_AI_CALLS — 토픽 수에 따라 움직인다).
-# 요청 스레드에서 돌리면 단일 스레드 서버가 그동안 멈춘다. /weekly/status 폴링으로
-# 진행("토픽 3/5 서술 중…")을 흘린다 — weekly 엔진이 내보내는 메시지 그대로.
-# 주간 소요 시간 안내 — **여기 한 곳에서만** 만든다. 2026-07-29 에 대기 카드가
-# "1~3분", 진입 문구가 "2~5분" 이라 같은 작업을 두 화면이 다르게 말했고, 그래서
-# 시간 표기를 통째로 없앴었다. 실측(데모·sonnet, 2026-08-22: 13~17콜에 1,108~1,654초)
-# 으로 근거가 생겨 되살리되 상수로 묶는다.
-_WEEKLY_ETA = "보통 20~30분"
+# 주간 보고 백그라운드 잡(단일) — 본문·머리글·누락으로 AI 최대 3콜
+# (weekly.MAX_AI_CALLS). 요청 스레드에서 돌리면 단일 스레드 서버가 그동안 멈춘다.
+# /weekly/status 폴링으로 진행("원문 읽고 토픽 쓰는 중…")을 흘린다.
+_WEEKLY_ETA_PER_WEEK = (8, 13)    # 주당 하한·상한(분) — 아래 실측에서 나온 값
+
+
+def _weekly_eta(weeks: int = 1) -> str:
+    """주간 보고 소요 시간 안내 — **여기 한 곳에서만** 만든다.
+
+    2026-07-29 에 대기 카드가 "1~3분", 진입 문구가 "2~5분" 이라 같은 작업을 두
+    화면이 다르게 말했고, 그래서 시간 표기를 통째로 없앴었다. 실측으로 근거가
+    생겨 되살리되 만드는 자리를 하나로 묶는다.
+
+    실측(데모·sonnet, 3콜 재설계 뒤 2026-08-24):
+      1주(36스레드) 458 · 538 · 623초   → 7.6~10.4분
+      2주(50스레드) 873 · 1,555초       → 14.6~25.9분
+    **같은 프롬프트가 2.2배까지 흔들린다**(2주 본문 콜 616초 대 1,363초, 느린
+    쪽이 산출은 더 적었다). 그래서 값이 아니라 범위로 말한다.
+
+    기간에 비례하는 것은 재료가 아니라 **산출량**이다 — 1주 41KB → 2주 48KB
+    (+17%)인데 토픽 불릿은 46 → 65~76 이었고 시간은 1.4~2.5배가 됐다. 시간은
+    출력량에 비례하므로(실측 25자/초) 주 수에 거의 비례한다.
+
+    스레드 수와는 거의 무관하다 — 주 2,000통(777스레드 → 재료 예산이 147건
+    선택)도 517초였다. 재료 예산이 프롬프트를 묶어 주기 때문이다.
+
+    3주 이상은 미측정이다. 주당 값을 그대로 늘려 잡는다 — 틀리더라도 **과대
+    추정 쪽이 안전하다**(짧게 말하면 멈춘 줄 알고 중지를 누른다)."""
+    lo, hi = _WEEKLY_ETA_PER_WEEK
+    w = max(1, int(weeks or 1))
+    return f"보통 {lo * w}~{hi * w}분"
 _weekly_job = _new_job(weeks=1, date="")
 _weekly_lock = threading.Lock()
 
@@ -5355,8 +5377,8 @@ def render_settings(store, cfg) -> str:
                  "opus 가 sonnet 보다 싸고 빨랐다)</td></tr>"
                + "<tr><th>주간 백엔드</th>"
                + _sel("weekly_backend", cfg.backend_for("weekly"))
-               + f"<td class='dim'>주간 보고 (최대 {weekly.MAX_AI_CALLS}콜 · "
-                 "미설정 시 요약 백엔드)</td></tr>"
+               + f"<td class='dim'>주간 보고 ({weekly.MAX_AI_CALLS}콜 · "
+                 f"{_weekly_eta(1)} · 미설정 시 요약 백엔드)</td></tr>"
                + "</table><button class='btn-primary'>판정 기준 저장</button></form>")
     out.append(_ai_status_html(cfg))
 
@@ -7144,9 +7166,10 @@ def render_weekly(cfg, qs, store=None) -> str:
            f"<select name='weeks'>{opts}</select> "
            "<button class='aibtn'>보고 만들기</button></form></div>",
            "<p class='dim'>내가 관여한 사안(내 발신·나 지목·직접 수신)을 토픽으로 묶어 "
-           "진행·이슈·향후로 정리합니다. 기간 내 원문을 소배치로 읽고 근거를 재검증합니다. "
-           f"AI 최대 {weekly_mod.MAX_AI_CALLS}콜 · <b>{_WEEKLY_ETA}</b> 걸립니다"
-           " — 배경에서 도니 다른 화면을 봐도 됩니다.</p>"]
+           "진행·이슈·향후로 정리합니다. 기간 내 원문을 한 번에 읽고 인용을 코드가 "
+           "대조합니다. "
+           f"AI {weekly_mod.MAX_AI_CALLS}콜 · {weeks}주 기준 <b>{_weekly_eta(weeks)}</b> "
+           "걸립니다 — 배경에서 도니 다른 화면을 봐도 됩니다.</p>"]
 
     if cur:
         # 인접 차수 이동 — 일간(render_daily)은 날짜 산술로 ◀▶ 를 만들지만 주간은
@@ -7197,8 +7220,9 @@ def render_weekly_status(cfg, store=None) -> tuple:
                     stage=st.get("stage") or "준비 중…",
                     live=_job_live_line(st), preview=_job_preview(st),
                     model=st.get("model") or "",
-                    hint="토픽을 묶고 사안별로 진행·이슈·향후를 씁니다 — "
-                         f"콜이 많아 {_WEEKLY_ETA} 걸립니다(멈춘 것이 아닙니다). "
+                    hint="원문을 읽어 토픽별 진행·이슈·향후를 씁니다 — "
+                         f"{_weekly_eta(st.get('weeks') or 1)} 걸립니다"
+                         "(멈춘 것이 아닙니다). "
                          "완료되면 자동 전환. "
                          + _cancel_hint(st.get("stream", False)),
                     cancel_action="/weekly/cancel",

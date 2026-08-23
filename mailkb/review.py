@@ -469,7 +469,7 @@ def headlines(store: Store, now: dict, day: str, ptids: set,
     **한 건이 아니라 여러 건이다**(2026-08-22). 8/15 의 '한 건을 중심으로 한 문단'
     계약은 "3~5문장으로 전부 훑던" 요약이 경과 나열이 되는 문체 문제를 건수
     제한으로 푼 과교정이었다 — 하루에 중요한 일이 둘 이상인 게 정상이고, 그때
-    둘째는 그냥 사라졌다. 주간 보고(OVERVIEW, 최대 5건·건당 한 문장)와 같은 모양으로
+    둘째는 그냥 사라졌다. 주간 보고(HEADLINE, 최대 7건·건당 두세 문장)와 같은 모양으로
     맞춘다: 나열을 막는 장치는 건수가 아니라 문장 규칙이다.
 
     선정은 여전히 결정론이다 — AI 는 문장만 쓴다. 가볍게 논의되는 것뿐이면 빈
@@ -488,8 +488,13 @@ def headlines(store: Store, now: dict, day: str, ptids: set,
 def headline(store: Store, now: dict, day: str, ptids: set) -> dict | None:
     """오늘 리포트의 '한 건' — headlines() 의 첫 항목(옛 호출부·테스트 호환).
 
-    **선정은 결정론이다.** AI 에게 고르게 하면 '무엇이 중요한가'가 문장 생성에
-    끌려간다(주간의 문체 표본을 결정론으로 고르는 것과 같은 이유). 가볍게
+    **일간의 선정은 결정론이다.** AI 에게 고르게 하면 '무엇이 중요한가'가 문장 생성에
+    끌려간다(주간의 문체 표본을 결정론으로 고르는 것과 같은 이유).
+
+    **주간은 2026-08-23 에 이 원칙에서 갈라졌다** — 재료 전체가 한 콜에 들어가게
+    되면서 모델이 전체를 보고 고른다. 일간이 따라가지 않은 이유는 근거가 아직
+    없어서다: 이 가설(선정을 맡기면 쓰기 쉬운 것이 뽑힌다)은 측정된 적이 없고,
+    반대로 지금 결정론 점수식이 관여도 축뿐이라는 것은 측정됐다(§6.4). 가볍게
     논의되는 것(회식·사무용품)뿐이면 아무것도 고르지 않는다 — 그러면 머리글은
     '특이사항 없음'이 된다.
 
@@ -563,6 +568,16 @@ class AIAuthError(Exception):
     흐려진다)."""
 
 
+class AIQuotaError(AIAuthError):
+    """사용량 한도 소진 — 처방이 인증 만료와 같아서(멈추고 사람에게 알린다)
+    AIAuthError 를 상속해 기존 탈출 경로를 그대로 탄다. 다른 것은 사람이 할 일뿐:
+    재로그인이 아니라 리셋 시각까지 기다리는 것이다.
+
+    2026-08-23 실측으로 생겼다 — 한도 문구는 _AUTH_DEAD_RX(AWS SSO 전용)에 걸리지
+    않아 일반 AIError 로 떨어졌고, 주간 파이프라인이 남은 단계를 전부 헛돌며
+    (전부 실패할 것을 알면서) 조용히 빈 보고서를 냈다."""
+
+
 # 백엔드 전체가 죽은 인증류 오류 문자열 — AWS SSO/자격 증명 계열만 좁게 잡는다
 # (일반 'unauthorized' 는 다른 원인과 섞여 오진 위험). 실기기 로그 문자열이
 # 확보되면 여기에 보강한다.
@@ -572,11 +587,22 @@ _AUTH_DEAD_RX = re.compile(
     r"|aws sso login|unable to locate credentials"
     r"|credential[s]?.{0,20}expired|expired.{0,20}credential", re.IGNORECASE)
 
+# 사용량 한도 — 흔한 단어(limit)가 아니라 **문구째**로 잡는다. 오진하면 멀쩡한
+# 실패를 '기다리세요'로 안내하게 되고, 그건 인증 오진과 같은 비용이다.
+_QUOTA_RX = re.compile(
+    r"hit your (?:usage|session|weekly|5-hour) limit"
+    r"|(?:usage|session|rate) limit (?:reached|exceeded)"
+    r"|quota (?:exceeded|exhausted)", re.IGNORECASE)
+_QUOTA_RESET_RX = re.compile(r"resets?\s+([^\n·|]{3,40})", re.IGNORECASE)
+
+QUOTA_HINT = "⚠ AI 사용량 한도 소진 — 리셋 후 다시 시도하세요"
+
+
 AUTH_DEAD_HINT = ("⚠ AI 백엔드 인증 만료(AWS SSO 추정) — PC에서 aws sso login "
                   "후 다시 시도")
 
 
-def _ai_error(msg: str, detail: str = "") -> Exception:
+def _ai_error(msg: str, detail: str = "", stdout: str = "") -> Exception:
     """실패 종류를 가른다 — 인증 만료면 AIAuthError 로 승격해 재시도 없이
     즉시 안내가 올라가게 한다.
 
@@ -587,6 +613,14 @@ def _ai_error(msg: str, detail: str = "") -> Exception:
     중단 + 틀린 안내로 이어진다(2026-07-31 리뷰 실증). 오진 비용이 미탐
     비용(재시도 후 일반 실패)보다 훨씬 크므로 판정 채널을 좁게 잡는다.
     """
+    # 한도는 stderr 뿐 아니라 stdout 도 본다 — claude -p 는 오류 봉투를 stdout 으로
+    # 내는 경우가 많고, 이 함수는 **exit != 0 일 때만** 불린다(정상 모델 출력은
+    # 여기 오지 않는다). 그래도 문구째 대조라 메일 본문이 흉내 내기 어렵다.
+    q = _QUOTA_RX.search(detail or "") or _QUOTA_RX.search(stdout or "")
+    if q:
+        reset = _QUOTA_RESET_RX.search((detail or "") + "\n" + (stdout or ""))
+        when = f" (리셋 {reset.group(1).strip()})" if reset else ""
+        return AIQuotaError(f"{QUOTA_HINT}{when}\n근거: {q.group(0)}")
     m = _AUTH_DEAD_RX.search(detail or "")
     if not m:
         return AIError(msg)
@@ -716,7 +750,7 @@ def _ai_run_once(cmd: list[str], prompt: str, timeout: int) -> str:
         # detail=err — stdout(out)은 메시지에만 싣고 판정에는 넣지 않는다
         raise _ai_error(
             f"AI 호출 실패 (exit {proc.returncode}): {' '.join(cmd)}\n"
-            f"{(err or out)[:500]}", err)
+            f"{(err or out)[:500]}", err, out)
     out = proc.stdout.strip()
     if not out:
         _log_ai_error({"reason": "empty", "cmd": cmd,

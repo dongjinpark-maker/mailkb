@@ -8048,6 +8048,55 @@ class TestIntervention(unittest.TestCase):
 
 
 
+class TestAIQuotaError(unittest.TestCase):
+    """사용량 한도 — 인증 만료와 같은 처방(멈추고 알린다)이라 AIAuthError 를
+    상속한다. 2026-08-23 실측: 한도 문구가 AWS SSO 패턴에 안 걸려 일반 AIError 로
+    떨어졌고, 파이프라인이 남은 단계를 전부 헛돌며 조용히 빈 보고서를 냈다."""
+
+    REAL = "You've hit your session limit · resets 8:10pm (Asia/Seoul)"
+
+    def test_quota_is_detected_and_reset_time_is_shown(self):
+        # 실측 문구는 stdout 으로 왔다 — claude -p 는 오류 봉투를 stdout 에 낸다.
+        e = review._ai_error("AI 호출 실패 (exit 1)", "", self.REAL)
+        self.assertIsInstance(e, review.AIQuotaError)
+        self.assertIsInstance(e, review.AIAuthError)   # 기존 탈출 경로를 탄다
+        self.assertIn("8:10pm", str(e))                # 언제 풀리는지가 안내의 핵심
+        self.assertIn("한도", str(e))
+        self.assertNotIn("aws sso login", str(e))      # 처방을 섞지 않는다
+
+    def test_quota_verdict_is_phrase_anchored(self):
+        # 'limit' 한 단어로 잡으면 멀쩡한 실패를 '기다리세요'로 오안내한다.
+        for s in ("429 rate limit", "prompt is too long", "exit 1: limit",
+                  "context limit", "알 수 없는 오류"):
+            e = review._ai_error("실패", s, s)
+            self.assertNotIsInstance(e, review.AIQuotaError, msg=s)
+
+    def test_quota_stops_the_pipeline_with_a_banner(self):
+        # graceful 삼킴(except AIError)을 통과해 보고서 머리까지 올라와야 한다.
+        import mailkb.weekly as weekly_mod
+        with mock.patch.object(weekly_mod, "run_ai_layer",
+                               side_effect=review.AIQuotaError(
+                                   review.QUOTA_HINT + " (리셋 8:10pm)")):
+            content, det = weekly_mod.generate(
+                self.store, self.cfg, weeks=2, ai=True, today="2026-07-14")
+        self.assertIn("한도", det["ai_error"])
+        self.assertIn("한도", content.splitlines()[2])   # 머리에 안내
+        self.assertIn("주간 보고", content)               # 뼈대는 그대로 산다
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        home = Path(self.tmp.name)
+        self.cfg = Config(home=home, my_addresses=[ME], my_names=["김도현"],
+                          internal_domains=["corp.example"],
+                          ai_default="internal",
+                          ai_backends={"internal": {"cmd": ["echo"]}})
+        self.store = Store(home / "t.sqlite", [ME], ["김도현"], noise=self.cfg)
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+
 class TestAIAuthError(unittest.TestCase):
     """인증 만료(AWS SSO 류) — 재시도 없이 즉시 안내하고 멈춘다(2026-07-31).
 
@@ -16652,72 +16701,92 @@ class TestWeekly(unittest.TestCase):
         return self.store.db.execute(
             "SELECT thread_id FROM messages WHERE message_id='<t1@t>'").fetchone()[0]
 
-    def _ai_layer(self, replies, weeks=2, today="2026-07-14", progress=None):
+    def _ai_layer(self, replies, weeks=2, today="2026-07-14", progress=None,
+                  head=None, missed=None):
+        """AI 층은 3콜이다(2026-08-23) — 본문 · 머리글(+해석) · 누락.
+
+        각 테스트는 대개 본문 하나에 집중하므로 replies 는 **본문 콜**에 쓰이고,
+        머리글·누락은 지정하지 않으면 빈 응답이 간다. 종전 하네스가 카드 단계를
+        빈 응답으로 두던 자리와 같은 역할이다."""
         det = self.weekly.deterministic(self.store, self.cfg, weeks, today)
         answers = iter(replies)
 
         def fake_ai(cmd, prompt, **kwargs):
-            # 각 테스트는 토픽 편집 결과에 집중한다. 새 원문 카드 단계는 빈 응답으로
-            # 두어 결정론 원문 fallback을 쓰고, 마지막 의미 검증은 명시적으로 통과시키며,
-            # 해석 층은 기본 비활성(빈 배열) — 해석 테스트만 각본으로 채운다.
-            if "기간 내 원문 메일에서 주간 보고 후보 사실을 추출한다" in prompt:
-                return json.dumps({"threads": []})
-            if "주간 보고의 각 서술이 붙어 있는 원문 인용으로" in prompt:
-                return json.dumps({
-                    "supported": [f"r{i}" for i in range(30)],
-                    "summary_supported": True,
-                })
-            if "그래서 무엇을 주목해야 하나" in prompt:
-                try:
-                    return next(answers)      # 해석 각본이 있으면 사용
-                except StopIteration:
-                    return json.dumps({"insights": []})
-            return next(answers)
+            if prompt.startswith("당신은 주간 업무 보고의 머리글"):
+                return head if head is not None else json.dumps(
+                    {"summary": [], "order": [], "insights": []})
+            if prompt.startswith("주간 보고가 아래 [다룬 토픽]"):
+                return missed if missed is not None else json.dumps({"missed": []})
+            return next(answers)               # 본문
 
         with mock.patch.object(review, "ai_run", side_effect=fake_ai):
             ai = self.weekly.run_ai_layer(self.store, self.cfg, det,
                                           progress=progress)
         return det, ai
 
+    def test_items_without_tid_survive_when_the_topic_names_one(self):
+        """항목에 tid 가 빠지면 _keep 이 전건을 버린다 — 종전 카드 단계가 정확히
+        그래서 통째로 폐기되고 있었다(2026-08-23: 실제 응답 23건 → 통과 0건,
+        폴백 문장이 조용히 대신 들어갔다). 토픽이 스레드를 하나만 지목하면
+        출처가 유일하므로 코드가 채운다. 여럿이면 추측이라 채우지 않는다."""
+        tid = self._seed_topic()
+        body = json.dumps({"topics": [{
+            "name": "드라이버 API", "tids": [tid],
+            "progress": [{"text": "검토 요청이 왔다",          # tid 없음
+                          "quote": "스펙 v0.9 검토 의견 부탁드립니다"}],
+            "issues": [], "next": []}]}, ensure_ascii=False)
+        _, ai = self._ai_layer([body])
+        self.assertEqual([it["text"] for it in ai["topics"][0]["progress"]],
+                         ["검토 요청이 왔다"])
+        self.assertEqual(ai["topics"][0]["tids"], [tid])
+
+    def test_items_without_tid_are_dropped_when_the_topic_is_ambiguous(self):
+        # 스레드가 둘이면 어느 쪽 인용인지 코드가 알 수 없다 — 채우지 않는다.
+        tid = self._seed_topic()
+        body = json.dumps({"topics": [{
+            "name": "묶음", "tids": [tid, tid + 1],
+            "progress": [{"text": "출처 불명", "quote": "스펙 v0.9 검토 의견 부탁드립니다"}],
+            "issues": [], "next": []}]}, ensure_ascii=False)
+        _, ai = self._ai_layer([body])
+        self.assertIsNone(ai)                      # 남는 서술이 없으면 층 자체가 없다
+
     def test_ai_layer_verifies_quotes_and_sent_only_for_mine(self):
         tid = self._seed_topic()
         mids = {r["message_id"]: r["id"] for r in self.store.db.execute(
             "SELECT id, message_id FROM messages WHERE thread_id=?", (tid,))}
-        replies = [
-            json.dumps({"topics": [{"name": "드라이버 API", "threads": [tid]}]}),
-            json.dumps({"progress": [
-                # ① 상대 인용 — 통과
-                {"text": "검토 요청이 왔다", "tid": tid,
-                 "quote": "스펙 v0.9 검토 의견 부탁드립니다"},
-                # ② mine=true 인데 상대 문장을 인용 — 탈락해야 함
-                {"text": "내가 검토를 요청했다", "tid": tid, "mine": True,
-                 "quote": "스펙 v0.9 검토 의견 부탁드립니다"},
-                # ③ mine=true + 내 발신 인용 — 통과
-                {"text": "인터럽트 수정을 요청했다", "tid": tid, "mine": True,
-                 "quote": "인터럽트 처리 부분만 수정 요청했습니다"},
-                # ④ quote는 맞지만 다른 mid를 명시 — 메시지 출처가 틀려 탈락
-                {"text": "출처를 바꿔 단 주장", "tid": tid, "mid": mids["<t2@t>"],
-                 "quote": "스펙 v0.9 검토 의견 부탁드립니다"},
-                # ⑤ 없는 인용 — 탈락
-                {"text": "지어낸 주장", "tid": tid, "quote": "이런 문장은 본문에 없다"},
-            ], "issues": [], "next": []}),
-            json.dumps({"summary": "드라이버 API 검토가 진행 중이다.",
-                        "order": ["드라이버 API"]}),
-            json.dumps({"missed": []}),
-        ]
-        det, ai = self._ai_layer(replies)
+        body = json.dumps({"topics": [{"name": "드라이버 API", "progress": [
+            # ① 상대 인용 — 통과
+            {"text": "검토 요청이 왔다", "tid": tid,
+             "quote": "스펙 v0.9 검토 의견 부탁드립니다"},
+            # ② mine=true 인데 상대 문장을 인용 — 탈락해야 함
+            {"text": "내가 검토를 요청했다", "tid": tid, "mine": True,
+             "quote": "스펙 v0.9 검토 의견 부탁드립니다"},
+            # ③ mine=true + 내 발신 인용 — 통과
+            {"text": "인터럽트 수정을 요청했다", "tid": tid, "mine": True,
+             "quote": "인터럽트 처리 부분만 수정 요청했습니다"},
+            # ④ quote는 맞지만 다른 mid를 명시 — 메시지 출처가 틀려 탈락
+            {"text": "출처를 바꿔 단 주장", "tid": tid, "mid": mids["<t2@t>"],
+             "quote": "스펙 v0.9 검토 의견 부탁드립니다"},
+            # ⑤ 없는 인용 — 탈락
+            {"text": "지어낸 주장", "tid": tid, "quote": "이런 문장은 본문에 없다"},
+        ], "issues": [], "next": []}]}, ensure_ascii=False)
+        head = json.dumps({"summary": "드라이버 API 검토가 진행 중이다.",
+                           "order": ["드라이버 API"], "insights": []},
+                          ensure_ascii=False)
+        det, ai = self._ai_layer([body], head=head)
         self.assertIsNotNone(ai)
         texts = [p["text"] for p in ai["topics"][0]["progress"]]
         self.assertIn("검토 요청이 왔다", texts)
         self.assertIn("인터럽트 수정을 요청했다", texts)
         self.assertNotIn("내가 검토를 요청했다", texts)   # 남의 문장으로 내 성과 금지
-        self.assertNotIn("출처를 바꿔 단 주장", texts)     # 다른 메시지 quote로 갈아끼우기 금지
+        self.assertNotIn("출처를 바꿔 단 주장", texts)     # 다른 메시지로 갈아끼우기 금지
         self.assertNotIn("지어낸 주장", texts)            # 인용 검증 실패
         self.assertEqual(ai["dropped"], 3)
         # summary 는 항목 리스트가 정본 — 모델이 문자열로 줘도 받아 준다
         self.assertEqual(ai["summary"], ["드라이버 API 검토가 진행 중이다."])
-        # 원문카드1+묶기1+서술1+총평1+의미검증1+해석1
-        self.assertEqual(ai["calls"], 6)
+        # 누락 콜은 **남은 스레드가 있을 때만** 나간다 — 여기선 후보가 전부
+        # 토픽에 들어가서 2콜(본문·머리글)이다. 상한은 MAX_AI_CALLS=3.
+        self.assertEqual(ai["calls"], 2)
 
     def test_completeness_check_recovers_missed_thread(self):
         tid = self._seed_topic()
@@ -16726,40 +16795,33 @@ class TestWeekly(unittest.TestCase):
             "7월 30일까지 제출 부탁드립니다.")])
         other = self.store.db.execute(
             "SELECT thread_id FROM messages WHERE message_id='<m1@t>'").fetchone()[0]
-        replies = [
-            json.dumps({"topics": [{"name": "드라이버 API", "threads": [tid]}]}),
-            json.dumps({"progress": [
-                {"text": "검토 요청이 왔다", "tid": tid,
-                 "quote": "스펙 v0.9 검토 의견 부탁드립니다"}], "issues": [], "next": []}),
-            json.dumps({"summary": "x", "order": []}),
-            json.dumps({"missed": [{"tid": other, "why": "기한이 임박한 제출 건"}]}),
-        ]
-        _, ai = self._ai_layer(replies)
-        self.assertEqual(ai["calls"], 7)                  # 누락 점검·해석 콜 포함
+        body = json.dumps({"topics": [{"name": "드라이버 API", "progress": [
+            {"text": "검토 요청이 왔다", "tid": tid,
+             "quote": "스펙 v0.9 검토 의견 부탁드립니다"}],
+            "issues": [], "next": []}]}, ensure_ascii=False)
+        missed = json.dumps({"missed": [
+            {"tid": other, "text": "기한이 임박한 제출 건", "mine": False,
+             "quote": "7월 30일까지 제출 부탁드립니다"}]}, ensure_ascii=False)
+        _, ai = self._ai_layer([body], missed=missed)
+        self.assertEqual(ai["calls"], 3)                  # 본문·머리글·누락
         self.assertEqual(ai["missed"][0]["tid"], other)
-        self.assertIn("7월 30일", ai["missed"][0]["why"])  # 모델의 자유 이유가 아닌 원문 사실
+        # 인용은 코드가 원문과 대조한다 — 통과한 것만 남는다
+        self.assertIn("7월 30일", ai["missed"][0]["quote"])
         self.assertIn("짚어둘 것", self.weekly.render(
             self.weekly.deterministic(self.store, self.cfg, 2, "2026-07-14"), ai))
 
     def test_progress_reports_call_count_and_input_size(self):
         # 콜 하나가 수 분까지 가는 동안 대기 화면이 멈춘 것처럼 보이지 않아야
-        # 한다 — 각 단계 진행 문구에 '콜 n/N · 입력 KB' 를 싣는다. 경과초는
-        # 클라이언트(#wk-elapsed)가 세므로 여기선 정적 정보만 사양으로 고정.
+        # 한다 — 각 단계 진행 문구에 '콜 n/N · 입력 KB' 를 싣는다.
         tid = self._seed_topic()
-        replies = [
-            json.dumps({"topics": [{"name": "드라이버 API", "threads": [tid]}]}),
-            json.dumps({"progress": [
-                {"text": "검토 요청이 왔다", "tid": tid,
-                 "quote": "스펙 v0.9 검토 의견 부탁드립니다"}],
-                "issues": [], "next": []}),
-            json.dumps({"summary": "x", "order": []}),
-        ]
+        body = json.dumps({"topics": [{"name": "드라이버 API", "progress": [
+            {"text": "검토 요청이 왔다", "tid": tid,
+             "quote": "스펙 v0.9 검토 의견 부탁드립니다"}],
+            "issues": [], "next": []}]}, ensure_ascii=False)
         msgs = []
-        _, ai = self._ai_layer(replies, progress=msgs.append)
+        _, ai = self._ai_layer([body], progress=msgs.append)
         self.assertIsNotNone(ai)
-        for label in ("원문 근거 1/1 묶음 읽는 중", "토픽 묶는 중",
-                      "토픽 1/1 서술 중", "총평 정리 중",
-                      "보고 근거 검증 중", "해석 정리 중"):
+        for label in ("원문 읽고 토픽 쓰는 중", "머리글 정리 중"):
             self.assertTrue(any(m.startswith(label + " · 콜 ") for m in msgs),
                             (label, msgs))
         # 송신·수신이 같은 자를 쓴다(review.fmt_bytes) — 한 카드에서 위 줄만
@@ -16769,41 +16831,33 @@ class TestWeekly(unittest.TestCase):
             "\n".join(msgs)), msgs)
 
     def test_ai_layer_captures_model_for_render_footer(self):
-        # 2b 축소 — 보고 푸터에 실행 모델의 실측 ID(별칭 아님)를 남긴다.
-        # 몇 달 뒤 같은 별칭이 다른 모델을 가리켜도 기록은 진실을 유지한다.
+        # 보고 푸터에 실행 모델의 실측 ID(별칭 아님)를 남긴다. 몇 달 뒤 같은
+        # 별칭이 다른 모델을 가리켜도 기록은 진실을 유지한다.
         tid = self._seed_topic()
         det = self.weekly.deterministic(self.store, self.cfg, 2, "2026-07-14")
-        answers = iter([
-            json.dumps({"topics": [{"name": "드라이버 API", "threads": [tid]}]}),
-            json.dumps({"progress": [
-                {"text": "검토 요청이 왔다", "tid": tid,
-                 "quote": "스펙 v0.9 검토 의견 부탁드립니다"}],
-                "issues": [], "next": []}),
-            json.dumps({"summary": "요약", "order": []}),
-        ])
+        body = json.dumps({"topics": [{"name": "드라이버 API", "progress": [
+            {"text": "검토 요청이 왔다", "tid": tid,
+             "quote": "스펙 v0.9 검토 의견 부탁드립니다"}],
+            "issues": [], "next": []}]}, ensure_ascii=False)
 
         def fake_ai(cmd, prompt, **kwargs):
             cb = kwargs.get("on_event")
             if cb:
                 cb({"ev": "model", "model": "claude-testmodel-9"})
-            if "기간 내 원문 메일에서 주간 보고 후보 사실을 추출한다" in prompt:
-                return json.dumps({"threads": []})
-            if "주간 보고의 각 서술이 붙어 있는 원문 인용으로" in prompt:
-                return json.dumps({"supported": [f"r{i}" for i in range(30)],
-                                   "summary_supported": True})
-            if "그래서 무엇을 주목해야 하나" in prompt:
-                return json.dumps({"insights": []})
-            return next(answers)
+            if prompt.startswith("당신은 주간 업무 보고의 머리글"):
+                return json.dumps({"summary": ["요약"], "order": [], "insights": []})
+            if prompt.startswith("주간 보고가 아래 [다룬 토픽]"):
+                return json.dumps({"missed": []})
+            return body
 
         events = []
         with mock.patch.object(review, "ai_run", side_effect=fake_ai):
             ai = self.weekly.run_ai_layer(self.store, self.cfg, det,
                                           on_event=events.append)
         self.assertEqual(ai["model"], "claude-testmodel-9")
-        self.assertTrue(any(e.get("ev") == "model" for e in events))
         self.assertIn("모델 claude-testmodel-9", self.weekly.render(det, ai))
-        # 이벤트가 없으면(비스트리밍 백엔드) 푸터에 모델 줄 자체가 없다
-        self.assertNotIn("모델 ", self.weekly.render(det, dict(ai, model="")))
+        # 래핑이 바깥 콜백을 삼키지 않는다 — 이벤트는 그대로 흘러간다
+        self.assertTrue(any(e.get("ev") == "model" for e in events))
 
     def test_generate_does_not_swallow_cancelled(self):
         # 취소가 graceful 삼킴(AIError) 경로를 타면 뼈대 보고가 '완료'로 저장돼
@@ -16817,33 +16871,29 @@ class TestWeekly(unittest.TestCase):
                                      cancel=threading.Event())
 
     def test_insight_layer_labeled_and_optional(self):
-        # 해석 층 — 검증 통과 사실만 재료로 쓰는 유일한 비인용 단계. 사실 나열로
-        # 수렴하는 인용 강제의 보완이되, '참고 의견' 라벨로 사실 층과 구분한다.
+        # 해석 층 — 서술만 재료로 쓰는 비인용 단계. '참고 의견' 라벨로 사실 층과
+        # 구분한다. 2026-08-23 재설계에서 **머리글 콜에 합쳤다**(둘 다 서술을
+        # 재료로 쓰는 비인용 판단이라 한 콜에서 나온다).
         tid = self._seed_topic()
-        replies = [
-            json.dumps({"topics": [{"name": "드라이버 API", "threads": [tid]}]}),
-            json.dumps({"progress": [
-                {"text": "검토 요청이 왔다", "tid": tid,
-                 "quote": "스펙 v0.9 검토 의견 부탁드립니다"}],
-                "issues": [], "next": []}),
-            json.dumps({"summary": "x", "order": []}),
-            # 후보가 전부 토픽에 들어가 누락 점검 콜은 생략 — 다음 각본이 해석
-            json.dumps({"insights": [
-                {"topic": "드라이버 API",
-                 "text": "리뷰 병목이 다음 주 일정의 변수로 보인다"},
-                {"text": ""},                    # 빈 텍스트 → 버린다
-                "문자열",                         # 형식 이탈 → 버린다
-            ]}),
-        ]
-        det, ai = self._ai_layer(replies)
+        body = json.dumps({"topics": [{"name": "드라이버 API", "progress": [
+            {"text": "검토 요청이 왔다", "tid": tid,
+             "quote": "스펙 v0.9 검토 의견 부탁드립니다"}],
+            "issues": [], "next": []}]}, ensure_ascii=False)
+        head = json.dumps({"summary": ["x"], "order": [], "insights": [
+            {"topic": "드라이버 API",
+             "text": "리뷰 병목이 다음 주 일정의 변수로 보인다"},
+            {"text": ""},                    # 빈 텍스트 → 버린다
+            "문자열",                         # 형식 이탈 → 버린다
+        ]}, ensure_ascii=False)
+        det, ai = self._ai_layer([body], head=head)
         self.assertEqual(len(ai["insights"]), 1)
         self.assertEqual(ai["insights"][0]["topic"], "드라이버 API")
         md = self.weekly.render(det, ai)
         self.assertIn("## 해석", md)
         self.assertIn("참고 의견", md)            # 비인용 층임을 라벨로 명시
         self.assertIn("리뷰 병목", md)
-        # 해석 응답이 없으면(빈 배열 폴백) 섹션 자체가 없다 — 억지로 안 채운다
-        det2, ai2 = self._ai_layer(replies[:3])
+        # 해석이 비면 섹션 자체가 없다 — 억지로 안 채운다
+        det2, ai2 = self._ai_layer([body])
         self.assertEqual(ai2["insights"], [])
         self.assertNotIn("## 해석", self.weekly.render(det2, ai2))
 
@@ -16922,36 +16972,27 @@ class TestWeekly(unittest.TestCase):
         self.assertEqual(got, "(없음)")          # 내가 쓴 분량은 26자뿐
 
     def test_tone_sample_enters_only_the_overview_with_its_label(self):
-        # previous_report 와 같은 3중 제약 — 라벨·규칙문·총평 검증. 사실이 새면
-        # 검증을 통과한 서술만 요약한다는 계약이 깨진다.
-        # 표본은 보고 기간 밖에서 온다 — 기간 안이면 근거 메일로도 정당하게
-        # 들어가 버려서, 표본 경로만 검사할 수가 없다
+        # previous_report 와 같은 3중 제약 — 라벨·규칙문·머리글 검증. 사실이 새면
+        # 서술만 요약한다는 계약이 깨진다. 표본은 보고 기간 밖에서 온다 — 기간
+        # 안이면 근거 메일로도 정당하게 들어가 표본 경로만 검사할 수 없다.
         self.store.ingest([self._rx(
             "tone", ME, "주간 업무 보고", "2026-06-20T09:00:00",
             "TONE_POISON_이 문장의 사실은 이번 기간 것이 아니다. " * 20,
             to=[self.KIM])])
         tid = self._seed_topic()
         prompts = []
-        answers = iter([
-            json.dumps({"topics": [{"name": "드라이버 API", "threads": [tid]}]}),
-            json.dumps({"progress": [{
-                "text": "인터럽트 수정을 요청했다", "tid": tid, "mine": True,
-                "quote": "인터럽트 처리 부분만 수정 요청했습니다"}],
-                "issues": [], "next": []}),
-            json.dumps({"summary": ["한 줄"], "order": []}),
-            json.dumps({"missed": []}),
-        ])
+        body = json.dumps({"topics": [{"name": "드라이버 API", "progress": [{
+            "text": "인터럽트 수정을 요청했다", "tid": tid, "mine": True,
+            "quote": "인터럽트 처리 부분만 수정 요청했습니다"}],
+            "issues": [], "next": []}]}, ensure_ascii=False)
 
         def spy(cmd, prompt, **kwargs):
             prompts.append(prompt)
-            if "기간 내 원문 메일에서" in prompt:
-                return json.dumps({"threads": []})
-            if "주간 보고의 각 서술이" in prompt:
-                return json.dumps({"supported": [f"r{i}" for i in range(30)],
-                                   "summary_supported": True})
-            if "그래서 무엇을 주목해야 하나" in prompt:
-                return json.dumps({"insights": []})
-            return next(answers)
+            if prompt.startswith("당신은 주간 업무 보고의 머리글"):
+                return json.dumps({"summary": ["한 줄"], "order": [], "insights": []})
+            if prompt.startswith("주간 보고가 아래 [다룬 토픽]"):
+                return json.dumps({"missed": []})
+            return body
 
         det = self.weekly.deterministic(self.store, self.cfg, 2, "2026-07-14")
         with mock.patch.object(review, "ai_run", side_effect=spy):
@@ -17206,22 +17247,19 @@ class TestWeekly(unittest.TestCase):
 
     def test_render_with_topics(self):
         tid = self._seed_topic()
-        replies = [
-            json.dumps({"topics": [{"name": "드라이버 API", "threads": [tid]}]}),
-            json.dumps({"progress": [
-                {"text": "인터럽트 수정을 요청했다", "tid": tid, "mine": True,
-                 "quote": "인터럽트 처리 부분만 수정 요청했습니다"}],
-                "issues": [], "next": []}),
-            json.dumps({"summary": "한 줄 총평.", "order": ["드라이버 API"]}),
-            json.dumps({"missed": []}),
-        ]
-        det, ai = self._ai_layer(replies)
+        body = json.dumps({"topics": [{"name": "드라이버 API", "progress": [
+            {"text": "인터럽트 수정을 요청했다", "tid": tid, "mine": True,
+             "quote": "인터럽트 처리 부분만 수정 요청했습니다"}],
+            "issues": [], "next": []}]}, ensure_ascii=False)
+        head = json.dumps({"summary": "한 줄 총평.", "order": ["드라이버 API"],
+                           "insights": []}, ensure_ascii=False)
+        det, ai = self._ai_layer([body], head=head)
         md = self.weekly.render(det, ai)
         self.assertIn("한 줄 총평.", md)
         self.assertIn("## 1. 드라이버 API", md)
         self.assertIn("**진행**", md)
         self.assertIn("「인터럽트 처리 부분만 수정 요청했습니다」", md)
-        self.assertIn("AI 6콜", md)                # 조사 범위에 콜 수 노출(해석 포함)
+        self.assertIn("AI 2콜", md)                # 조사 범위에 콜 수 노출
 
     def test_previous_report_loaded_as_reference(self):
         d = self.cfg.vault / "weekly"
@@ -17248,21 +17286,19 @@ class TestWeekly(unittest.TestCase):
             "PREVIOUS_REFERENCE_ONLY", encoding="utf-8")
 
         prompts = []
-        answers = iter([
-            json.dumps({"threads": []}),
-            json.dumps({"topics": [{"name": "드라이버 API", "threads": [tid]}]}),
-            json.dumps({"progress": [{
-                "text": "인터럽트 수정을 요청했다", "tid": tid, "mine": True,
-                "quote": "인터럽트 처리 부분만 수정 요청했습니다",
-            }], "issues": [], "next": []}),
-            json.dumps({"summary": "한 줄 총평", "order": ["드라이버 API"]}),
-            json.dumps({"supported": ["r0"], "summary_supported": True}),
-            json.dumps({"insights": []}),
-        ])
+        body = json.dumps({"topics": [{"name": "드라이버 API", "progress": [{
+            "text": "인터럽트 수정을 요청했다", "tid": tid, "mine": True,
+            "quote": "인터럽트 처리 부분만 수정 요청했습니다"}],
+            "issues": [], "next": []}]}, ensure_ascii=False)
 
         def spy(cmd, prompt, **kwargs):
             prompts.append(prompt)
-            return next(answers)
+            if prompt.startswith("당신은 주간 업무 보고의 머리글"):
+                return json.dumps({"summary": ["한 줄 총평"],
+                                   "order": ["드라이버 API"], "insights": []})
+            if prompt.startswith("주간 보고가 아래 [다룬 토픽]"):
+                return json.dumps({"missed": []})
+            return body
 
         det = self.weekly.deterministic(
             self.store, self.cfg, weeks=2, today="2026-07-14")
@@ -17273,7 +17309,7 @@ class TestWeekly(unittest.TestCase):
         self.assertNotIn("ROLLING_POISON", joined)
         self.assertNotIn("DAILY_POISON", joined)
         previous_prompts = [p for p in prompts if "PREVIOUS_REFERENCE_ONLY" in p]
-        self.assertEqual(len(previous_prompts), 1)
+        self.assertEqual(len(previous_prompts), 1)      # 본문 콜에만
         self.assertIn("표현 중복 회피 전용", previous_prompts[0])
 
     def test_write_saves_to_vault_weekly(self):
@@ -17312,15 +17348,26 @@ class TestWeekly(unittest.TestCase):
         out = web.render_weekly(self.cfg, {})
         self.assertIn("저장된 주간 보고가 없습니다", out)
         self.assertIn("보고 만들기", out)
-        self.assertIn(f"AI 최대 {self.weekly.MAX_AI_CALLS}콜", out)
-        # 소요 시간은 **한 상수에서만** 나온다 — 카드가 '1~3분', 여기가 '2~5분' 이라
+        self.assertIn(f"AI {self.weekly.MAX_AI_CALLS}콜", out)
+        # 소요 시간은 **한 자리에서만** 만든다 — 카드가 '1~3분', 여기가 '2~5분' 이라
         # 두 화면이 다르게 말한 적이 있어 표기를 없앴었다(2026-07-29). 실측 근거가
-        # 생겨 되살리되(2026-08-22) 진입 문구와 대기 카드가 같은 값을 쓰는지 잰다.
-        self.assertIn(web._WEEKLY_ETA, out)
-        with mock.patch.dict(web._weekly_job, {"running": True, "stage": "쓰는 중"}):
+        # 생겨 되살렸고(2026-08-22), 2026-08-24 에 기간에 따라 달라지게 했다:
+        # 1주 7.6~10.4분 · 2주 14.6~25.9분 실측이라 한 값으로는 둘 다 틀린다.
+        self.assertIn(web._weekly_eta(1), out)
+        with mock.patch.dict(web._weekly_job,
+                             {"running": True, "stage": "쓰는 중", "weeks": 2}):
             card, running = web.render_weekly_status(self.cfg)
         self.assertTrue(running)
-        self.assertIn(web._WEEKLY_ETA, card)
+        self.assertIn(web._weekly_eta(2), card)          # 잡의 기간을 따른다
+        self.assertNotIn(web._weekly_eta(1), card)       # 1주 값이 새면 오안내
+
+    def test_weekly_eta_scales_with_the_period(self):
+        # 기간이 곱절이면 시간도 대략 곱절이다(실측: 1주 458~623초 · 2주 873~1,555초).
+        # 범위로 말하는 이유는 같은 프롬프트가 2.2배까지 흔들려서다.
+        self.assertEqual(web._weekly_eta(1), "보통 8~13분")
+        self.assertEqual(web._weekly_eta(2), "보통 16~26분")
+        self.assertEqual(web._weekly_eta(0), web._weekly_eta(1))   # 0·None 방어
+        self.assertEqual(web._weekly_eta(None), web._weekly_eta(1))
 
     def test_weekly_tab_lists_past_reports(self):
         for d in ("2026-07-14", "2026-06-30", "2026-06-16"):

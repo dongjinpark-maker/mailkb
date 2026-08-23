@@ -10,13 +10,12 @@
 중요도는 지목·답장 신호가 높다. **기계적 종결 여부는 점수에 넣지 않는다**(사용자
 확정) — 마무리됐다는 사실은 상태로만 표기한다.
 
-AI 계층(graceful, 실패해도 결정론 뼈대는 남는다):
-  1 기간 내 원문을 소배치로 읽어 메시지 단위 근거 카드 생성
-  2 검증된 카드로 토픽 묶기 → 최대 MAX_TOPICS 개
-  3 토픽별 서술 — 기간 내 원문 + 기간 이전 **원문**으로 델타 작성
-  4 누락 점검·총평·의미 검증
-모든 서술은 메시지 번호와 인용을 달고, 코드의 원문 대조와 별도 의미 검증을 모두
-통과한 것만 남는다. '내가 한 것'은 내 발신 메일에서만 인용을 허용한다.
+AI 계층은 **3콜**이다(graceful, 실패해도 결정론 뼈대는 남는다):
+  1 본문 — 그 주 원문 전체를 한 번에 읽고 토픽(최대 MAX_TOPICS)과 서술을 쓴다
+  2 머리글 — 1의 서술만 재료로 Executive Summary 와 해석을 쓴다
+  3 누락 점검 — 1이 다루지 않은 스레드에서 빠지면 안 되는 것을 건진다
+모든 서술은 메시지 번호와 인용을 달고, **코드의 원문 대조**(_keep)를 통과한 것만
+남는다. '내가 한 것'은 내 발신 메일에서만 인용을 허용한다.
 """
 
 from __future__ import annotations
@@ -38,22 +37,31 @@ MAX_TOPICS = 7            # 요약 항목의 재료 — EXEC_TOP 과 함께 움�
 WEEKLY_TOP = 5            # 한 절에 본문으로 보여 줄 최대 건수 (나머지는 '외 N건')
 EXEC_TOP = 7              # Executive Summary 항목 수 (사용자 확정: 일간 3 · 주간 7)
 REST_TOP = 20             # '그 외' 목록 상한 — 넘으면 '외 N건'으로 밝힌다
+CALENDAR_TOP = 20         # 기한 절 상한 — 날짜순이라 임박한 것부터 남는다
 TONE_SAMPLES = 2          # 문체 표본으로 붙일 내 보고성 메일 수
 TONE_CHARS = 1200         # 표본 한 통의 상한
 TONE_MIN_CHARS = 400      # 이보다 짧으면 문체가 안 드러난다
 # 보고성 제목 — 문체 표본 선정은 결정론이다(AI 에게 고르게 하면 사실이 샌다)
 _TONE_SUBJECT_RX = re.compile(r"보고|현황|정리|요약|주간|월간|회고")
-MAX_CANDIDATES = 64       # 중요 상태 우선 후보 상한 — 나머지는 '그 외'에 남김
-CARD_BATCH = 8            # 원문 근거 카드 1콜당 스레드 수
-CARD_MESSAGES = 8         # 카드용 스레드당 최초·신호·최신 메시지 상한
-# 카드는 **인용 근거를 뽑는 자리**라 이 상한이 가장 아팠다 — 700자면 업무 메일의
-# 결론·기한이 대개 밖에 있었다. 앞뒤 분할(clean.smart_truncate)로 꼬리를 살리고
-# 상한도 올린다. 콜이 배치당 1회씩 여러 번이라 무한정 올리지는 않는다(2026-08-03).
+# 후보는 **건수가 아니라 재료 크기로** 자른다(2026-08-23). 종전 상한 64 는
+# 카드 콜 수를 8개로 맞추려던 값(64÷8)이었고, 카드가 사라지자 근거가 없어졌다.
+# 실측: 주 2,000통(관여 777스레드)에서 상한 64 는 커버 37, 상한 150(재료 76KB)은
+# 44 였다. 반대로 전부(340KB) 넣으면 커버는 그대로인데 입력 토큰만 4.5배다 —
+# 예산은 품질 규칙이 아니라 **비용 상한이자 예측 가능성 장치**다.
+MATERIAL_BUDGET = 75_000  # 본문 콜에 실을 원문 재료 상한(자)
+MAX_CANDIDATES = 300      # 예산 안에서도 넘지 않는 건수 천장(병리적 입력 방어)
+CARD_MESSAGES = 8         # 스레드당 최초·신호·최신 메시지 상한
+# 원문 인용을 뽑는 자리라 이 상한이 가장 아프다 — 700자면 업무 메일의 결론·기한이
+# 대개 밖에 있었다. 앞뒤 분할(clean.smart_truncate)로 꼬리를 살린다(2026-08-03).
 CARD_BODY_MAX = 1200
 BODY_MAX = 2400           # 최종 서술용 메일 한 통 본문 상한
 QUOTE_MAX = 300
-MAX_AI_CALLS = ((MAX_CANDIDATES + CARD_BATCH - 1) // CARD_BATCH
-                + MAX_TOPICS + 5)  # 카드+묶기+서술+누락+총평+검증+해석
+MISSED_POOL = 30          # 누락 점검에 원문을 실어 보낼 '남은 스레드' 상한
+MAX_AI_CALLS = 3          # 본문 · 머리글(+해석) · 누락
+# 콜 하나가 무거워졌으므로 타임아웃도 단계별로 나눈다. 종전 240초 고정은 실측
+# 단독 콜(167~234초)에도 여유가 6초뿐이라 부하가 걸리면 바로 터졌다.
+_BODY_TIMEOUT = 900       # 본문 — 출력이 5~9KB 라 가장 길다
+_SHORT_TIMEOUT = 300      # 머리글·누락 — 출력이 짧다
 
 WEEKLY_SYSTEM = review.MAIL_EVIDENCE_SYSTEM + """
 주간 보고의 현재 사실·상태·중요도는 기간 내 원문 메일과 결정론 상태만으로 판단한다.
@@ -282,87 +290,68 @@ def deterministic(store: Store, cfg: Config, weeks: int = WINDOW_WEEKS,
 
 # ───────────────────────────────────────────────── AI 프롬프트
 
-CARD = """기간 내 원문 메일에서 주간 보고 후보 사실을 추출한다.
+# 프롬프트는 3개다 — 본문·머리글·누락. 2026-08-23 실측으로 7단계(카드→묶기→
+# 서술→총평→누락→검증→해석)에서 줄였다: 한 주 재료가 통째로 7~70KB 뿐이라
+# 쪼갤 이유가 용량이 아니었고, 쪼개니 모델이 한 번에 전체의 1/5만 보면서 출력의
+# 61%를 보고서에 싣지 않는 중간 산출물(카드)에 썼다. 17콜 29분 → 3콜 8분,
+# 인용 검증 통과율 92%대 → 100%.
+BODY = """당신은 주간 업무 보고를 쓴다. [이번 주 원문]과 [결정론 상태]만 근거로 삼는다.
 
-[규칙]
-- 스레드마다 이번 기간에 실제로 생긴 진행·이슈·다음 행동을 최대 4개 뽑는다.
-- 기간 이전 원문은 변화 전 상태를 이해하는 참고일 뿐, fact의 근거나 인용이 아니다.
-- fact마다 현재 기간 메일 하나의 mid와 그 본문에서 그대로 복사한 10자 이상 연속
-  quote를 붙인다. 여러 메시지를 한 quote로 합치지 않는다.
-- mine=true는 사용자가 직접 한 일이며 반드시 '나(발신)' 메시지여야 한다.
-- 중요도는 high/normal/low 중 하나다. 내 차례·막힘·결정·기한은 빠뜨리지 않는다.
-- 사실이 없는 스레드도 tid와 빈 facts를 반환한다.
+[할 일]
+이번 주에 실제로 움직인 일을 **최대 {max_topics}개 토픽**으로 묶고, 토픽마다
+진행·이슈·향후를 쓴다. 한 사안이면 여러 스레드를 한 토픽에 모으고, 다른 사안이면
+이름표가 같아도 나눈다.
 
-[출력] JSON 객체 하나만:
-{{"threads": [{{"tid": 12, "importance": "high",
-  "facts": [{{"kind": "progress", "text": "...", "mid": 31,
-              "quote": "...", "mine": false}}]}}]}}
+[무엇을 남기나 — 가장 중요한 판단]
+- 재료에는 이번 주에 움직인 스레드가 전부 들어 있다. 그중 **보고할 값어치가 있는
+  것**만 남겨라. 내가 많이 답장했다는 이유로 올리지 말고, 조용했다는 이유로 빼지
+  마라. 기준은 **일이 어떻게 됐고 무엇이 걸려 있는가**다.
+- 결정·기한·막힘·내 차례는 조용해도 빠뜨리지 마라.
 
-[원문 묶음]
-{source}
-"""
-
-GROUP = """검증된 원문 근거 카드에서 주간 보고의 '토픽'을 정한다.
-아래 목록은 사용자가 이번 기간에 직접 관여한 스레드와 원문 대조를 통과한 사실이다.
-
-[규칙]
-- 제목이 달라도 같은 사안이면 한 토픽으로 묶어라(예: 타이밍 문제와 그 재작업).
-- 보고 가치가 높은 순으로 최대 {max_topics}개만. 내 차례·막힘·결정·기한과 실제 변화,
-  이어서 관여도(지목·답장·내 발신)를 우선한다.
-- 토픽명은 사안을 알아볼 수 있는 한국어 명사구 20자 이내. 메일 제목 복사가 아니어도 된다.
-- 어느 토픽에도 안 들어가는 스레드는 그냥 빼라(억지로 묶지 말 것).
-- 입력에 없는 스레드 번호를 만들지 마라.
-
-[출력] JSON 객체 하나만. 코드펜스·설명 금지:
-{{"topics": [{{"name": "토픽명", "threads": [번호, 번호]}}]}}
-
-[스레드와 검증된 사실]
-{threads}
-"""
-
-WRITE = """당신은 주간 업무 보고의 한 토픽을 쓰는 실무자다. 아래 근거 메일만 사용한다.
-
-[토픽] {name}
-
-[기간] {start} ~ {end}
-{rules_user}
-[규칙]
-- **진행 사항**: 이 기간에 무엇이 움직였나. '기간 전 상태'와 비교해 **달라진 점**을 써라.
-- **이슈**: 걸린 것·미결·리스크. 없으면 빈 배열.
-- **향후 방향**: 다음에 필요한 것. **메일에 근거가 있을 때만** 쓰고, 없으면 빈 배열
-  (추측 금지). 기한이 있으면 날짜를 함께.
-- 각 항목은 한국어 한 문장(80자 내외)으로 간결하게.
-- 모든 항목에 근거가 필요하다: mid(메일 번호) + tid(스레드 번호) +
+[사실 항목 규칙]
+- **진행**: 이 기간에 달라진 것('기간 전 상태'와 비교). **이슈**: 걸린 것·미결·
+  리스크. **향후**: 메일에 근거가 있을 때만(추측 금지), 기한이 있으면 날짜를 함께.
+- 모든 항목에 근거가 필요하다: tid(스레드 번호) + mid(메일 번호) +
   quote(그 메일 본문에서 **그대로 복사한** 연속된 구절 10자 이상).
   여러 메일의 문장을 하나의 quote 로 합치지 마라.
-- **mine=true 는 '내가 한 것'을 뜻하며, quote 는 반드시 '내 발신' 메일에서만 가져와라.**
-  남이 쓴 문장으로 내 성과를 서술하지 마라.
+- **항목마다 tid 를 반드시 넣어라.** 토픽에만 적지 마라.
+- **mine=true 는 '내가 한 것'을 뜻하며, quote 는 반드시 '내 발신' 메일에서만
+  가져와라.** 남이 쓴 문장으로 내 성과를 서술하지 마라.
+- 각 항목은 한국어 한 문장(80자 내외).
+- **토픽마다 그 사안에서 실제로 일어난 일을 빠짐없이 쓴다**(보통 6~10건). 원문에
+  근거가 있는 사실을 분량을 아끼려고 생략하지 마라. 다만 근거 없는 항목을 채워
+  넣지는 마라. (이 한 줄이 실측에서 토픽 불릿을 35 → 62 로 올렸다.)
 - '직전 보고'는 문장 반복을 줄이기 위한 참고일 뿐이다. 그 안의 사실·상태·중요도를
   채택하거나, 원문에 있는 항목을 직전 보고 때문에 삭제하지 마라.
-
+{rules_user}
 [출력] JSON 객체 하나만. 코드펜스·설명 금지:
-{{"progress": [{{"text": "...", "tid": 12, "mid": 31,
-                 "quote": "...", "mine": false}}],
-  "issues": [{{"text": "...", "tid": 12, "mid": 31, "quote": "..."}}],
-  "next": [{{"text": "...", "tid": 12, "mid": 31, "quote": "..."}}]}}
+{{"topics": [{{"name": "토픽명",
+  "progress": [{{"text": "...", "tid": 12, "mid": 31, "quote": "...", "mine": false}}],
+  "issues":   [{{"text": "...", "tid": 12, "mid": 31, "quote": "..."}}],
+  "next":     [{{"text": "...", "tid": 12, "mid": 31, "quote": "..."}}]}}]}}
 
-[기간 전 원문 — 변화 전 상태 참고, 현재 항목의 인용 금지]
-{before}
+[결정론 상태 — 코드가 센 사실]
+{board}
 
 [직전 보고 — 표현 중복 회피 전용, 사실·상태·선별 근거로 사용 금지]
 {previous}
 
-[근거 메일]
-{mails}
+[이번 주 원문 — 인용 대상]
+{source}
 """
 
-OVERVIEW = """당신은 주간 업무 보고의 머리글(executive summary)을 쓴다.
+# 머리글을 본문과 **다른 콜**로 뺀 이유: 같은 콜에서 쓰게 하면 모델이 서술을 다
+# 쓴 뒤 남은 힘으로 머리글을 몰아 써서 계약을 어긴다. 실측(데모) — 한 콜일 때
+# 불릿당 1.4문장·절 잇기 0.3회, 분리하면 2.7문장·0.1회. 계약이 요구하는 "한
+# 문장에 사실 하나"가 지켜지는지가 여기서 갈렸다. 해석 층도 같은 성격(서술을
+# 재료로 쓰는 비인용 판단)이라 이 콜에 함께 싣는다.
+HEADLINE = """당신은 주간 업무 보고의 머리글(executive summary)과 해석을 쓴다.
 읽는 사람은 상위 management 다 — 세부 경과가 아니라 **무엇이 중요하고 무엇이
 걸려 있는지**가 먼저 와야 한다.
-{rules_user}
+
 [규칙]
 - 아래 [토픽 서술]과 [결정론 상태]만 근거로 쓴다. 새 사실을 만들지 마라.
-- 항목은 **최대 {top}건**, 중요한 것부터.
+- 머리글은 **최대 {top}건**, 중요한 것부터.
 - 각 항목은 '무엇이 어떻게 됐고, 그래서 지금 무엇이 필요한가'가 드러나게 쓴다.
   경과 나열이 아니라 판단이 서는 문장이어야 한다.
 - **높임말(합니다체)로 쓴다** — 상위 보고 문서다. "~했다"·"~이다" 같은 평서체를
@@ -376,16 +365,18 @@ OVERVIEW = """당신은 주간 업무 보고의 머리글(executive summary)을 
   인명·일정을 이번 요약에 가져오지 마라.
 - 쓸 것이 없으면 빈 배열을 내라. 채우려고 사소한 것을 올리지 마라.
 - 이어서 보고 순서를 중요도순으로 정하라(토픽명 그대로).
+- 해석(insights)은 '그래서 무엇을 주목해야 하나'다 — 사실 반복이 아니라 판단이고,
+  최대 4건이다. 근거가 약하면 비워라.
 
 [좋은 예 — 형태만 참고. 아래 사실을 가져다 쓰지 마라]
 - "양자화가 QAT 로 확정돼 B0 일정의 최대 변수가 닫혔습니다 — 남은 것은 재학습
   데이터 8/5 수령입니다"        ← 무엇이 어떻게 됐고 + 그래서 무엇이 남았나
 - "GDS 제출 8/20 이 다가오는데 타이밍 클로저 hold 위반이 유일한 걸림돌입니다"
-- "협력사 NDA 2건이 이번 분기 만료인데 제 후속이 12일째 없습니다"
 [나쁜 예] "양자화 관련 논의가 있었고 일정도 이야기됐습니다" ← 경과 나열, 판단 없음
-
+{rules_user}
 [출력] JSON 객체 하나만:
-{{"summary": ["한 문장", "한 문장"], "order": ["토픽명", "토픽명"]}}
+{{"summary": ["한 덩어리", "한 덩어리"], "order": ["토픽명", "토픽명"],
+  "insights": [{{"topic": "토픽명", "text": "해석 한두 문장"}}]}}
 
 [결정론 상태 — 코드가 센 사실. '지난 차수 대비'의 유일한 근거]
 {board}
@@ -397,110 +388,44 @@ OVERVIEW = """당신은 주간 업무 보고의 머리글(executive summary)을 
 {topics}
 """
 
-CHECK = """당신은 주간 보고의 누락을 점검한다.
+MISSED = """주간 보고가 아래 [다룬 토픽]으로 정리됐다. [남은 스레드]에서 **보고에서
+빠지면 안 되는 것**만 최대 5건 건져라.
 
-아래 '이미 다룬 토픽' 밖에서, 보고에 넣지 않으면 곤란할 사안이 있는지만 보라.
-조용하지만 중요한 것(기한 통보, 단발 결정, 요청 접수)을 특히 살펴라.
-아래 검증된 사실에 없는 이유를 만들지 마라. 없으면 빈 배열.
+[규칙]
+- 이미 다룬 토픽과 겹치는 것은 올리지 마라.
+- 결정·기한·막힘·내 차례를 우선한다. 채우려고 사소한 것을 올리지 마라.
+  없으면 빈 배열.
+- 각 항목에 tid + mid + quote(원문에서 **그대로 복사한** 10자 이상) + 한 문장 설명.
+- mine=true 는 '내가 한 것'이며 quote 는 '내 발신' 메일에서만 가져온다.
 
 [출력] JSON 객체 하나만:
-{{"missed": [{{"tid": 12}}]}}
+{{"missed": [{{"text": "...", "tid": 12, "mid": 31, "quote": "...", "mine": false}}]}}
 
-[이미 다룬 토픽]
+[다룬 토픽]
 {topics}
 
-[다루지 않은 스레드와 검증된 사실]
+[남은 스레드 원문]
 {rest}
 """
 
-VERIFY_REPORT = """주간 보고의 각 서술이 붙어 있는 원문 인용으로 의미상 뒷받침되는지
-보수적으로 검증한다. 인용에 같은 단어가 있다는 이유만으로 통과시키지 말고, 시제·주체·
-확정/예정/취소 상태가 서술과 맞아야 한다. summary는 통과한 서술들만 요약하는지 본다.
-
-[보고 항목과 원문]
-{claims}
-
-[총평]
-{summary}
-
-[결정론 상태 — 코드가 센 사실. 총평이 이걸 근거로 쓰는 것은 허용]
-{board}
-
-[출력] JSON 객체 하나만:
-{{"supported": ["r0", "r2"], "summary_supported": true}}
-"""
-
-_CARD_SCHEMA = {
-    "type": "object",
-    "properties": {"threads": {"type": "array", "items": {"type": "object"}}},
-    "required": ["threads"],
-}
-_GROUP_SCHEMA = {
+_BODY_SCHEMA = {
     "type": "object",
     "properties": {"topics": {"type": "array", "items": {"type": "object"}}},
     "required": ["topics"],
 }
-_WRITE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "progress": {"type": "array", "items": {"type": "object"}},
-        "issues": {"type": "array", "items": {"type": "object"}},
-        "next": {"type": "array", "items": {"type": "object"}},
-    },
-    "required": ["progress", "issues", "next"],
-}
-_OVERVIEW_SCHEMA = {
+_HEADLINE_SCHEMA = {
     "type": "object",
     "properties": {
         "summary": {"type": ["array", "string"], "items": {"type": "string"}},
         "order": {"type": "array", "items": {"type": "string"}},
+        "insights": {"type": "array", "items": {"type": "object"}},
     },
-    "required": ["summary", "order"],
+    "required": ["summary"],
 }
-_CHECK_SCHEMA = {
+_MISSED_SCHEMA = {
     "type": "object",
     "properties": {"missed": {"type": "array", "items": {"type": "object"}}},
     "required": ["missed"],
-}
-_VERIFY_REPORT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "supported": {"type": "array", "items": {"type": "string"}},
-        "summary_supported": {"type": "boolean"},
-    },
-    "required": ["supported", "summary_supported"],
-}
-
-# 해석 층 — 사실 층과 분리된 유일한 비인용 단계. 인용 강제는 정확하지만 사실
-# 나열에 수렴하므로, 검증을 통과한 서술만 재료로 '그래서 무엇을 주목하나'를
-# 별도 라벨로 쓴다. 화면·마크다운에서 참고 의견임을 명시한다(초안은 AI, 확정은 사람).
-INSIGHT = """당신은 주간 보고를 읽는 사람에게 '그래서 무엇을 주목해야 하나'를 말한다.
-
-아래 검증된 서술과 결정론 상태만 재료로 쓴다. 재료에 없는 사건·수치·이름을
-만들지 마라. 개별 서술의 반복은 해석이 아니다 — 서술들을 가로질러 보이는 것만
-말하라: 겹치는 원인, 커지는 리스크, 다음 주에 결판나는 것, 멈춰 있는 것.
-
-- 2~4개. 각 항목은 한두 문장, 어떤 토픽에서 나온 판단인지 topic 에 적는다.
-- 확실하지 않으면 '~로 보인다'로 쓰되, 재료로 뒷받침되지 않는 추측은 버려라.
-- 쓸 만한 해석이 없으면 빈 배열 — 억지로 채우지 마라.
-
-[출력] JSON 객체 하나만:
-{{"insights": [{{"topic": "토픽명", "text": "해석 한두 문장"}}]}}
-
-[검증된 서술]
-{brief}
-
-[짚어둘 것]
-{missed}
-
-[결정론 상태]
-{stats}
-"""
-
-_INSIGHT_SCHEMA = {
-    "type": "object",
-    "properties": {"insights": {"type": "array", "items": {"type": "object"}}},
-    "required": ["insights"],
 }
 
 
@@ -551,14 +476,30 @@ class _MessageQuoteChecker:
         return matched[0] if len(matched) == 1 else None
 
 
-def _candidate_items(items: list[dict]) -> list[dict]:
-    """열린 일·결정·기한을 먼저 보존한 뒤 관여도와 최신순으로 자른다."""
+def _candidate_items(items: list[dict], store: "Store | None" = None,
+                    start: str = "", end: str = "") -> list[dict]:
+    """열린 일·결정·기한을 먼저 보존한 뒤 관여도와 최신순으로 자른다.
+
+    store 를 주면 **재료 크기 예산**(MATERIAL_BUDGET)으로 자른다 — 스레드마다
+    실제로 프롬프트에 실릴 원문 길이를 재서 예산을 넘기 전까지 담는다. 건수로
+    자르면 짧은 스레드가 많은 주는 재료를 남기고, 긴 스레드가 많은 주는 넘친다.
+    store 없이 부르면 종전처럼 건수 천장만 적용한다(호출부 호환)."""
     def key(t):
         protected = (t["state"] in ("내 차례", "막힘")
                      or bool(t["decision"]) or bool(t["deadline"]))
         return (int(protected), t["score"], t["last"])
 
-    return sorted(items, key=key, reverse=True)[:MAX_CANDIDATES]
+    ranked = sorted(items, key=key, reverse=True)[:MAX_CANDIDATES]
+    if store is None or not start:
+        return ranked
+    out, used = [], 0
+    for t in ranked:
+        size = len(_card_source(store, [t], start, end))
+        if out and used + size > MATERIAL_BUDGET:
+            break                 # 첫 건은 예산을 넘어도 싣는다(빈 보고 방지)
+        out.append(t)
+        used += size
+    return out
 
 
 def _period_rows(store: Store, tid: int, start: str, end: str,
@@ -607,16 +548,6 @@ def _format_rows(rows: list, body_max: int) -> str:
     return "\n\n".join(out)
 
 
-def _topic_mails(store: Store, tids: list[int], start: str, end: str) -> str:
-    """최종 서술 입력 — 기간 내 원문. 누적·데일리 요약은 읽지 않는다."""
-    chunks = []
-    for tid in tids:
-        text = _format_rows(_period_rows(store, tid, start, end), BODY_MAX)
-        if text:
-            chunks.append(text)
-    return "\n\n".join(chunks)
-
-
 def _before_state(store: Store, tids: list[int], start: str) -> str:
     """변화 전 상태는 현재 누적 요약이 아니라 기간 이전 원문 끝부분으로 복원한다."""
     out = []
@@ -646,47 +577,6 @@ def _card_source(store: Store, items: list[dict], start: str, end: str) -> str:
             f"{_before_state(store, [t['thread_id']], start)}\n"
             f"[현재 기간 원문 — fact 인용 대상]\n{current}")
     return "\n\n".join(out)
-
-
-def _fallback_fact(store: Store, t: dict, start: str, end: str) -> list[dict]:
-    """카드 콜 실패/빈 응답 때도 원문 한 문장으로 후보를 잃지 않는다."""
-    rows = _period_rows(store, t["thread_id"], start, end, CARD_MESSAGES)
-    for row in reversed(rows):
-        for sentence in features.split_sentences((row["new_content"] or "").strip()):
-            quote = sentence.strip()
-            if len(_norm_ws(quote)) < 10:
-                continue
-            if row["has_deadline"]:
-                kind = "next"
-            elif row["has_request"] and not row["is_sent"]:
-                kind = "issue"
-            else:
-                kind = "progress"
-            return [{"kind": kind, "text": quote[:160], "mid": row["id"],
-                     "tid": t["thread_id"], "quote": quote[:QUOTE_MAX],
-                     "mine": bool(row["is_sent"])}]
-    return []
-
-
-def _thread_lines(items: list[dict], cards: dict[int, list[dict]]) -> str:
-    """토픽 묶기 입력 — 결정론 상태와 원문 검증을 통과한 카드만."""
-    out = []
-    for t in items:
-        who = ", ".join(sorted(t["people"], key=lambda k: -t["people"][k])[:3])
-        head = (
-            f"#{t['thread_id']} {t['subject']} · {t['first'][:10]}~{t['last'][:10]} "
-            f"· 상태 {t['state']}({t['state_note']}) · 내발신 {t['sent']} "
-            f"지목 {t['named']} 직접 {t['direct']} 답장 {t['replies']} "
-            f"결정 {t['decision']} 기한 {t['deadline']}"
-            + (f" · {who}" if who else ""))
-        facts = cards.get(t["thread_id"]) or []
-        lines = [
-            f"    - {f['kind']}: {f['text']} "
-            f"「{f['quote']}」 (mid={f['mid']})"
-            for f in facts
-        ]
-        out.append(head + (("\n" + "\n".join(lines)) if lines else ""))
-    return "\n".join(out)
 
 
 def previous_report(cfg: Config, start: str) -> str:
@@ -764,7 +654,7 @@ def board_facts(det: dict) -> str:
 
 def _ai(cfg: Config, cmd: list[str], prompt: str, meter: dict,
         schema=None, progress=None, label: str = "",
-        on_event=None, cancel=None) -> dict | None:
+        on_event=None, cancel=None, timeout: int = 300) -> dict | None:
     """AI 1콜 → JSON 객체. 실패는 None(호출부가 graceful 하게 계속).
 
     progress+label 이 오면 호출 직전 '콜 n/N · 송신 …' 를 상태 문구에 싣는다 —
@@ -779,7 +669,7 @@ def _ai(cfg: Config, cmd: list[str], prompt: str, meter: dict,
         progress(f"{label} · 콜 {meter['calls']}/{MAX_AI_CALLS} · 송신 {size}")
     try:
         raw = review.ai_run(
-            cmd, prompt, timeout=240, retries=1,
+            cmd, prompt, timeout=timeout, retries=1,
             system_prompt=WEEKLY_SYSTEM, json_schema=schema, effort="high",
             # effort_flag 는 run_ai_layer 가 meter 에 실어 보낸다 — 7개 호출
             # 지점에 인자를 각각 꿰는 대신, 한 실행에서 불변인 값을 이미 모든
@@ -787,7 +677,12 @@ def _ai(cfg: Config, cmd: list[str], prompt: str, meter: dict,
             effort_flag=meter.get("effort_flag"),
             on_event=on_event, cancel=cancel,
         )
-    except review.AIError:
+    except review.AIError as e:
+        # 실패한 단계를 남긴다 — 콜이 3개뿐이라 하나가 죽으면 보고서의 한 층이
+        # 통째로 빈다. 그걸 말하지 않으면 사용자는 '이번 주는 조용했나 보다'로
+        # 읽는다(2026-08-23 실측: AI 층이 전멸했는데 보고서에 아무 표시가 없었다).
+        meter.setdefault("failed", []).append(
+            f"{label or '단계'}({'시간 초과' if isinstance(e, review.AITimeout) else '실패'})")
         return None
     return review._parse_json_obj(raw)
 
@@ -808,7 +703,7 @@ def _brief(written: list[dict]) -> str:
 
 
 def _exec_lines(v) -> list[str]:
-    """OVERVIEW 의 summary 를 항목 리스트로. 배열이 정본이고 문자열도 받는다 —
+    """HEADLINE 의 summary 를 항목 리스트로. 배열이 정본이고 문자열도 받는다 —
     백엔드가 CLI 라 형태가 흔들린다(줄바꿈 나열로 돌려주는 모델이 있다).
     렌더가 '- ' 를 붙이므로 앞머리 글머리표는 여기서 뗀다."""
     if isinstance(v, str):
@@ -821,6 +716,14 @@ def _exec_lines(v) -> list[str]:
         if s:
             out.append(s[:600])
     return out[:EXEC_TOP]
+
+
+def _with_tid(rows, tid: int | None):
+    """항목에 tid 가 없고 출처가 유일할 때만 채운다 — 없으면 그대로 둔다."""
+    if tid is None:
+        return rows
+    return [(dict(r, tid=r.get("tid", tid)) if isinstance(r, dict) else r)
+            for r in (rows or [])]
 
 
 def _keep(rows, checker: _MessageQuoteChecker, allow: set[int]) -> list[dict]:
@@ -846,54 +749,29 @@ def _keep(rows, checker: _MessageQuoteChecker, allow: set[int]) -> list[dict]:
     return out
 
 
-def _cards(store: Store, cfg: Config, cmd: list[str], candidates: list[dict],
-           start: str, end: str, meter: dict, progress=None,
-           on_event=None, cancel=None) -> dict[int, list[dict]]:
-    checker = _MessageQuoteChecker(store, start, end)
-    out: dict[int, list[dict]] = {}
-    total = (len(candidates) + CARD_BATCH - 1) // CARD_BATCH
-    for pos in range(0, len(candidates), CARD_BATCH):
-        batch = candidates[pos:pos + CARD_BATCH]
-        res = _ai(cfg, cmd, CARD.format(
-            source=_card_source(store, batch, start, end)),
-            meter, _CARD_SCHEMA, progress,
-            f"원문 근거 {pos // CARD_BATCH + 1}/{total} 묶음 읽는 중",
-            on_event, cancel) or {}
-        raw_by_tid: dict[int, list] = {}
-        for entry in res.get("threads") or []:
-            if not isinstance(entry, dict):
-                continue
-            try:
-                tid = int(entry.get("tid"))
-            except (TypeError, ValueError):
-                continue
-            raw_by_tid[tid] = entry.get("facts") or []
-        for t in batch:
-            tid = t["thread_id"]
-            raw = raw_by_tid.get(tid) or []
-            facts = _keep(raw, checker, {tid})
-            clean = []
-            for fact in facts[:4]:
-                source = next((
-                    x for x in raw if isinstance(x, dict)
-                    and str(x.get("quote") or "").strip()[:QUOTE_MAX] == fact["quote"]
-                ), {})
-                kind = str(source.get("kind") or "progress")
-                fact["kind"] = kind if kind in ("progress", "issue", "next") else "progress"
-                clean.append(fact)
-            out[tid] = clean or _fallback_fact(store, t, start, end)
-    return out
-
-
-def _best_fact(facts: list[dict]) -> dict | None:
-    order = {"issue": 0, "next": 1, "progress": 2}
-    return min(facts, key=lambda f: order.get(f.get("kind"), 3)) if facts else None
-
-
 def run_ai_layer(store: Store, cfg: Config, det: dict,
                  backend: str | None = None, progress=None,
                  on_event=None, cancel=None) -> dict | None:
-    """원문 카드 → 토픽 → 서술 → 누락 → 총평 → 의미 검증."""
+    """본문 → 머리글·해석 → 누락. **3콜이다**(2026-08-23 재설계).
+
+    종전에는 7단계 17~20콜이었다. 재료를 8스레드씩 잘라 카드를 뽑고, 토픽을 묶고,
+    토픽마다 서술하고, 총평·누락·의미검증·해석을 각각 불렀다. 그 구조를 버린
+    근거는 실측이다:
+
+    - 쪼갤 이유가 **용량이 아니었다.** 한 주 재료가 7KB(주 80통)~70KB(주 2,000통)
+      뿐인데 17콜이 같은 재료를 6.5배(43,678자)로 부풀려 보내고 있었다.
+    - 모델이 한 번에 **전체의 1/5**만 봤다. 앞 조각을 기억하지 못한 채 묶고 썼다.
+    - 출력의 **61%가 보고서에 실리지 않는 중간 산출물**(카드)이었고, 시간은
+      출력량에 비례한다 — 카드에만 15분이 갔다.
+    - 결과: 17콜 29분 → 3콜 8분(3.5~4.3배), 인용 검증 통과율 92%대 → 100%,
+      토픽 불릿 동등(62 대 64), 커버는 오히려 넓다(44 대 37).
+
+    의미 검증(VERIFY_REPORT) 단계는 없앴다. 실측 3회 중 2회가 240초 타임아웃으로
+    죽었고, 살아난 1회가 한 일은 머리글을 통째로 지운 것이었다. 더 나쁜 것은
+    **타임아웃이 보고서를 더 그럴듯하게** 만든다는 점이다(검증이 건너뛰어져 걸러질
+    문장이 남는다). 불변식 7이 요구하는 것은 '인용 검증을 코드가 한다'이고 그건
+    _keep()이 그대로 한다 — 없앤 것은 그 위에 얹었던 모델의 재확인이다.
+    """
     items = det["items"]
     if not items:
         return None
@@ -914,178 +792,61 @@ def run_ai_layer(store: Store, cfg: Config, det: dict,
                 seen_model["v"] = str(info["model"])
             _outer_event(info)
 
-    meter = {"calls": 0, "effort_flag": cfg.ai_effort_flag(bk_name)}
-    by_id = {t["thread_id"]: t for t in items}
-    candidates = _candidate_items(items)
-    candidate_ids = {t["thread_id"] for t in candidates}
-    cards = _cards(
-        store, cfg, cmd, candidates, det["start"], det["end"], meter, progress,
-        on_event, cancel)
-
-    grouped = _ai(cfg, cmd, GROUP.format(
-        max_topics=MAX_TOPICS, threads=_thread_lines(candidates, cards)),
-        meter, _GROUP_SCHEMA, progress, "토픽 묶는 중", on_event, cancel)
-    topics_in = (grouped or {}).get("topics") or []
-    topics: list[dict] = []
-    claimed: set[int] = set()
-    for t in topics_in[:MAX_TOPICS]:
-        if not isinstance(t, dict):
-            continue
-        name = str(t.get("name") or "").strip()[:60]
-        tids = []
-        for x in t.get("threads") or []:
-            if not isinstance(x, (int, str)) or not str(x).isdigit():
-                continue
-            tid = int(x)
-            if tid in candidate_ids and tid not in claimed:
-                tids.append(tid)
-        if name and tids:
-            topics.append({"name": name, "tids": tids})
-            claimed.update(tids)
-    if not topics:
-        topics = [{"name": t["subject"][:60], "tids": [t["thread_id"]]}
-                  for t in candidates[:MAX_TOPICS]]
-
-    checker = _MessageQuoteChecker(store, det["start"], det["end"])
-    prev = previous_report(cfg, det["start"])
-    # 사용자 지침(ai-rules.md)은 서술·총평에만 넣는다 — 추출(CARD)·누락 점검
-    # (CHECK)·검증(VERIFY_REPORT)에 넣으면 지침이 의역을 유발해 인용 검증
-    # 탈락률만 올린다. 라벨이 '사실 근거 아님'을 명시하는 이유는 이 모듈의
-    # 원칙(누적 요약·이전 보고를 사실 근거로 안 쓴다)과 한 몸이 되기 위해서다.
+    meter = {"calls": 0, "effort_flag": cfg.ai_effort_flag(bk_name), "failed": []}
+    candidates = _candidate_items(items, store, det["start"], det["end"])
+    allow = {t["thread_id"] for t in candidates}
     rules = cfg.ai_rules_text()
+    # 사용자 지침(ai-rules.md)은 서술·머리글에만 넣는다 — 누락 점검에 넣으면
+    # 지침이 의역을 유발해 인용 검증 탈락률만 올린다.
     rules_user = (f"\n[사용자 지침 — 표현·우선순위 지시. 사실 근거가 아니며"
                   f" 인용 대상이 아니다]\n{rules}\n" if rules else "")
+
+    body = _ai(cfg, cmd, BODY.format(
+        max_topics=MAX_TOPICS, rules_user=rules_user,
+        board=board_facts(det),
+        previous=previous_report(cfg, det["start"]) or "(없음)",
+        source=_card_source(store, candidates, det["start"], det["end"])),
+        meter, _BODY_SCHEMA, progress, "원문 읽고 토픽 쓰는 중",
+        on_event, cancel, timeout=_BODY_TIMEOUT) or {}
+
+    checker = _MessageQuoteChecker(store, det["start"], det["end"])
     written, dropped = [], 0
-    for i, tp in enumerate(topics, 1):
-        res = _ai(cfg, cmd, WRITE.format(
-            name=tp["name"], start=det["start"], end=det["end"],
-            rules_user=rules_user,
-            before=_before_state(store, tp["tids"], det["start"]),
-            previous=prev,
-            mails=_topic_mails(store, tp["tids"], det["start"], det["end"])),
-            meter, _WRITE_SCHEMA, progress, f"토픽 {i}/{len(topics)} 서술 중",
-            on_event, cancel)
-        if not res:
+    for tp in (body.get("topics") or [])[:MAX_TOPICS]:
+        if not isinstance(tp, dict):
             continue
-        allow = set(tp["tids"])
-        sec = {k: _keep(res.get(k), checker, allow)
+        name = str(tp.get("name") or "").strip()[:60]
+        # 항목에 tid 가 빠지면 _keep 이 전건을 버린다 — 종전 카드 단계가 정확히
+        # 그래서 통째로 폐기되고 있었다(2026-08-23 발견: 사실 23개 → 통과 0개).
+        # 프롬프트가 항목마다 요구하지만, 토픽이 tids 를 하나만 달고 온 경우는
+        # 출처가 유일하므로 코드가 채운다. 여럿이면 추측이 되므로 채우지 않는다.
+        one = None
+        tl = [x for x in (tp.get("tids") or []) if str(x).isdigit()]
+        if len(tl) == 1:
+            one = int(tl[0])
+        sec = {k: _keep(_with_tid(tp.get(k), one), checker, allow)
                for k in ("progress", "issues", "next")}
-        raw_n = sum(len(res.get(k) or []) for k in ("progress", "issues", "next"))
+        raw_n = sum(len(tp.get(k) or []) for k in ("progress", "issues", "next"))
         dropped += raw_n - sum(len(v) for v in sec.values())
-        if any(sec.values()):
-            written.append({"name": tp["name"], "tids": tp["tids"], **sec})
+        if name and any(sec.values()):
+            tids = sorted({it["tid"] for v in sec.values() for it in v})
+            written.append({"name": name, "tids": tids, **sec})
     if not written:
         return None
 
-    board = board_facts(det)
-    ov = _ai(
-        cfg, cmd, OVERVIEW.format(topics=_brief(written), top=EXEC_TOP,
-                                  rules_user=rules_user,
-                                  board=board, tone=tone_samples(store)),
-        meter, _OVERVIEW_SCHEMA, progress, "총평 정리 중",
-        on_event, cancel) or {}
-    summary = _exec_lines(ov.get("summary"))
+    head = _ai(cfg, cmd, HEADLINE.format(
+        top=EXEC_TOP, rules_user=rules_user, board=board_facts(det),
+        tone=tone_samples(store), topics=_brief(written)),
+        meter, _HEADLINE_SCHEMA, progress, "머리글 정리 중",
+        on_event, cancel, timeout=_SHORT_TIMEOUT) or {}
+    summary = _exec_lines(head.get("summary"))
     # 빈 결과의 이유를 갈라 둔다 — 호출 실패를 '특이사항 없음'이라 말하면 거짓이다
-    summary_state = "ok" if summary else ("none" if ov else "failed")
-    order = [str(x) for x in (ov.get("order") or [])]
+    summary_state = "ok" if summary else ("none" if head else "failed")
+    order = [str(x) for x in (head.get("order") or [])]
     if order:
         rank = {n: i for i, n in enumerate(order)}
         written.sort(key=lambda w: rank.get(w["name"], len(rank)))
-
-    covered = {tid for w in written for tid in w["tids"]}
-    candidate_rest = [t for t in candidates if t["thread_id"] not in covered]
-    missed = []
-    if candidate_rest:
-        chk = _ai(cfg, cmd, CHECK.format(
-            topics=", ".join(w["name"] for w in written),
-            rest=_thread_lines(candidate_rest, cards)),
-            meter, _CHECK_SCHEMA, progress, "누락 점검 중",
-            on_event, cancel) or {}
-        selected = []
-        for m in chk.get("missed") or []:
-            if not isinstance(m, dict):
-                continue
-            try:
-                tid = int(m.get("tid"))
-            except (TypeError, ValueError):
-                continue
-            if tid in candidate_ids and tid not in covered and tid not in selected:
-                selected.append(tid)
-        # 모델이 놓쳐도 내 차례·막힘·결정·기한은 조용히 사라지지 않는다.
-        for t in candidate_rest:
-            if (t["state"] in ("내 차례", "막힘")
-                    or t["decision"] or t["deadline"]):
-                if t["thread_id"] not in selected:
-                    selected.append(t["thread_id"])
-        for tid in selected[:5]:
-            fact = _best_fact(cards.get(tid) or [])
-            if fact:
-                missed.append({
-                    "tid": tid, "mid": fact["mid"], "why": fact["text"],
-                    "quote": fact["quote"], "mine": fact["mine"],
-                    "subject": by_id[tid]["subject"],
-                })
-
-    claims = []
-    refs: dict[str, dict] = {}
-    for w in written:
-        for key in ("progress", "issues", "next"):
-            for it in w[key]:
-                rid = f"r{len(claims)}"
-                refs[rid] = it
-                claims.append({
-                    "id": rid, "text": it["text"], "mid": it["mid"],
-                    "quote": it["quote"],
-                })
-    for it in missed:
-        rid = f"r{len(claims)}"
-        refs[rid] = it
-        claims.append({
-            "id": rid, "text": it["why"], "mid": it["mid"],
-            "quote": it["quote"],
-        })
-    verified = _ai(
-        cfg, cmd, VERIFY_REPORT.format(
-            claims=json.dumps(claims, ensure_ascii=False),
-            summary="\n".join(f"- {s}" for s in summary) or "(없음)", board=board),
-        meter, _VERIFY_REPORT_SCHEMA, progress, "보고 근거 검증 중",
-        on_event, cancel)
-    semantic_checked = bool(verified)
-    if verified:
-        supported = {str(x) for x in verified.get("supported") or []}
-        for w in written:
-            for key in ("progress", "issues", "next"):
-                before_n = len(w[key])
-                w[key] = [it for it in w[key]
-                          if next((rid for rid, ref in refs.items() if ref is it), "")
-                          in supported]
-                dropped += before_n - len(w[key])
-        written = [w for w in written if any(
-            w[k] for k in ("progress", "issues", "next"))]
-        missed = [it for it in missed
-                  if next((rid for rid, ref in refs.items() if ref is it), "")
-                  in supported]
-        if not verified.get("summary_supported"):
-            summary = []
-            summary_state = "unverified"
-    if not written:
-        return None
-
-    # 해석 층 — 검증을 통과한 서술만 재료로 쓰는 비인용 단계. 실패하면 생략
-    # (사실 층은 불변). 상태 카운트는 결정론 값이라 해석의 닻이 된다.
-    n_state: dict[str, int] = {}
-    for t in candidates:
-        n_state[t["state"]] = n_state.get(t["state"], 0) + 1
-    stats = " · ".join(f"{k} {v}건" for k, v in sorted(n_state.items()))
-    ins = _ai(cfg, cmd, INSIGHT.format(
-        brief=_brief(written),
-        missed="\n".join(f"- {m['subject']} — {m['why']}" for m in missed)
-               or "(없음)",
-        stats=stats or "(없음)"),
-        meter, _INSIGHT_SCHEMA, progress, "해석 정리 중",
-        on_event, cancel) or {}
     insights = []
-    for it in (ins.get("insights") or [])[:4]:
+    for it in (head.get("insights") or [])[:4]:
         if not isinstance(it, dict):
             continue
         text = str(it.get("text") or "").strip()[:300]
@@ -1093,8 +854,27 @@ def run_ai_layer(store: Store, cfg: Config, det: dict,
             insights.append({"topic": str(it.get("topic") or "").strip()[:60],
                              "text": text})
 
-    accounted = {tid for w in written for tid in w["tids"]}
-    accounted.update(m["tid"] for m in missed)
+    covered = {tid for w in written for tid in w["tids"]}
+    rest_cand = [t for t in candidates if t["thread_id"] not in covered]
+    missed = []
+    if rest_cand:
+        chk = _ai(cfg, cmd, MISSED.format(
+            topics="\n".join(f"- {w['name']}" for w in written),
+            rest=_card_source(store, rest_cand[:MISSED_POOL],
+                              det["start"], det["end"])),
+            meter, _MISSED_SCHEMA, progress, "누락 점검 중",
+            on_event, cancel, timeout=_SHORT_TIMEOUT) or {}
+        pool = {t["thread_id"] for t in rest_cand[:MISSED_POOL]}
+        rows = chk.get("missed") or []
+        kept = _keep(rows, checker, pool)[:5]
+        dropped += len(rows) - len(kept)
+        by_id = {t["thread_id"]: t for t in items}
+        for it in kept:
+            missed.append({"tid": it["tid"], "mid": it["mid"], "why": it["text"],
+                           "quote": it["quote"], "mine": it["mine"],
+                           "subject": by_id[it["tid"]]["subject"]})
+
+    accounted = covered | {m["tid"] for m in missed}
     rest = [t for t in items if t["thread_id"] not in accounted]
     if progress:
         progress("완료")
@@ -1102,7 +882,7 @@ def run_ai_layer(store: Store, cfg: Config, det: dict,
             "topics": written, "missed": missed,
             "insights": insights,
             "rest": rest, "calls": meter["calls"], "dropped": dropped,
-            "semantic_checked": semantic_checked,
+            "failed": list(meter["failed"]),
             "candidate_count": len(candidates),
             "model": seen_model["v"]}
 
@@ -1141,12 +921,17 @@ def _render_calendar(out: list[str], det: dict) -> None:
     if not cal:
         return
     out.append(f"## 기한 ({len(cal)}건)")
-    for c in cal:
+    # 상한을 둔다(2026-08-23). "중요도가 낮아도 빼지 않는다"는 원칙은 기한이
+    # 5건일 때 옳았고, 주 2,000통 실측에서 113건 → 인용까지 226줄이 되어 읽을 수
+    # 없는 벽이 됐다. 날짜순이므로 **임박한 것부터** 남기고 나머지는 건수로 밝힌다.
+    for c in cal[:CALENDAR_TOP]:
         tag = " · 중요도 낮음" if c["low"] else ""
         out.append(f"- **{c['due']:%m/%d}** [#{c['thread_id']}] {c['subject']}{tag}"
                    + review.done_mark("deadline",
                                       Store.report_key(c["thread_id"], c["quote"])))
         out.append(f"  「{c['quote']}」")
+    if len(cal) > CALENDAR_TOP:
+        out.append(f"- … 외 {len(cal) - CALENDAR_TOP}건 (날짜 늦은 순)")
     out.append("")
 
 
@@ -1198,7 +983,11 @@ def render(det: dict, ai: dict | None) -> str:
     if det.get("ai_error"):
         # 인증 만료 등으로 AI 보강이 중단됨 — 로그 없이도 원인이 보이게 머리에
         out += [f"> {det['ai_error']} (AI 보강 없이 뼈대만)", ""]
-    # Executive Summary — 상위 management 보고 톤. 대상 선정은 결정론, 문장만 AI.
+    # Executive Summary — 상위 management 보고 톤. **주간은 선정도 AI 가 한다**
+    # (2026-08-23): 재료 전체가 한 콜에 들어가므로 모델이 전체를 보고 고른다.
+    # 결정론이 남는 자리는 후보 풀(재료 예산)·상태판·인용 검증이다. 일간 머리글은
+    # 여전히 결정론 선정이다(review.headlines) — 콜 하나로 하루를 훑는 구조가
+    # 아니라서, 같은 근거가 아직 서지 않았다.
     # AI 가 없으면 비운다(결정론 흉내는 읽는 값이 없다 — 2026-08-01 사용자 확정).
     # AI 를 안 돌렸으면 절 자체를 내지 않는다. 돌렸는데 비었으면 그 이유를 말한다
     # (일간과 같은 문구 표 — review.EXEC_EMPTY).
@@ -1279,8 +1068,10 @@ def render(det: dict, ai: dict | None) -> str:
         scope += f" · 원문 후보 {ai.get('candidate_count', st['threads'])}"
         if ai.get("dropped"):
             scope += f" · 인용 검증 탈락 {ai['dropped']}"
-        if not ai.get("semantic_checked"):
-            scope += " · 의미 검증 미완료"
+        # 실패한 단계를 반드시 말한다 — 콜이 3개라 하나만 죽어도 한 층이 통째로
+        # 빈다. 침묵하면 '이번 주는 조용했다'로 읽힌다(2026-08-23).
+        if ai.get("failed"):
+            scope += f" · ⚠ AI 단계 실패 {len(ai['failed'])}건({', '.join(ai['failed'])})"
     out.append(scope)
     out.append("별표(*)는 내 발신 메일에서 인용한 '내가 한 것'을 뜻합니다.")
     return "\n".join(out)

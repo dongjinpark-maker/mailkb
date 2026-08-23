@@ -263,7 +263,7 @@ ask 와 diagnose 는 그 자체가 AI 명령이니 내가 요청할 때만 실�
 | `ask <질문> [--follow --person]` | **분석** — 근거 달린 답 | ✓ |
 | `ask --history` · `--show <번호>` · `--context <질문>` | 저장된 분석 열람 · 엔진이 실을 지침·노트·지식 보기 | ✗ |
 | `review [--ai]` | 일간 회고 → vault/daily | 선택 |
-| `weekly [--weeks 1 --ai]` | 원문 근거 기반 주간 보고 → vault/weekly. `--ai` 는 최대 20콜이라 **보통 20~30분** | 선택 |
+| `weekly [--weeks 1 --ai]` | 원문 근거 기반 주간 보고 → vault/weekly. `--ai` 는 3콜이고 **주당 8~13분** | 선택 |
 | `note <스레드ID>` | 지식 노트 템플릿 생성 — 웹에선 스레드 화면에서 바로 쓰고, 검색·AI 문맥에 반영 | ✗ |
 | `audit` · `noise` · `stats` | 분류 감사 · 발신자 분포 · 저장소 통계 | ✗ |
 | `doctor` | **사전 점검** — 환경·Outlook·수집 폴더 범위·설정·DB·AI 경로. 수집 전에 30초로 '이 PC 에서 되는가' 를 답한다 | ✗ |
