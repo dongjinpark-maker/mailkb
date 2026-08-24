@@ -136,12 +136,17 @@ def save_candidate(cfg: Config, store: Store, cid: int,
 
     보강(AI 1콜)을 저장 시점에 시도하고, 실패하면 수확본 그대로 저장한다 —
     AI 실패는 우아하게, 저장 자체는 늘 된다.
+
+    보강 실패 여부는 `save_candidate.last_enriched` 에 남는다(호출 직후에만
+    유효한 관측값). 종전에는 실패가 완전히 조용해서, 사용자는 "지식으로 저장:
+    x.md" 성공 메시지만 보고 본문이 보강본인지 수확본인지 알 길이 없었다.
     """
     row = store.knowledge_candidate(cid)
     if row is None or row["status"] != "pending":
         raise ValueError(f"암묵지 후보 없음 또는 처리됨: #{cid}")
     tids = [int(t) for t in (row["threads"] or "").split(";") if t.strip()]
     body = (row["body"] or "").strip()
+    save_candidate.last_enriched = True
     try:
         cmd = cfg.ai_cmd(backend)
         enriched = review.ai_run(cmd, ENRICH.format(
@@ -150,8 +155,16 @@ def save_candidate(cfg: Config, store: Store, cid: int,
         enriched = enriched.strip()
         if enriched:
             body = enriched
-    except (SystemExit, review.AIError):
-        pass                              # 백엔드 미설정·실패 → 수확본 유지
+        else:
+            save_candidate.last_enriched = False
+    # AIAuthError(인증 만료·세션 한도)를 함께 잡는다 — AIError 의 하위가 아니라
+    # 종전 except 를 통과했고, 그래서 **저장 자체가 안 됐다**(후보는 pending 으로
+    # 남았다). 위 docstring 이 "저장 자체는 늘 된다"고 약속하는데 정작 사용자가
+    # 실제로 만나는 실패(세션 한도)에서 그 약속이 깨져 있었다(2026-08-25 실행 확인).
+    # 다른 자리에서 AIAuthError 를 올려 보내는 이유(백엔드가 통째로 죽었으니 중단)는
+    # 여기엔 없다 — 이 콜은 저장의 곁가지지 저장의 조건이 아니다.
+    except (SystemExit, review.AIError, review.AIAuthError):
+        save_candidate.last_enriched = False   # 백엔드 미설정·실패 → 수확본 유지
 
     path = _unique_path(cfg, row["date"], row["title"])
     text = "\n".join([

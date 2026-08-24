@@ -4924,19 +4924,201 @@ class TestHarvest(unittest.TestCase):
             "SELECT COUNT(*) FROM distill_signals").fetchone()[0]
         self.assertEqual(n_sig, 1)
 
-    def test_harvest_flagged_thread_first_in_prompt(self):
-        # 플래그 스레드가 더 오래된 활동이어도 프롬프트 블록 맨 앞에 온다
-        self.store.ingest([
-            _rec("fh1", "lee@corp.example", [ME], "플래그건",
-                 "2026-07-20T08:00:00", body="중요 사안 초기 논의입니다."),
-        ])
-        ftid = self.store.db.execute(
-            "SELECT thread_id t FROM messages WHERE subject='플래그건'"
-        ).fetchone()["t"]
-        self.store.set_flag(ftid, True)
-        items, _ = distill._harvest_items(
+    def test_same_quote_is_not_stored_twice(self):
+        """플래그 얹기가 같은 메일을 다시 보내도 신호가 겹치지 않는다.
+
+        종전에는 워터마크가 같은 메일을 두 번 안 보내 준다는 전제로 무조건
+        INSERT 했다. 플래그 스레드를 앞머리 밖에서도 싣게 되면서 그 전제가
+        깨졌다 — 열쇠는 인용이다(같은 메일을 다시 읽으면 서술은 달라져도
+        근거 문장은 같다)."""
+        for _ in range(2):
+            self.store.add_signal("2026-07-20", "person", "김민수", self.tid,
+                                  "ECN 결정 주도", "논의 끝에 B안으로 확정하겠습니다")
+        # 서술만 다른 같은 근거도 한 건이다
+        self.store.add_signal("2026-07-20", "person", "김민수", self.tid,
+                              "B안 확정을 이끔", "논의 끝에 B안으로 확정하겠습니다")
+        n = self.store.db.execute(
+            "SELECT COUNT(*) FROM distill_signals").fetchone()[0]
+        self.assertEqual(n, 1)
+        # 인용이 다르면 다른 신호다
+        self.store.add_signal("2026-07-20", "person", "김민수", self.tid,
+                              "비용 근거 제시", "비용 절감이 근거입니다")
+        # 축이 다르거나 날이 다르면 별개다
+        self.store.add_signal("2026-07-20", "project", "", self.tid,
+                              "ECN B안", "논의 끝에 B안으로 확정하겠습니다")
+        self.store.add_signal("2026-07-21", "person", "김민수", self.tid,
+                              "ECN 결정 주도", "논의 끝에 B안으로 확정하겠습니다")
+        # **사람이 다르면 같은 인용이어도 별개다** — 한 문장에서 두 사람의 신호가
+        # 나올 수 있다(「A 가 B 에게 넘겼습니다」). 이걸 묶으면 중복을 막으려다
+        # 둘째 사람을 조용히 지운다.
+        self.store.add_signal("2026-07-20", "person", "이서연", self.tid,
+                              "B안 수용", "논의 끝에 B안으로 확정하겠습니다")
+        self.assertEqual(self.store.db.execute(
+            "SELECT COUNT(*) FROM distill_signals").fetchone()[0], 5)
+        # 인용 없는 줄은 대조할 것이 없어 그대로 쌓인다
+        for _ in range(2):
+            self.store.add_signal("2026-07-20", "person", "최하늘", self.tid,
+                                  "인용 없는 신호", "")
+        self.assertEqual(self.store.db.execute(
+            "SELECT COUNT(*) FROM distill_signals").fetchone()[0], 7)
+
+    def test_harvest_uses_its_own_timeout_not_the_default(self):
+        """수확만 기본 300초를 안 쓴다 (2026-08-25).
+
+        같은 크기 재료가 145초에도 415초에도 끝났다(변동 3배). 300초 경계에
+        걸치면 재시도 3회가 모두 실패해 **그날 수확이 통째로 사라진다** —
+        실측으로 2회 중 1회 그랬다."""
+        seen = {}
+
+        def fake(cmd, prompt, **kw):
+            seen.update(timeout=kw.get("timeout"), retries=kw.get("retries"))
+            return "## 오늘 델타\n- 없음\n"
+
+        with mock.patch.object(review, "ai_run", side_effect=fake):
+            distill.harvest(self.store, self.cfg, {"date": "2026-07-20"},
+                            backend="internal")
+        self.assertEqual(seen["timeout"], distill.HARVEST_TIMEOUT)
+        self.assertEqual(seen["retries"], distill.HARVEST_RETRIES)
+        self.assertGreater(distill.HARVEST_TIMEOUT, 300)
+        # 재시도는 줄여야 한다 — 타임아웃이 '느림'을 뜻하는 콜에서 같은 프롬프트를
+        # 다시 던지면 기다린 시간만 버린다(실측 1,103초 = 600 버림 + 501 성공).
+        self.assertLess(distill.HARVEST_RETRIES, 2)
+
+    def test_harvest_records_and_clears_the_debt(self):
+        """미룬 것이 있으면 그 날을 적고, 창이 그 앞으로 닫히지 않는다.
+
+        워터마크만 고치면 창이 앞질러 가 같은 자리에서 다시 잃는다 — 미룬 것은
+        '아직 안 본 것'이지 '건너뛴 날'이 아니다."""
+        for i in range(4):
+            self.store.ingest([
+                _rec(f"dbt{i}", "lee@corp.example", [ME], f"큰 건 {i}",
+                     f"2026-07-20T1{i}:00:00", body="가" * 900)])
+        with mock.patch.object(distill, "HARVEST_BUDGET", 1200), \
+             mock.patch.object(review, "ai_run",
+                               return_value="## 오늘 델타\n- 없음\n"):
+            res = distill.harvest(self.store, self.cfg, {"date": "2026-07-20"},
+                                  backend="internal")
+        self.assertGreater(res["deferred"], 0)
+        # 빚은 **이번 창의 시작일** — 거기부터 아직 안 본 것이 남아 있다
+        owed = self.store.get_state("harvest_owed_from")
+        self.assertEqual(owed, "2026-07-18")     # summary_max_days=3 → 창 시작
+        # 창이 빚을 따라간다 — 날이 지나 소급 상한이 빚을 앞질러도 닫히지 않는다
+        start, _ = distill._harvest_window(self.store, self.cfg, "2026-07-30")
+        self.assertEqual(start, owed)
+        # 다 빠지면 빚이 지워진다
+        with mock.patch.object(review, "ai_run",
+                               return_value="## 오늘 델타\n- 없음\n"):
+            distill.harvest(self.store, self.cfg, {"date": "2026-07-20"},
+                            backend="internal")
+        while self.store.get_state("harvest_owed_from"):
+            with mock.patch.object(review, "ai_run",
+                                   return_value="## 오늘 델타\n- 없음\n"):
+                if distill.harvest(self.store, self.cfg, {"date": "2026-07-20"},
+                                   backend="internal") is None:
+                    break
+        self.assertFalse(self.store.get_state("harvest_owed_from"))
+
+    def _flagged_thread(self, mid: str, subject: str, when: str, body: str) -> int:
+        self.store.ingest([_rec(mid, "lee@corp.example", [ME], subject,
+                                when, body=body)])
+        tid = self.store.db.execute(
+            "SELECT thread_id t FROM messages WHERE subject=?",
+            (subject,)).fetchone()["t"]
+        self.store.set_flag(tid, True)
+        return tid
+
+    def test_flagged_thread_comes_first_and_is_marked(self):
+        ftid = self._flagged_thread("fh1", "플래그건", "2026-07-20T08:00:00",
+                                    "중요 사안 초기 논의입니다.")
+        items, mark, deferred = distill._harvest_items(
             self.store, self.cfg, "2026-07-20", "2026-07-20", "")
         self.assertLess(items.index(f"[#{ftid}]"), items.index(f"[#{self.tid}]"))
+        self.assertIn(f"[#{ftid}] 🚩", items)        # 모델이 중요도를 볼 수 있게
+        self.assertEqual(deferred, 0)               # 예산이 넉넉하면 아무것도 안 미룬다
+        self.assertTrue(mark.startswith("2026-07-20"))
+
+    def test_flagged_mail_rides_along_when_the_budget_bites(self):
+        """예산이 물어도 플래그 메일은 다음 실행으로 밀리지 않는다 (2026-08-25).
+
+        시간 절단은 "T 이전 전부"라 정직하지만, 그것만으로는 사용자가 중요
+        표시한 스레드의 **늦은 시각** 메일이 밀린다. 그 스레드는 '나중에 보라'고
+        표시한 것이 아니다. 앞머리를 먼저 채우고 남은 몫(HARVEST_FLAG_EXTRA)에
+        플래그만 얹는다 — 워터마크는 그대로 앞머리 끝이라 진도는 안 흔들린다."""
+        for i in range(5):
+            self.store.ingest([
+                _rec(f"bulk{i}", "kim@corp.example", [ME], f"평범 {i}",
+                     f"2026-07-20T0{i}:30:00", body="가" * 700)])
+        # 플래그 스레드는 그날 **가장 늦게** 활동한다 — 앞머리 밖이다
+        ftid = self._flagged_thread("late1", "늦은 플래그건",
+                                    "2026-07-20T23:00:00",
+                                    "마감 관련 최종 확인 부탁드립니다.")
+        with mock.patch.object(distill, "HARVEST_BUDGET", 1000), \
+             mock.patch.object(distill, "HARVEST_FLAG_EXTRA", 5000):
+            items, mark, deferred = distill._harvest_items(
+                self.store, self.cfg, "2026-07-20", "2026-07-20", "")
+        self.assertGreater(deferred, 0)             # 예산이 실제로 물었다
+        self.assertIn(f"[#{ftid}] 🚩", items)        # 그런데도 실렸다
+        self.assertLess(items.index(f"[#{ftid}]"), 10)   # 맨 앞이다
+        # 워터마크는 **앞머리 끝**이지 얹은 플래그 메일 시각이 아니다 —
+        # 아니면 그 사이 메일이 통째로 사라진다(이 절의 원래 결함).
+        self.assertLess(mark, "2026-07-20T23:00:00")
+
+    def test_flag_ride_along_does_not_stall_or_lose(self):
+        # 얹기가 진도·누락 계약을 깨지 않는다
+        for i in range(6):
+            self.store.ingest([
+                _rec(f"mix{i}", "kim@corp.example", [ME], f"섞임 {i}",
+                     f"2026-07-20T0{i}:10:00", body="나" * 700)])
+        self._flagged_thread("late2", "늦은 플래그건2", "2026-07-20T22:00:00",
+                             "이번 주 안에 결론 내야 합니다.")
+        want = {r["thread_id"] for r in self.store.db.execute(
+            "SELECT DISTINCT thread_id FROM messages WHERE sent_on LIKE ?",
+            ("2026-07-20%",))}
+        last, seen, runs, marks = "", set(), 0, []
+        with mock.patch.object(distill, "HARVEST_BUDGET", 1000):
+            while runs < 25:
+                items, mark, deferred = distill._harvest_items(
+                    self.store, self.cfg, "2026-07-20", "2026-07-20", last)
+                if not items:
+                    break
+                runs += 1
+                seen |= {int(x) for x in re.findall(r"\[#(\d+)\]", items)}
+                marks.append(mark)
+                if not deferred:
+                    break
+                self.assertGreater(mark, last, "워터마크가 멈추면 안 된다")
+                last = mark
+        self.assertTrue(all(marks[i] < marks[i + 1] for i in range(len(marks) - 1)))
+        self.assertTrue(want <= seen, f"영구 누락: {want - seen}")
+
+    def test_harvest_defers_by_time_and_loses_nothing(self):
+        """예산이 물면 **시간을 자르고**, 워터마크가 그 지점에서 멈춘다.
+
+        회귀 가드 — 종전에는 스레드를 건수로 자르고 워터마크는 실은 것의 최대로
+        전진해, 잘린 스레드의 메일이 영구히 사라졌다(재현: 후보 16 · 상한 8 이면
+        8스레드 48통 증발)."""
+        for i in range(6):
+            self.store.ingest([
+                _rec(f"big{i}", "lee@corp.example", [ME], f"대형 {i}",
+                     f"2026-07-20T1{i}:00:00", body="가" * 800)])
+        seen, last, runs = set(), "", 0
+        with mock.patch.object(distill, "HARVEST_BUDGET", 1200):
+            while runs < 20:
+                items, mark, deferred = distill._harvest_items(
+                    self.store, self.cfg, "2026-07-20", "2026-07-20", last)
+                if not items:
+                    break
+                runs += 1
+                seen |= set(re.findall(r"\[#(\d+)\]", items))
+                self.assertTrue(mark > last, "워터마크가 매 실행 전진해야 한다")
+                if not deferred:
+                    break
+                last = mark
+        self.assertGreater(runs, 1)                 # 예산이 실제로 물었다
+        got = {str(r["thread_id"]) for r in self.store.db.execute(
+            "SELECT DISTINCT thread_id FROM messages "
+            "WHERE sent_on LIKE '2026-07-20%'")}
+        self.assertTrue(got <= seen, f"영구 누락: {got - seen}")
 
     def test_harvest_window_covers_skipped_days(self):
         # 하루 이틀 건너뛰어도 소급 창이 건너뛴 날의 지식까지 수확한다.
@@ -5103,6 +5285,47 @@ class TestKnowledge(unittest.TestCase):
                                             "처음부터 skew 재배분을 검토한다."):
             p = knowledge.save_candidate(self.cfg, self.store, cid)
         self.assertIn("보강된 본문.", p.read_text(encoding="utf-8"))
+
+    def test_save_survives_session_limit_and_says_so(self):
+        """세션 한도에서도 **저장은 된다** — 그리고 조용하지 않다 (2026-08-25).
+
+        회귀 가드: AIAuthError 는 AIError 의 하위가 아니라 종전 except 를 통과했고,
+        그래서 파일이 아예 안 만들어지고 후보가 pending 으로 남았다. docstring 은
+        "저장 자체는 늘 된다"고 약속하는데 정작 사용자가 실제로 만나는 실패에서
+        그 약속이 깨져 있었다."""
+        for exc in (review.AIQuotaError("5시간 한도 초과"),
+                    review.AIAuthError("인증 만료"),
+                    review.AIError("타임아웃")):
+            self.store.db.execute("DELETE FROM knowledge_candidates")
+            self.store.db.commit()
+            cid = self.store.add_knowledge_candidate(
+                "2026-07-20", f"한도 {type(exc).__name__}", "수확본 내용",
+                str(self.tid), "")
+            with mock.patch.object(review, "ai_run", side_effect=exc):
+                path = knowledge.save_candidate(self.cfg, self.store, cid)
+            self.assertTrue(path.exists(), f"{type(exc).__name__} 에서 저장 안 됨")
+            self.assertIn("수확본 내용", path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                self.store.knowledge_candidate(cid)["status"], "saved")
+            self.assertFalse(knowledge.save_candidate.last_enriched)
+
+    def test_enrichment_failure_reaches_the_completion_message(self):
+        # 실패가 완료 안내에 실린다 — 종전엔 성공 문구만 보였다
+        self._harvest_with(self._raw(self._KN_LINE % {"t": self.tid}))
+        cid = self.store.knowledge_candidates()[0]["id"]
+        with mock.patch.object(review, "ai_run",
+                               side_effect=review.AIError("x")):
+            web._run_kn_job(self.cfg, cid)
+        self.assertIn("지식으로 저장", web._kn_job["msg"])
+        self.assertIn("보강 실패", web._kn_job["msg"])
+        # 정상일 때는 붙지 않는다
+        self._harvest_with(self._raw(
+            self._KN_LINE.replace("useful skew", "다른 제목 skew") % {"t": self.tid}))
+        rows = self.store.knowledge_candidates()
+        if rows:
+            with mock.patch.object(review, "ai_run", return_value="보강된 본문."):
+                web._run_kn_job(self.cfg, rows[0]["id"])
+            self.assertNotIn("보강 실패", web._kn_job["msg"])
 
     def test_dismiss_leaves_no_file(self):
         self._harvest_with(self._raw(self._KN_LINE % {"t": self.tid}))
@@ -5863,7 +6086,7 @@ class TestHiddenAIExclusion(unittest.TestCase):
         self.assertNotIn("연봉 조정안", "\n".join(prompts))
 
     def test_harvest_items_skip_hidden(self):
-        blocks, _ = distill._harvest_items(
+        blocks, _, _ = distill._harvest_items(
             self.store, self.cfg, "2026-07-10", "2026-07-11", "")
         self.assertNotIn("연봉", blocks)
         self.assertIn("양자화", blocks)
@@ -6029,6 +6252,109 @@ class TestAskContextBudget(unittest.TestCase):
                 for m in short.db.execute("SELECT id, thread_id, sent_on FROM messages")}
         out = self.ask._fmt_read(read, 3000, self.ask._thread_totals(short, read))
         self.assertNotIn("통 중", out)
+
+
+class TestAskGroundedAnswer(unittest.TestCase):
+    """재작성본 검증을 코드가 한다 (2026-08-25).
+
+    종전에는 재작성 뒤 AI 검증 콜이 한 번 더 있었다. 6질문 실측에서 그 콜은
+    질문당 38초를 쓰고 불리언 하나만 남겼고, 같은 근거에 대해 1차 검증과
+    판정이 어긋났다(한 건은 방금 통과시킨 8개 중 5개를 다시 탈락). 지금은
+    근거 밖의 **수량·날짜**를 쓴 문장만 코드가 떨어뜨린다."""
+
+    def setUp(self):
+        from mailkb import ask
+        self.ask = ask
+
+    def _claims(self, *pairs):
+        return [{"text": t, "quote": q, "sent_on": "2026-07-21T09:00:00"}
+                for t, q in pairs]
+
+    def test_identifiers_with_digits_are_not_treated_as_quantities(self):
+        # 오탐 회귀 가드 — 하네스에서 실제로 잡힌 것. 자릿수만 보고 고르면
+        # 'NPX-200' 의 200 이 근거에 없다는 이유로 결론 문장이 통째로 날아갔다.
+        claims = self._claims(("hold ECO 를 분리 커밋하기로 했다",
+                               "hold ECO 는 분리 커밋합니다"))
+        for name in ("NPX-200 B0 의 hold ECO 를 분리 커밋한다.",
+                     "CVE-2026-31337 대응으로 분리 커밋한다.",
+                     "ISO 21434 기준으로 분리 커밋한다.",
+                     "FW 2.3 이상에서 분리 커밋한다.",
+                     "v2 패치로 분리 커밋한다."):
+            kept, dropped = self.ask._grounded(name, claims, [])
+            self.assertEqual(dropped, 0, f"이름의 숫자를 수량으로 오인: {name}")
+            self.assertEqual(kept, name)
+
+    def test_quantity_outside_evidence_is_dropped(self):
+        claims = self._claims(("hold 위반이 1,847건이다", "hold 위반 1,847건 나왔습니다"))
+        kept, dropped = self.ask._grounded(
+            "hold 위반은 1,847건이다. 회복은 0.3%p 이내로 확실하다.", claims, [])
+        self.assertEqual(dropped, 1)                  # 0.3%p 는 근거에 없다
+        self.assertIn("1,847건", kept)                # 근거에 있는 수량은 남는다
+        self.assertNotIn("0.3%p", kept)
+
+    def test_date_outside_evidence_is_dropped_across_notations(self):
+        claims = self._claims(("7/21 로 확정했다", "넷리스트 프리즈를 7/21 로 확정합니다"))
+        # 같은 날짜의 다른 표기는 통과한다
+        for ok in ("프리즈는 7/21 로 확정됐다.", "프리즈는 7월 21일로 확정됐다.",
+                   "프리즈는 2026-07-21 로 확정됐다."):
+            self.assertEqual(self.ask._grounded(ok, claims, [])[1], 0, ok)
+        # 근거에 없는 날짜는 떨어진다
+        kept, dropped = self.ask._grounded("프리즈는 8월 3일로 밀렸다.", claims, [])
+        self.assertEqual(dropped, 1)
+        self.assertEqual(kept, "")
+
+    def test_sent_on_dates_count_as_evidence(self):
+        # 재작성 프롬프트는 근거의 발신일을 date 로 넘긴다 — 그 날짜를 쓴 문장이
+        # 지어낸 것으로 몰리면 안 된다.
+        claims = self._claims(("확정했다", "확정합니다"))
+        kept, dropped = self.ask._grounded(
+            "2026-07-21 에 확정됐다.", claims, [])
+        self.assertEqual(dropped, 0)
+        self.assertEqual(kept, "2026-07-21 에 확정됐다.")
+
+    def test_sentences_without_numbers_always_survive(self):
+        # 판단 문장은 재료 안에서 나온 것이라 손대지 않는다(일간 머리글과 같은 태도)
+        claims = self._claims(("분리 커밋하기로 했다", "분리 커밋합니다"))
+        text = "hold ECO 는 기능 ECO 와 분리해 커밋하기로 했다. 근거는 LEC 리스크 분리다."
+        self.assertEqual(self.ask._grounded(text, claims, []), (text, 0))
+
+    def test_everything_dropped_returns_empty_for_safe_fallback(self):
+        claims = self._claims(("확정했다", "확정합니다"))
+        kept, dropped = self.ask._grounded("9,999건이다. 8월 3일이다.", claims, [])
+        self.assertEqual((kept, dropped), ("", 2))
+
+    def test_conflicts_are_evidence_too(self):
+        conflicts = [{"value": "8월 12일", "quote": "다음 달 12일로 잡았습니다",
+                      "sent_on": "2026-07-10T09:00:00"}]
+        self.assertEqual(
+            self.ask._grounded("데모는 8월 12일이다.", [], conflicts)[1], 0)
+
+    def test_repair_costs_one_call_not_two(self):
+        # 재작성 뒤 AI 재검증이 사라졌다 — 콜 수가 계약이다
+        claims = self._claims(("확정했다", "확정합니다"))
+        calls = []
+
+        def fake(cmd, prompt, **kw):
+            calls.append(prompt)
+            return json.dumps({"answer": "분리 커밋으로 확정됐다."})
+
+        with mock.patch.object(review, "ai_run", side_effect=fake):
+            answer, used = self.ask._repair_answer(
+                ["echo"], "질문", "확인됨", claims, [])
+        self.assertEqual(used, 1)
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("보수적인 근거 검증기", calls[0])   # 검증 프롬프트가 아니다
+        self.assertEqual(answer, "분리 커밋으로 확정됐다.")
+        self.assertEqual(self.ask._repair_answer.last_dropped, 0)
+
+    def test_repair_returns_none_when_nothing_survives(self):
+        claims = self._claims(("확정했다", "확정합니다"))
+        with mock.patch.object(review, "ai_run", side_effect=lambda *a, **k:
+                               json.dumps({"answer": "9,999건으로 확정됐다."})):
+            answer, used = self.ask._repair_answer(
+                ["echo"], "질문", "확인됨", claims, [])
+        self.assertIsNone(answer)          # 호출부가 _safe_answer 로 간다
+        self.assertEqual(used, 1)
 
 
 class TestAskPromptParity(unittest.TestCase):

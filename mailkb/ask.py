@@ -689,11 +689,98 @@ def _safe_answer(state: str, claims: list[dict], conflicts: list[dict]) -> str:
     return "저장된 메일에서 질문에 답할 수 있는 근거를 확인하지 못했습니다."
 
 
+# 재작성본 검증 — **코드가 한다**(2026-08-25). 종전에는 이 자리에 AI 검증 콜이
+# 한 번 더 있었다(재작성 → 같은 검증기 재통과). 6질문 실측에서 그 콜은 질문당
+# 38초(전체의 16%)를 쓰고 `answer_supported` 불리언 하나만 남겼다 — 항목별 탈락
+# 목록은 코드가 받아서 버렸다. 게다가 1차 검증과 판정이 어긋났다: 한 질문에서
+# **방금 통과시킨 근거 8개 중 5개**를 다시 탈락시켰고 그중엔 핵심 결론도 있었다.
+# 같은 입력에 두 번 물어 다른 답을 받는 관문은 관문이 아니다.
+#
+# 대신 일간 머리글(review._exec_verify)과 같은 기법을 쓴다: 재작성은 **검증을
+# 통과한 근거만**을 재료로 받으므로, 그 재료 밖의 수치·날짜가 문장에 나타나면
+# 모델이 없는 사실을 지어낸 것이다. 그 문장만 버린다. 판단 문장(수치 없는 서술)은
+# 재료 안에서 나온 것이라 손대지 않는다.
+#
+# 검사 대상은 **단위가 붙은 수량과 날짜**뿐이다. 자릿수만 보고 고르면(일간의
+# 첫 판처럼 `\d{3,}`) 이름에 박힌 숫자를 수량으로 오인한다 — 검증 하네스에서
+# "NPX-200 … 7/21 로 확정" 한 문장이 통째로 버려졌다. 근거에 'NPX-200'이 없고
+# '200'만 대조했기 때문이다. CVE-2026-31337·ISO 21434·FW 2.3·v2 가 같은 함정이다.
+# 단위(건·주·%·ps…)가 붙은 수는 이름이 아니라 주장이라, 지어내면 잡아야 하는
+# 바로 그 값이다. 실제 관측된 지어내기도 이 축이었다(없는 날짜를 붙인 답변).
+_ANS_DATE_RX = re.compile(r"\d{4}[-/.]\s*(\d{1,2})[-/.]\s*(\d{1,2})"
+                          r"|(?<![\d-])(\d{1,2})\s*[/월]\s*(\d{1,2})\s*일?(?![\d-])")
+_ANS_UNITS = ("건", "통", "명", "개", "일", "주", "개월", "시간", "분", "초",
+              "배", "원", "억", "만", "ps", "ns", "us", "ms", "GB", "TB", "MB", "KB")
+_ANS_NUM_RX = re.compile(
+    r"\d+(?:\.\d+)?\s*%p?"                        # 3.2% · 94% · 0.3%p
+    r"|\d+(?:,\d{3})+"                             # 1,847 (자릿점은 이름에 안 쓴다)
+    r"|\d+(?:\.\d+)?\s*(?:" + "|".join(_ANS_UNITS) + r")(?![A-Za-z0-9])")
+_ANS_SENT_RX = re.compile(r"(?<=[.!?])\s+")
+
+
+def _ans_norm(text: str) -> str:
+    """대조용 평탄화 — 공백·쉼표는 표기 차이일 뿐이라 지운다."""
+    return re.sub(r"[\s,]", "", text or "")
+
+
+def _ans_dates(text: str) -> set:
+    """(월, 일) 집합. 2026-07-21 · 7/21 · 7월 21일을 같은 것으로 본다."""
+    out = set()
+    for m in _ANS_DATE_RX.finditer(text or ""):
+        mm, dd = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))
+        try:
+            out.add((int(mm), int(dd)))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _grounded(answer: str, claims: list[dict],
+              conflicts: list[dict]) -> tuple[str, int]:
+    """(근거 안에서만 쓴 문장들, 버린 문장 수).
+
+    근거는 재작성에 넘긴 것과 같다 — text·quote·발신일. 전부 버려지면 빈 문자열을
+    돌려주고, 호출부가 _safe_answer 로 간다(종전 answer_supported=False 와 같은 길).
+    """
+    ground_parts, ground_dates = [], set()
+    for c in list(claims) + list(conflicts):
+        for key in ("text", "value", "quote"):
+            if c.get(key):
+                ground_parts.append(str(c[key]))
+        sent_on = str(c.get("sent_on") or "")
+        ground_parts.append(sent_on)
+        ground_dates |= _ans_dates(sent_on)
+    ground = _ans_norm(" ".join(ground_parts))
+    ground_dates |= _ans_dates(" ".join(ground_parts))
+
+    kept, dropped = [], 0
+    for sent in _ANS_SENT_RX.split(answer or ""):
+        if not sent.strip():
+            continue
+        # 날짜 표기는 날짜로만 본다 — '7월 21일'의 '21일'을 수량으로 또 재면
+        # 근거가 '7/21'일 때 멀쩡한 문장이 떨어진다(테스트로 잡은 이중 계산).
+        probe = _ANS_DATE_RX.sub(" ", sent)
+        bad = any(_ans_norm(n) not in ground for n in _ANS_NUM_RX.findall(probe))
+        bad = bad or not _ans_dates(sent) <= ground_dates
+        if bad:
+            dropped += 1
+            continue
+        kept.append(sent.strip())
+    return " ".join(kept), dropped
+
+
 def _repair_answer(cmd: list[str], question: str, state: str,
                    claims: list[dict], conflicts: list[dict],
                    effort_flag: str | None = None,
                    on_event=None, cancel=None) -> tuple[str | None, int]:
-    """검증된 근거로 자연스러운 답을 재작성하고 같은 검증기를 한 번 더 통과시킨다."""
+    """검증된 근거로 자연스러운 답을 다시 쓰고 **코드로** 근거 밖 수치를 걸러낸다.
+
+    반환 (답변|None, 쓴 콜 수). 콜은 1회다 — 종전 2회(재작성+재검증)에서 줄었다.
+    사유는 위 _grounded 주석. 버린 문장 수는 `last_dropped` 에 남는다 —
+    **이번 호출 것**이어야 하므로 들어오자마자 0 으로 되돌린다(diagnose_thread
+    에서 같은 자리를 스윕으로 잡았다: 실패로 빠져나가면 직전 호출의 숫자가 남아
+    다음 화면이 남의 값을 보고한다)."""
+    _repair_answer.last_dropped = 0
     evidence = json.dumps(
         [{"text": c["text"], "date": c["sent_on"][:10], "quote": c["quote"]}
          for c in claims]
@@ -713,10 +800,9 @@ def _repair_answer(cmd: list[str], question: str, state: str,
     answer = str(data.get("answer") or "").strip()[:2000]
     if not answer:
         return None, 1
-    _, _, supported, checked = _semantic_verify(
-        cmd, question, answer, claims, conflicts, effort_flag=effort_flag,
-        on_event=on_event, cancel=cancel)
-    return (answer if checked and supported else None), 2
+    answer, dropped = _grounded(answer, claims, conflicts)
+    _repair_answer.last_dropped = dropped   # 관측값 — 호출 직후에만 유효
+    return (answer or None), 1
 
 
 def cache_key(store: Store, question: str, parent_id: int | None = None,
@@ -1132,7 +1218,7 @@ def ask(store: Store, cfg: Config, question: str, backend: str | None = None,
         not answer_supported and (exact_n or state != "근거 부족")))
     if needs_rewrite:
         repaired = None
-        if semantic_checked and (claims or conflicts) and calls + 2 <= MAX_CALLS:
+        if semantic_checked and (claims or conflicts) and calls + 1 <= MAX_CALLS:
             repaired, repair_calls = _repair_answer(
                 cmd, q, state, claims, conflicts, effort_flag=eflag,
                 on_event=on_event, cancel=cancel)
@@ -1164,6 +1250,10 @@ def ask(store: Store, cfg: Config, question: str, backend: str | None = None,
                       for query in queries)),
                   "hits": len(hits) + len(read),
                   "read": len(read), "calls": calls, "dropped": dropped,
+                  # 재작성본에서 코드 검증이 버린 문장 수(근거 밖 수량·날짜).
+                  # 인용 탈락과 나란히 보인다 — 답이 짧아진 이유가 화면에 있어야 한다.
+                  "trimmed": getattr(_repair_answer, "last_dropped", 0)
+                  if needs_rewrite else 0,
                   "span": _evidence_span(read),
                   # 덜 본 스레드 — 모델이 아니라 코드만 정확히 아는 사실이라
                   # 여기서 세어 '기준' 줄에 싣는다
@@ -1618,6 +1708,8 @@ def render_text(res: dict) -> str:
             f" · {s['backend']}")
     if s["dropped"]:
         line += f" · 인용 검증 탈락 {s['dropped']}"
+    if s.get("trimmed"):
+        line += f" · 근거 밖 문장 {s['trimmed']}개 제외"
     out.append(line)
     if res.get("id"):
         out += ["", f"이어서 묻기:  mailkb ask \"추가 질문\" --follow {res['id']}"]

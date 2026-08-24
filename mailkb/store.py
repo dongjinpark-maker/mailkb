@@ -2975,7 +2975,27 @@ class Store:
 
     def add_signal(self, date_iso: str, kind: str, who: str,
                    thread_id: int | None, signal: str, quote: str = "") -> None:
-        """인물/프로젝트 신호 적재 — Phase 2 주간 증류의 재료."""
+        """인물/프로젝트 신호 적재 — Phase 2 주간 증류의 재료.
+
+        같은 날·같은 축·같은 스레드·**같은 대상**에서 같은 인용이 다시 오면 넣지
+        않는다(2026-08-25). 종전에는 워터마크가 같은 메일을 두 번 안 보내 준다는
+        전제로 무조건 INSERT 했는데, 플래그 스레드를 시간 앞머리 밖에서도 싣게
+        되면서 그 전제가 깨졌다(distill._harvest_items).
+
+        열쇠에 인용을 넣는 이유: 같은 메일을 다시 읽으면 서술(signal)은 조금씩
+        달라져도 근거 문장은 같다. **who 를 함께 넣는 이유**: 한 문장에서 두
+        사람의 신호가 나올 수 있어(「A 가 B 에게 …를 넘겼습니다」), who 를 빼면
+        둘째 사람이 조용히 사라진다 — 중복을 막으려다 없는 것을 만드는 쪽이
+        더 나쁘다. who 표기가 흔들리면 비슷한 줄이 하나 더 생길 뿐이다.
+        인용이 없는 줄은 대조할 것이 없어 그대로 넣는다.
+        """
+        if quote:
+            dup = self.db.execute(
+                "SELECT 1 FROM distill_signals WHERE date=? AND kind=? "
+                "AND who=? AND thread_id IS ? AND quote=?",
+                (date_iso, kind, who or "", thread_id, quote)).fetchone()
+            if dup:
+                return
         self.db.execute(
             """INSERT INTO distill_signals
                  (date, kind, who, thread_id, signal, quote, created)

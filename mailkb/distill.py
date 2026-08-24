@@ -230,10 +230,45 @@ def parse_harvest(text: str) -> dict:
 
 # ------------------------------------------------------------------ 재료 조립
 
-_CAP_THREADS = 40      # 수확 대상 업무 스레드 상한
-_CAP_MSGS = 3          # 스레드당 하루치 메시지 상한 (창이 길면 일수만큼 늘림, 최대 8)
+# 재료 예산 — **건수가 아니라 자수로 자른다**(2026-08-25). 종전의 상한 40은
+# 배치 시절의 잔재였고, 실측에서 두 가지가 드러났다.
+#  ① 하루 100통이면 업무 스레드가 63개다. 상한 40에서 23개가 말없이 빠지는데,
+#     재료 자체는 42KB뿐이라 잘라야 할 이유가 없었다(예산 압박 0).
+#  ② 반대로 창이 3일이면 재료가 122KB까지 가고, 그 콜은 기본 타임아웃(300초)
+#     경계에 걸터앉는다 — 관측 시도 7회 중 5회 초과, 재시도 3회가 모두 실패해
+#     수확이 통째로 사라진 실행이 2회 중 1회였다. 건수 상한은 이걸 못 막는다.
+# 값의 근거 — 3일 창 무거운 코퍼스에서 예산만 바꿔 단독 실측(2026-08-25):
+#   47,206자 → 248초 · 62,406자 → 415초 · 77,604자 → 508초 (출력은 셋 다 7.3K자)
+# **출력량이 같은데 시간이 입력에 비례한다.** 주간 보고에서 얻은 "시간 = 출력량 ÷
+# 생성속도"가 여기선 안 통한다 — 수확은 모든 메일을 훑어 추출하는 일이라 읽는
+# 시간이 지배한다. 그래서 예산은 출력이 아니라 입력으로 잡아야 한다.
+# 45,000 을 고른 이유: 300초 기본 타임아웃 안에 드는 가장 큰 측정점이다. 하루
+# 100통 · 통당 1,000자가 약 46KB 이므로 바쁜 하루가 한두 콜에 들어간다.
+HARVEST_BUDGET = 45_000
+
+# 수확 콜은 기본 타임아웃(300초)·재시도(2회)를 쓰지 않는다.
+#
+# 같은 크기 재료의 실측이 145 · 248 · 415 · 508 · ~500초로 흩어진다 — **변동이
+# 3배 이상이고 크기로 설명되지 않는다.** 여기서 짧은 타임아웃 + 재시도는 손해다:
+# 46,336자 실행이 600초에 걸려 죽고 재시도가 501초에 성공해 **총 1,103초**가
+# 걸렸다. 600초를 통째로 버린 것이다. 이 콜의 타임아웃은 '고장'이 아니라 '느림'을
+# 뜻하므로, 같은 프롬프트를 다시 던져도 빨라질 이유가 없다.
+#
+# 그래서 한 번에 넉넉히 기다리고(900초) 재시도는 1회만 둔다(진짜 일시적 실패용).
+# 타임아웃이 나도 잃는 것은 '오늘 회고의 수확 절'뿐이다 — 워터마크는 성공했을
+# 때만 전진하므로 **다음 실행이 같은 재료를 그대로 이어받는다**(영구 손실 아님).
+HARVEST_TIMEOUT = 900
+HARVEST_RETRIES = 1
+
+# 플래그(🚩) 스레드 몫 — 시간 앞머리 **밖에** 있는 플래그 메일을 이만큼 더 싣는다.
+# 시간 절단은 "T 이전 전부"라 정직하지만, 예산이 무는 날엔 사용자가 중요 표시한
+# 스레드의 오후 메일이 다음 실행으로 밀린다. 그 스레드는 다음 날 늦게 보라고
+# 표시한 것이 아니다. 앞머리를 먼저 채우고 남은 자리에 플래그만 얹으므로
+# 워터마크는 그대로 앞머리 끝이다 — 얹힌 메일은 다음 실행이 다시 싣지만
+# (중복 과금), 신호는 인용으로 중복이 막히고(store.add_signal) 암묵지는 제목으로
+# 막힌다. 플래그가 없거나 다 앞머리 안에 있으면 이 값은 아무 일도 하지 않는다.
+HARVEST_FLAG_EXTRA = 9_000
 _CAP_BODY = 1000       # 메시지 본문 상한 (자)
-_CAP_SUMM = 300        # 롤링 요약 상한 (자)
 # 도시에 발췌 — 8스레드 × 2발췌라 한 콜에 다 실려도 작다(300→600 이면 9.6K자).
 _CAP_EXCERPT = 600     # 인물 요약용 본인 발췌 상한 (자)
 
@@ -277,20 +312,51 @@ def _harvest_window(store: Store, cfg: Config, date_iso: str) -> tuple[str, str]
     last_ts = store.get_state("last_harvest") or ""
     if last_ts and date_iso < last_ts[:10]:
         return date_iso, ""            # 백필 모드: 그 날 하루, 워터마크 미적용
+    # 예산에 밀려 두고 온 날이 있으면 창이 그 앞으로 닫히지 않는다(2026-08-25).
+    # 워터마크를 정직하게 만들어도 창이 앞질러 가면 같은 자리에서 다시 잃는다 —
+    # 미룬 것은 '아직 안 본 것'이지 '건너뛴 날'이 아니다. 빚이 없으면 이 값은
+    # 비어 있고 종전과 바이트 단위로 같게 동작한다.
+    owed = store.get_state("harvest_owed_from") or ""
+    if owed and owed < floor:
+        floor = owed
     return floor, last_ts
 
 
 def _harvest_items(store: Store, cfg: Config, start_day: str, end_day: str,
-                   last_ts: str) -> tuple[str, str]:
-    """창 안의 업무 스레드 블록 + 실은 메시지의 최대 타임스탬프(마커 전진용).
+                   last_ts: str) -> tuple:
+    """(블록, 워터마크, 미룬 메일 수) — **시간을 잘라** 예산만큼 싣는다.
 
-    창 안 메시지 중 last_ts 이후 것만 싣는다(재실행 시 중복 과금 방지)."""
-    try:
-        days = (date.fromisoformat(end_day) - date.fromisoformat(start_day)).days + 1
-    except ValueError:
-        days = 1
-    per_cap = min(8, _CAP_MSGS * max(1, days))
-    picked = []                # (플래그, 마지막 활동, tid, 창 메시지, 제목, 요약)
+    창 안 메시지 중 last_ts 이후 것만 싣는다(재실행 시 중복 과금 방지).
+
+    ── 왜 시간으로 자르나 (2026-08-25) ─────────────────────────────────────
+    종전에는 플래그·최근활동순으로 **스레드를** 고르고 건수 상한(40)에서 잘랐고,
+    워터마크는 실은 것의 최대 시각으로 전진했다. 잘린 스레드의 메일은 전부 그보다
+    과거라 다음 실행의 `sent_on > last_ts` 필터에서 통째로 사라졌다 — **영구
+    누락이고 재실행해도 복구되지 않았다.** 결정론 재현: 후보 16 · 상한 8 이면
+    8개 스레드 48통이 증발했고, 하루 100통이면 63개 중 23개다.
+
+    고치는 길로 두 가지를 먼저 시도했고 둘 다 시뮬레이션이 반증했다.
+      ① 워터마크 클램프 + 밀린 스레드 우선: 밀린 목록이 '이번에 안 실린 전부'라
+         이미 실은 것까지 되돌아와 두 집합이 번갈아 실리며 진동했다(7회에 5/16).
+      ② 스레드를 시간순으로 담기: 스레드끼리 시간이 겹쳐, 미룬 스레드의 첫 메일이
+         늘 이른 시각이라 워터마크가 18분씩만 나아갔다 — 300통 커버에 860통을
+         다시 읽었다.
+    원인은 같다. **스레드 단위로 자르면서 시간 하나로 진도를 적으려 한 것**이다.
+
+    그래서 자르는 축을 시간으로 바꾼다. 창 안 메일을 시각순으로 늘어놓고 예산까지
+    담으면, 실은 것은 "T 이전 전부"이고 워터마크 = T 가 정확하다. 남은 것은 손대지
+    않은 채 다음 실행이 T 부터 이어받는다. 스레드는 담긴 메일만으로 묶어 보여준다
+    — 한 스레드가 반만 실릴 수 있지만, 그건 창이 원래 하던 일과 같다.
+
+    스레드 안에서 최근 N통만 남기던 규칙(옛 per_cap)과 건수 상한(옛 _CAP_THREADS)
+    은 뺐다. 둘 다 오래된 쪽을 말없이 버리는 통로였고, 총량은 예산이 잡는다.
+    플래그(🚩)는 몫으로 남긴다 — 앞머리를 채운 뒤 남은 자리(HARVEST_FLAG_EXTRA)에
+    플래그 스레드의 앞머리 밖 메일을 얹는다. 워터마크는 앞머리 끝 그대로라
+    진도가 안 흔들리고, 얹은 메일은 다음 실행이 다시 싣는다(중복 과금) —
+    그 중복이 기록을 겹치지 않게 store.add_signal 이 (날짜·축·대상·스레드·인용)
+    을 열쇠로 거른다.
+    """
+    rows, subject_of, flagged = [], {}, set()
     # 숨긴 스레드는 수확 재료에서 뺀다 — 안 거르면 숨긴 대화의 원문이 프롬프트에
     # 실린다(2026-08-02 점검). 숨긴 스레드만 신규면 blocks 가 비어 AI 콜 자체가
     # 없고 마커도 안 전진한다 — 다음 실행이 재확인할 뿐 비용은 0.
@@ -304,37 +370,75 @@ def _harvest_items(store: Store, cfg: Config, start_day: str, end_day: str,
             continue
         if review.thread_kind(cfg, msgs) != "work":
             continue
-        win = [m for m in msgs
-               if start_day <= (m["sent_on"] or "")[:10] <= end_day
-               and (not last_ts or m["sent_on"] > last_ts)]
-        if not win:
+        subject_of[tid] = msgs[0]["subject"]
+        if t["flagged"]:
+            flagged.add(tid)
+        for m in msgs:
+            when = m["sent_on"] or ""
+            if start_day <= when[:10] <= end_day and (not last_ts or when > last_ts):
+                rows.append((when, tid, m))
+    if not rows:
+        return "", "", 0
+    rows.sort(key=lambda r: (r[0], r[1]))
+
+    take, used = [], 0
+    for r in rows:
+        size = len(r[2]["new_content"] or "")
+        if take and used + size > HARVEST_BUDGET:
+            break
+        take.append(r)
+        used += size
+    # 같은 시각의 메일은 함께 싣는다 — 워터마크가 T 인데 T 짜리 메일이 남아 있으면
+    # 그것이 곧 누락이다(예산을 조금 넘겨도 잃는 것보다 낫다).
+    mark = take[-1][0]
+    while len(take) < len(rows) and rows[len(take)][0] == mark:
+        take.append(rows[len(take)])
+    rest = rows[len(take):]
+
+    # 앞머리 **밖의 플래그 메일**을 남은 몫만큼 얹는다. 워터마크는 아래에서
+    # 앞머리 끝으로 잡히므로(rest 의 최소 시각 앞), 얹은 것이 진도를 앞지르지
+    # 않는다 — 다음 실행이 다시 싣지만 잃지는 않는다.
+    extra, spent = [], 0
+    for r in rest:
+        if r[1] not in flagged:
             continue
-        picked.append((bool(t["flagged"]), win[-1]["sent_on"], tid, win[-per_cap:],
-                       msgs[0]["subject"], t["rolling_summary"] or ""))
-    # 플래그(🚩) 스레드 먼저, 그 안에서 최근 활동순 — 바쁜 날 상한(_CAP_THREADS)
-    # 에서 사용자가 중요 표시한 건이 잘려나가지 않게. 순서만, 판정 무왜곡.
-    picked.sort(key=lambda x: x[1], reverse=True)      # 2차 기준: 최근 활동
-    picked.sort(key=lambda x: x[0], reverse=True)      # 1차 기준: 플래그(안정 정렬)
-    blocks, max_ts = [], ""
-    for _, _, tid, win, subject, summ in picked[:_CAP_THREADS]:
-        # 요약은 split-join 평탄화로 개행이 사라져 표 구조가 이미 없다 —
-        # smart_truncate 를 걸 이유도 효과도 없는 자리(본문 절단과 다르다)
+        size = len(r[2]["new_content"] or "")
+        if spent + size > HARVEST_FLAG_EXTRA:
+            break
+        extra.append(r)
+        spent += size
+
+    # 스레드로 묶어 보여준다 — **플래그가 앞**, 그 안에서 첫 실린 메일 시각순.
+    by_tid: dict = {}
+    for when, tid, m in take + extra:
+        by_tid.setdefault(tid, []).append(m)
+    for msgs in by_tid.values():
+        msgs.sort(key=lambda m: m["sent_on"] or "")
+    blocks = []
+    for tid, msgs in sorted(by_tid.items(),
+                            key=lambda kv: (kv[0] not in flagged,
+                                            kv[1][0]["sent_on"])):
         # **진단(파생물)을 재료로 넣지 않는다**(2026-08-16). 어제는 인용 꼬리만
         # 뺐는데, 서술도 그 스레드의 AI 산출이라 같은 고리다 — 수확이 그것을
         # 근거 삼으면 지난주 판단이 오늘 수확으로 되돌아온다. 주간 보고가
         # 이미 지키는 규칙("사실·상태·선별을 전부 원문에서 다시 한다")을
         # 수확에도 적용한다. 그 자리는 아래 창(원문)이 메운다.
-        head = f"[#{tid}] {subject}"
         body = ""
-        for m in win:
+        for m in msgs:
             who = "나" if m["is_sent"] else (m["sender_name"] or m["sender_addr"])
             when = m["sent_on"][5:10] + " " + m["sent_on"][11:16]
             body += (f"\n  ({when} {who}) "
                      + smart_truncate((m["new_content"] or "").strip(), _CAP_BODY))
-            if m["sent_on"] > max_ts:
-                max_ts = m["sent_on"]
-        blocks.append(head + body)
-    return "\n".join(blocks), max_ts
+        blocks.append(f"[#{tid}]{' 🚩' if tid in flagged else ''} "
+                      + subject_of.get(tid, "") + body)
+    # 워터마크는 **앞머리 끝**이다 — 얹은 플래그 메일은 rest 를 앞지르지 않는다.
+    mark = take[-1][0]
+    if rest:
+        safe = [r[0] for r in take + extra if r[0] < rest[0][0]]
+        mark = max(safe) if safe else mark
+    # 미룬 통수는 '아직 안 본 것' — 이번에 얹은 플래그 메일은 다음에 다시 오므로
+    # 여기서 빼지 않는다(진도는 워터마크가 말한다).
+    return "\n".join(blocks), mark, len(rest)
 
 
 # ------------------------------------------------------------------ 수확 실행
@@ -360,7 +464,8 @@ def harvest(store: Store, cfg: Config, det: dict,
     적재. 소급 창은 ai.summary_max_days(기본 1일 — 오늘만)이라, 며칠 건너뛴 뒤
     소급하려면 그 값을 늘려야 한다(_window 참고).
 
-    반환: {"delta": [...], "person", "project", "knowledge", "dropped"} —
+    반환: {"delta": [...], "person", "project", "knowledge", "dropped",
+    "deferred"(예산에 밀려 다음 실행으로 넘긴 스레드 수)} —
     재료 없음(새 메일 없음 포함)/백엔드 미설정/호출 실패면 None
     (graceful, 데일리는 결정론 섹션만으로 살아남는다).
     """
@@ -370,7 +475,8 @@ def harvest(store: Store, cfg: Config, det: dict,
     except SystemExit:
         return None
     start_day, last_ts = _harvest_window(store, cfg, date_iso)
-    items, max_ts = _harvest_items(store, cfg, start_day, date_iso, last_ts)
+    items, max_ts, deferred = _harvest_items(store, cfg, start_day,
+                                             date_iso, last_ts)
     if not items:
         return None
     rules = cfg.ai_rules_text()
@@ -380,15 +486,22 @@ def harvest(store: Store, cfg: Config, det: dict,
                             yesterday=_recent_delta(cfg, date_iso),
                             items=items)
     try:
-        raw = review.ai_run(cmd, prompt, on_event=on_event, cancel=cancel)
+        raw = review.ai_run(cmd, prompt, timeout=HARVEST_TIMEOUT,
+                            retries=HARVEST_RETRIES,
+                            on_event=on_event, cancel=cancel)
     except review.AIError as e:
         review._notify_error(on_error, e)   # 삼키는 자리가 곧 보고 자리
         return None
     # 수확 성공 → 워터마크 전진(앞으로만 — 백필은 max() 가드가 자연 처리).
     # 저장 건수와 무관: 모델이 본 메일은 재실행 때 다시 과금하지 않는다.
+    # max_ts 는 이미 잘린 메일 앞에서 멈춘 값이다(_harvest_items 참고) —
+    # 빈 문자열이면 전진하지 않는다.
     if max_ts:
         cur = store.get_state("last_harvest")
         store.set_state("last_harvest", max(cur, max_ts) if cur else max_ts)
+    # 남은 빚 — 있으면 다음 실행의 창이 여기까지 열린다(_harvest_window).
+    store.set_state("harvest_owed_from", start_day if deferred else "")
+
 
     parsed = parse_harvest(raw)
     checker = _QuoteChecker(store)
@@ -423,12 +536,17 @@ def harvest(store: Store, cfg: Config, det: dict,
 
     result = {"delta": parsed["delta"],
               "person": person_saved, "project": project_saved,
-              "knowledge": knowledge_saved, "dropped": dropped}
+              "knowledge": knowledge_saved, "dropped": dropped,
+              "deferred": deferred}
     if cfg.opt("ai", "harvest_log", default=True):
         _log_harvest(cfg, {
             "date": date_iso, "backend": backend, "raw": raw[:8000],
             "n_person": len(person_saved), "n_project": len(project_saved),
             "n_knowledge": len(knowledge_saved),
+            # 예산에 밀려 이번에 못 실은 스레드 수 — 로그만으로 "왜 이 스레드가
+            # 수확에 없나"에 답할 수 있어야 한다. 종전엔 이 숫자가 없어서
+            # 절단이 조용했다.
+            "n_deferred": deferred,
             "saved_knowledge": [{"title": x["title"],
                                  "threads": x["thread_ids"]}
                                 for x in knowledge_saved],

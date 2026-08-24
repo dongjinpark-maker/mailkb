@@ -6625,6 +6625,10 @@ def _run_kn_job(cfg, cid: int) -> None:
         try:
             path = knowledge_mod.save_candidate(cfg, store, cid)
             msg = f"지식으로 저장: {path.name}"
+            # 보강이 실패해도 저장은 된다 — 다만 조용히 두지 않는다. 본문이
+            # 수확본 그대로라는 사실은 사용자가 알아야 다시 눌러 볼 수 있다.
+            if not getattr(knowledge_mod.save_candidate, "last_enriched", True):
+                msg += " · AI 보강 실패(수확본 그대로 — 다시 저장하면 재시도)"
         finally:
             store.close()
     except ValueError as e:            # 후보 없음·이미 처리됨
@@ -7584,6 +7588,9 @@ def _ask_answer_body(res: dict) -> str:
         scope.append("<li>주장-인용 의미 검증 안 됨 — 인용 대조만 통과</li>")
     scope.append(f"<li>훑음 {s.get('hits', 0)}건 · 정독 {s.get('read', 0)}통"
                  + (f" · 근거 검증 탈락 {s['dropped']}" if s.get("dropped") else "")
+                 # 재작성본에서 코드가 버린 문장 — 답이 짧아진 이유를 화면에 둔다
+                 + (f" · 근거 밖 문장 {s['trimmed']}개 제외"
+                    if s.get("trimmed") else "")
                  + f" · {esc(s.get('backend', ''))}</li>")
     scope.append("</ul></details>")
     out.append("".join(scope))
