@@ -6527,7 +6527,8 @@ def _review_button_forms(day: str | None = None) -> str:
     dt = f"<input type='hidden' name='date' value='{esc(day)}'>" if day else ""
     return ("<form method='post' action='/review'><input type='hidden' name='ai' value='1'>"
             f"{dt}<button class='aibtn ghost'>AI 회고</button>"
-            " <span class='dim'>· AI 4콜 · 수 분</span></form>")
+            f" <span class='dim'>· AI {review.DAILY_AI_CALLS}콜 · "
+            f"{review.DAILY_ETA}</span></form>")
 
 
 _DONE_KINDS = (("promise", "내 약속"), ("stalled", "오래 멈춘 스레드"),

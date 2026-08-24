@@ -8688,10 +8688,6 @@ class TestAILayer(unittest.TestCase):
             "sent": [{"sent_on": "2026-07-20T09:12:00", "subject": "RE: A",
                       "to_addrs": "kim@x"}],
             "closed_by_me": [{"thread_id": 4, "subject": "D요청"}],
-            "intervention": [
-                {"category": "respond", "thread_id": 7, "who": "김",
-                 "subject": "회신건", "days": 1, "personal": True, "tag": "⏰",
-                 "snippet": "내일까지 회신 부탁드립니다"}],
             "harvest": {"delta": ["B안 확정 (#2)", "[#9] C안 채택"]},
             "digest": {"work": [
                 {"thread_id": 3, "subject": "흐름건", "who": "이",
@@ -8708,22 +8704,20 @@ class TestAILayer(unittest.TestCase):
         with mock.patch.object(review, "ai_run", side_effect=fake):
             out = review.ai_exec_summary(self.store, self.cfg, det)
         self.assertEqual(out, ("하루 요약입니다 (#7).", "ok"))
+        self.assertEqual(len(prompts), 1)          # 1콜 — 2패스는 없앴다
         p = prompts[0]
-        # 이미 추출된 사실만 — 활동(발신·종결)·흐름. '지금 할 일' 블록은 신호
-        # 노출 폐지(2026-07-30)로 프롬프트에서도 뺐다(요약이 판정을 재노출 금지).
+        # 이미 추출된 사실만 — 활동(발신·종결)·수확. '지금 할 일' 블록은 신호
+        # 노출 폐지(2026-07-30)로 프롬프트에서도 뺐다.
         self.assertNotIn("지금 할 일", p)
-        self.assertNotIn("회신 필요", p)
-        self.assertNotIn("⏰기한", p)
         self.assertIn("보낸 메일 1건", p)
         self.assertIn("- 09:12 RE: A", p)
         self.assertIn("내 회신으로 요청 종결: [#4] D요청", p)
         self.assertIn("B안 확정 (#2)", p)
-        self.assertIn("[#9] C안 채택", p)
-        # 후보(결정론 선정)가 프롬프트의 중심이다 — 문장만 AI 가 쓴다
-        self.assertIn("[오늘의 후보 — 중요한 것부터]", p)
+        # 후보는 **오늘 움직인 것 전부**이고, 그중 무엇을 올릴지는 모델이 고른다
+        self.assertIn("[오늘의 후보 — 오늘 움직인 것 전부]", p)
+        self.assertIn("무엇을 고르나", p)
         self.assertIn("[#7] 회신건", p)
         self.assertIn("문체 표본", p)
-        # '그 외 흐름'은 뺐다 — 3~5문장으로 전부 훑던 옛 계약의 재료였다
         self.assertNotIn("[#3] 흐름건 — 리드", p)
         # 실패와 '고를 것이 없음'은 다른 사실이다
         with mock.patch.object(review, "ai_run",
@@ -8734,10 +8728,79 @@ class TestAILayer(unittest.TestCase):
                           ai_summary_backend="ghost")
         self.assertEqual(review.ai_exec_summary(self.store, cfg_none, det,
                                                 backend="ghost"), ("", "failed"))
-        # 고를 만한 한 건이 없으면 호출하지 않는다 = 특이사항 없음
+        # 고를 만한 건이 없으면 호출하지 않는다 = 특이사항 없음
         det.pop("headline")
         self.assertEqual(review.ai_exec_summary(self.store, self.cfg, det),
                          ("", "none"))
+
+    def test_headline_material_has_a_budget(self):
+        """후보 풀이 3 → 12 로 넓어지면서 재료가 이론상 144,000자(12×6통×2,000자)까지
+        간다. 주간에서 재료를 과하게 주면 산출이 오히려 얇아지는 것을 실측했으므로
+        (777스레드 340KB → 커버 42, 76KB → 44) 총량 상한을 둔다. 무거운 순으로
+        담다가 예산을 넘으면 멈추고, **첫 후보는 넘어도 싣는다**(빈 머리글 방지)."""
+        det = {"date": "2026-07-20", "headlines": [
+            {"thread_id": 700 + i, "subject": f"건{i}", "state": "내 차례",
+             "state_note": "", "people": {"김": 1}} for i in range(6)]}
+        full = review._headline_block(self.store, det)
+        self.assertEqual(full.count("▶"), 6)
+        with mock.patch.object(review, "HEADLINE_MATERIAL", 1):
+            tight = review._headline_block(self.store, det)
+        self.assertEqual(tight.count("▶"), 1)      # 첫 후보는 넘어도 싣는다
+        self.assertLess(len(tight), len(full))
+        with mock.patch.object(review, "HEADLINE_MATERIAL", len(full) // 2):
+            half = review._headline_block(self.store, det)
+        self.assertTrue(1 <= half.count("▶") < 6)  # 중간 예산은 중간만큼
+        # 후보가 없으면 문구 하나 — 호출부가 'none' 으로 가른다
+        self.assertIn("없다", review._headline_block(self.store, {"headlines": []}))
+
+    def test_exec_summary_falls_back_to_a_smaller_prompt(self):
+        """후보 전체를 싣는 프롬프트는 커서 빈 응답이 6일 60회 중 5회(8%) 나왔다.
+        그러면 무거운 순 3건만으로 한 번 더 부른다 — 사람이 가장 먼저 읽는 절을
+        비워 두지 않기 위해서다. 폴백도 실패하면 그때 'failed'."""
+        det = {"date": "2026-07-20", "received_count": 1, "sent": [],
+               "closed_by_me": [], "harvest": {"delta": []}, "digest": {"work": []},
+               "headlines": [{"thread_id": 100 + i, "subject": f"건{i}",
+                              "state": "내 차례", "people": {"김": 1}}
+                             for i in range(6)]}
+        seen = []
+
+        def first_empty(cmd, prompt, **kw):
+            seen.append(prompt)
+            return "" if len(seen) == 1 else "- 폴백 본문입니다."
+
+        with mock.patch.object(review, "ai_run", side_effect=first_empty):
+            out = review.ai_exec_summary(self.store, self.cfg, det)
+        self.assertEqual(out, ("- 폴백 본문입니다.", "ok"))
+        self.assertEqual(len(seen), 2)
+        self.assertIn("[#105] 건5", seen[0])        # 1차는 후보 전부
+        self.assertNotIn("[#105] 건5", seen[1])     # 폴백은 무거운 순 3건만
+        # 둘 다 실패하면 failed — 한 번만 보고한다
+        errs = []
+        with mock.patch.object(review, "ai_run", side_effect=review.AIError("boom")):
+            self.assertEqual(
+                review.ai_exec_summary(self.store, self.cfg, det, on_error=errs.append),
+                ("", "failed"))
+        self.assertEqual(len(errs), 1)
+
+    def test_exec_summary_verifies_refs_and_numbers_in_code(self):
+        """머리글은 판단 문장이라 인용을 요구하지 않는다(불변식 7의 예외). 그래서
+        원래 아무 방어가 없었고 유일한 재검토가 2패스였다. 그 콜을 빼면서 **코드가
+        검증할 수 있는 것**을 검증한다 — 없는 스레드 번호(실측 1회 발생)와 재료에
+        없는 수치. 고칠 수 없으니 그 불릿을 버린다."""
+        det = {"date": "2026-07-20", "received_count": 1, "sent": [],
+               "closed_by_me": [], "harvest": {"delta": ["예산 1.8억원 승인 (#2)"]},
+               "digest": {"work": []},
+               "headline": {"thread_id": 7, "subject": "회신건",
+                            "state": "내 차례", "people": {"김": 2}}}
+        body = ("- **정상 (#7)**: 예산 1.8억원 건이 남아 있습니다.\n"
+                "- **없는 번호 (#1)**: 이 불릿은 버려져야 합니다.\n"
+                "- **없는 수치 (#7)**: 비용이 9999억원이라고 합니다.")
+        with mock.patch.object(review, "ai_run", side_effect=lambda c, p, **k: body):
+            text, state = review.ai_exec_summary(self.store, self.cfg, det)
+        self.assertEqual(state, "ok")
+        self.assertIn("정상 (#7)", text)
+        self.assertNotIn("#1", text)        # 없는 스레드로 링크가 걸리면 안 된다
+        self.assertNotIn("9999", text)      # 재료에 없는 수치
 
     # ── 머리글 투자 확대 (2026-08-15) ─────────────────────────────────
     # 사람이 가장 먼저 읽는 절인데 회고 콜의 1/13 이었다. 셋을 손봤다:
@@ -8837,34 +8900,23 @@ class TestAILayer(unittest.TestCase):
         self.assertEqual(review._normalize_exec("한 문단 요약이다."), "한 문단 요약이다.")
 
     def test_exec_summary_drops_the_reviewers_remark(self):
-        # 2패스가 "[초안]은 …" 같은 **검토 소감**을 먼저 쓰고 `---` 뒤에 본문을
-        # 놓는 출력이 실제로 나왔다 — 화면의 Executive Summary 자리에 소감이
-        # 오고 본문이 아래 단락으로 밀렸다(2026-08-19 사용자 보고).
+        # 모델이 "…을 검토했습니다" 같은 **메타 소감**을 먼저 쓰고 `---` 뒤에
+        # 본문을 놓는 출력이 실제로 나왔다 — 화면의 Executive Summary 자리에
+        # 소감이 오고 본문이 아래로 밀렸다(2026-08-19 사용자 보고). 2패스를
+        # 없앤 뒤에도 1패스 출력에 같은 일이 생길 수 있어 계약을 유지한다.
         det = {"date": "2026-07-20", "received_count": 1, "sent": [],
                "closed_by_me": [], "harvest": {"delta": ["B안 확정 (#2)"]},
                "digest": {"work": []},
                "headline": {"thread_id": 7, "subject": "회신건",
                             "state": "내 차례", "people": {"김": 2}}}
-        remark = ("[초안]은 재료를 정확히 반영하고 있습니다. 주어만 보완했습니다.\n\n"
-                  "---\n\nB안으로 확정돼 다음 주 리뷰 전까지 회신이 필요하다(#26081338001).")
-
-        def two_pass(cmd, prompt, **kw):
-            return remark if "[초안]" in prompt else "초안 본문."
-
-        with mock.patch.object(review, "ai_run", side_effect=two_pass):
+        remark = ("재료를 정확히 반영했습니다. 주어만 보완했습니다.\n\n"
+                  "---\n\n- **B안 (#7)**: B안으로 확정돼 회신이 필요합니다.")
+        with mock.patch.object(review, "ai_run", side_effect=lambda c, p, **k: remark):
             out = review.ai_exec_summary(self.store, self.cfg, det)
         self.assertEqual(out[1], "ok")
-        self.assertNotIn("초안", out[0])          # 소감은 안 실린다
         self.assertNotIn("---", out[0])
-        self.assertTrue(out[0].startswith("B안으로 확정돼"))
-
-        # 소감밖에 없으면 초안으로 되돌아간다(2패스는 필수가 아니다)
-        with mock.patch.object(
-                review, "ai_run",
-                side_effect=lambda c, p, **k: ("[초안]을 검토했습니다. 고칠 곳이 없습니다."
-                                               if "[초안]" in p else "초안 본문.")):
-            self.assertEqual(review.ai_exec_summary(self.store, self.cfg, det),
-                             ("초안 본문.", "ok"))
+        self.assertNotIn("보완했습니다", out[0])      # 소감은 안 실린다
+        self.assertIn("B안으로 확정돼", out[0])
 
     def test_strip_meta_preamble_keeps_real_sentences(self):
         # 어휘만으로 자르지 않는다 — '검토 결과 …' 로 시작하는 **진짜 보고 문장**이
@@ -8875,61 +8927,6 @@ class TestAILayer(unittest.TestCase):
         self.assertEqual(review.strip_meta_preamble(plain), plain)
         self.assertEqual(review.strip_meta_preamble("검토 결과 문장을 다듬었습니다."), "")
         self.assertEqual(review.strip_meta_preamble(""), "")
-
-    def test_exec_summary_second_pass(self):
-        det = {"date": "2026-07-20", "received_count": 1, "sent": [],
-               "closed_by_me": [], "harvest": {"delta": ["B안 확정 (#2)"]},
-               "digest": {"work": []},
-               "headline": {"thread_id": 7, "subject": "회신건",
-                            "state": "내 차례", "people": {"김": 2}}}
-        seen = []
-
-        def two_pass(cmd, prompt, **kw):
-            seen.append(prompt)
-            return "고쳐 쓴 본문." if "[초안]" in prompt else "초안 본문."
-
-        with mock.patch.object(review, "ai_run", side_effect=two_pass):
-            out = review.ai_exec_summary(self.store, self.cfg, det)
-        self.assertEqual(out, ("고쳐 쓴 본문.", "ok"))     # 2패스 결과를 쓴다
-        self.assertEqual(len(seen), 2)
-        # 고쳐쓰기에도 **재료를 다시 준다** — 초안만 주면 없는 사실로 매끄럽게 만든다
-        self.assertIn("초안 본문.", seen[1])
-        self.assertIn("[오늘의 후보 — 중요한 것부터]", seen[1])
-        self.assertIn("B안 확정 (#2)", seen[1])
-
-        # 고쳐쓰기 실패는 on_error 로 보고하지 않는다 — 초안이 온전히 실리므로
-        # 사용자가 잃은 것이 없는데, 보고하면 회고 화면이 "결정론 리뷰만"이라고
-        # 말해 화면과 어긋난다
-        seen_err = []
-
-        def only_second_fails(cmd, prompt, **kw):
-            if "[초안]" in prompt:
-                raise review.AIError("두 번째만 실패")
-            return "초안 본문."
-
-        with mock.patch.object(review, "ai_run", side_effect=only_second_fails):
-            out2 = review.ai_exec_summary(self.store, self.cfg, det,
-                                          on_error=seen_err.append)
-        self.assertEqual(out2, ("초안 본문.", "ok"))
-        self.assertEqual(seen_err, [])
-
-        # 2패스는 되면 좋은 것 — 실패하거나 비면 초안이 그대로 살아남는다
-        for second in (review.AIError("boom"), ""):
-            calls = []
-
-            def flaky(cmd, prompt, **kw):
-                calls.append(prompt)
-                if "[초안]" not in prompt:
-                    return "초안 본문."
-                if isinstance(second, Exception):
-                    raise second
-                return second
-
-            with mock.patch.object(review, "ai_run", side_effect=flaky):
-                self.assertEqual(
-                    review.ai_exec_summary(self.store, self.cfg, det),
-                    ("초안 본문.", "ok"))
-            self.assertEqual(len(calls), 2)
 
     def test_ai_rules_text_strips_comments(self):
         self.assertEqual(self.cfg.ai_rules_text(), "")  # 파일 없음 → 빈 문자열

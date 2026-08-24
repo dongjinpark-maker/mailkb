@@ -439,10 +439,11 @@ def cmd_review(args) -> None:
               file=sys.stderr, flush=True)
         # graceful — AI 가 실패해도 결정론 리뷰는 항상 출력·저장 (#10)
         # run_ai_layer 은 3개 작업 단계(수확·디제스트·하루요약) 후 '완료'.
+        # 단계 수는 review.DAILY_AI_CALLS 한 곳에서 온다 — 화면과 어긋나지 않게.
         # 인물 요약은 인물 화면 버튼(2026-07-29), 개입 분류·정리는 '지금 할 일'
         # 폐지와 함께 제거(2026-07-30) — 오늘·백필 모두 같은 단계 구성.
         # 누적 요약 갱신은 2026-08-15 에 스레드 화면 버튼으로 분리됐다.
-        total = 3
+        total = review.DAILY_AI_CALLS
         ai_text, note = review.run_ai_layer(
             store, cfg, det, backend=args.backend, persist_date=d,
             progress=_StageProgress(total),

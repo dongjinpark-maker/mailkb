@@ -431,9 +431,12 @@ def deterministic(store: Store, cfg: Config, date_iso: str | None = None) -> dic
         "promises": proms,
         # 어제 대비 상태판 변화 — 리포트의 핵심. 무거우면 호출부가 빼도 된다.
         "shift": state_shift(store, cfg, d, now=now_map),
-        # 머리글 후보(최대 HEADLINE_TOP) — 선정은 결정론, 문장만 AI 가 쓴다.
+        # 머리글 후보 — **고르기는 모델이 한다**(2026-08-24, HEADLINE_POOL 주석).
+        # 여기서는 '보고할 값어치가 있는 것'만 걸러 무거운 순으로 담고, 그중
+        # 무엇을 올릴지는 ai_exec_summary 가 재료를 읽고 정한다.
         # headline(첫 항목)은 옛 호출부 호환용이다.
-        "headlines": headlines(store, now_map, d, {p["thread_id"] for p in proms}),
+        "headlines": headlines(store, now_map, d, {p["thread_id"] for p in proms},
+                               top=HEADLINE_POOL),
     }
     det["headline"] = det["headlines"][0] if det["headlines"] else None
     # 그날 이미 받아 둔 AI 산출을 다시 얹는다 — **호출은 하지 않는다**(되읽기).
@@ -459,12 +462,40 @@ def _worth_reporting(t: dict, promise_tids: set) -> bool:
             or t.get("deadline"))
 
 
-HEADLINE_TOP = 3            # 머리글 후보 상한 — 주간(EXEC_TOP 5)보다 하루는 짧다
+# 일간 AI 계층의 콜 수와 소요 시간 — **여기 한 곳에서만** 만든다(주간의
+# web._weekly_eta 와 같은 이유: 두 화면이 다른 값을 말하면 안내가 무너진다).
+# 실측(sonnet, 2026-08-24 1콜 머리글로 바꾼 뒤) — 배포 경로 전체:
+#   데모(하루 20통)            69 · 190 · 192초
+#   무거운 날(100통·본문 1,000자) 212초  (수확 128 · 디제스트 23 · 머리글 60)
+# 수확이 활동량에 비례해 늘고 머리글은 60~76초로 거의 평평하다. 종전 4콜
+# (머리글 2패스) 때는 같은 데모에서 257초였다.
+DAILY_AI_CALLS = 3          # 수확 · 디제스트 · 머리글
+DAILY_ETA = "보통 1~4분"
+
+HEADLINE_BULLETS = 3        # 머리글에 실을 건수 — 주간(EXEC_TOP 7)보다 하루는 짧다
+HEADLINE_POOL = 12          # 모델에게 보여 줄 후보 상한 — 재료 예산 겸 방어
+# **선정을 모델이 한다**(2026-08-24). 종전에는 상태판 점수 상위 3건을 코드가
+# 골라 문장만 맡겼는데, 그 점수는 관여도 축(지목·답장·직접수신·내 발신)뿐이라
+# **그날 무슨 일이 있었나를 읽지 못한다**. 독립 심판(그날 후보 전부를 주고
+# 고르기만 시킨 콜 5회의 다수결)을 기준선 삼아 6일을 채점한 결과:
+#
+#   점수 상위 3건(종전)        47~50%
+#   '내 차례·막힘'에 +20 가산   59~61%  ← 3일에 맞춰 만들면 그 3일만 89%,
+#                                        새 3일에서 38% 로 무너졌다(과적합)
+#   모델이 후보 전체에서 선정   79~83%  ← 튜닝·홀드아웃 격차가 작다
+#
+# 결정론이 실패하는 이유가 홀드아웃에 그대로 있었다 — 8/17 에 심판이 만장으로
+# 고른 것이 '학습용 GPU 서버 증설'(상태 플래그 없음, 관여도만 높음)이었다.
+# **중요도는 스레드의 속성이 아니라 그날 무슨 일이 있었느냐에 달려 있다.**
 
 
 def headlines(store: Store, now: dict, day: str, ptids: set,
-              top: int = HEADLINE_TOP) -> list[dict]:
-    """오늘 리포트의 머리글 후보 — 오늘 움직인 스레드 중 무거운 순 최대 top 건.
+              top: int = HEADLINE_POOL) -> list[dict]:
+    """오늘 리포트의 머리글 **후보 풀** — 오늘 움직인 스레드 중 무거운 순 최대 top 건.
+
+    **여기서 자르는 것은 재료 예산이지 선정이 아니다**(2026-08-24). 무엇을
+    머리글에 올릴지는 모델이 원문을 읽고 정한다(HEADLINE_POOL 주석의 실측).
+    점수 정렬은 예산이 모자랄 때 무엇을 먼저 버릴지의 기준으로만 남는다.
 
     **한 건이 아니라 여러 건이다**(2026-08-22). 8/15 의 '한 건을 중심으로 한 문단'
     계약은 "3~5문장으로 전부 훑던" 요약이 경과 나열이 되는 문체 문제를 건수
@@ -1221,8 +1252,14 @@ THREAD_DIGEST = """다음은 오늘 활동이 있었던 '업무' 메일 스레�
 EXEC_SUMMARY = """당신은 상위 management 가 읽는 하루 보고의 머리글을 쓴다.
 
 규칙 (한국어):
-- 아래 [오늘의 후보]는 중요한 것부터 최대 3건이다. **후보마다 불릿 하나**를 쓴다
-  ("- " 로 시작, 후보 순서 그대로). 후보가 하나면 불릿도 하나다.
+- 아래 [오늘의 후보]는 **오늘 움직인 것 전부**다(중요도 순이 아니다). 그중
+  **오늘 가장 보고할 값어치가 있는 것 최대 3건**을 직접 고르고, 고른 것마다
+  불릿 하나를 쓴다("- " 로 시작). 후보가 셋 이하면 그만큼만 쓴다.
+- **무엇을 고르나**: 메일을 많이 주고받았다는 것은 이유가 아니다. 조용했다는
+  것도 이유가 아니다. 기준은 **읽는 사람의 다음 판단이나 행동이 달라지는가**다.
+  이미 끝나서 아무도 할 일이 없는 것은 올리지 마라. 기한이 임박했거나 지난 것,
+  결정이 대기 중인 것, 막혀 있는 것, 규모·파급이 큰 사안을 본다.
+- **스레드 번호는 후보에 적힌 번호를 그대로 쓴다.** 새로 번호를 매기지 마라.
 - 불릿 머리는 **굵은 짧은 제목 (#번호)**: 이고, 그 뒤에 '무엇이 어떻게 됐고,
   그래서 지금 무엇이 필요한가'가 드러나는 문장을 쓴다. 경과 나열이 아니라
   판단이 서는 문장이어야 한다.
@@ -1239,11 +1276,20 @@ EXEC_SUMMARY = """당신은 상위 management 가 읽는 하루 보고의 머리
   인명·일정을 이 요약에 가져오지 마라.
 - 제목·머리말·인사말 금지, 불릿만.
 
+[내보내기 전 스스로 점검하라 — 어긋나면 고쳐서 내라]
+종전에는 이 점검을 **두 번째 콜**(고쳐쓰기)이 했는데, 6일 실측에서 2배 비싸고
+품질은 동등하거나 못했다(절 잇기 0.33 대 0.11). 규칙을 여기로 옮긴다.
+- 재료에 없는 사실·수치·인명·스레드 번호가 섞였는가 → 뺀다.
+- 경과 나열에 그치는가 → '그래서 지금 무엇이 필요한가'가 서게 고친다.
+- 한 문장이 절 서넛을 이어 길어졌는가 → 문장을 나눈다.
+- 재료에 있는데 빠뜨린 결정적 사실(결정·기한·막힌 지점)이 있는가 → 넣는다.
+- 완료되지 않은 것을 완료된 것처럼 썼는가 → 약속·예정으로 고친다.
+
 형식 예(내용은 예시일 뿐이다):
 - **양자화 방식 (#123)**: QAT 로 확정됐고, 킥오프에서 폴백 판정 시점을 정해야 합니다. 비용 산정 회신이 아직 없어 승인 전에 킥오프를 미룰지 판단이 필요합니다.
 - **B0 타이밍 (#456)**: hold 위반 대응이 마무리됐고 제 쪽 확인만 남았습니다.
 
-[오늘의 후보 — 중요한 것부터]
+[오늘의 후보 — 오늘 움직인 것 전부]
 {headline}
 
 [오늘 확정·변경]
@@ -1263,35 +1309,6 @@ EXEC_SUMMARY = """당신은 상위 management 가 읽는 하루 보고의 머리
 # 실패(경과 나열·재료에 없는 단정·'그래서 무엇' 누락)를 한 번 더 걸러 낸다.
 # **재료를 다시 준다** — 초안만 주고 고치라 하면 모델이 없는 사실로 매끄럽게
 # 만든다(주간의 검증 패스와 같은 이유로 원 재료를 항상 동봉한다).
-EXEC_REVISE = """당신은 상위 management 가 읽는 하루 보고의 머리글을 **고쳐 쓴다**.
-
-아래 [초안]을 같은 재료로 검토하고, 고칠 곳이 있으면 고쳐서 **최종 본문만** 출력하라.
-
-검토 기준:
-- 재료에 없는 사실·수치·인명·스레드 번호가 섞였는가 → 뺀다.
-- 경과 나열에 그치는가 → '그래서 지금 무엇이 필요한가'가 서게 고친다.
-- 한 문장이 절 서넛을 이어 길어졌는가 → 문장을 나눈다(한 문장에 사실 하나).
-- 재료에 있는데 빠뜨린 결정적 사실(결정·기한·막힌 지점)이 있는가 → 넣는다.
-- 모양은 그대로 지킨다: **후보마다 불릿 하나**(최대 3개, 후보 순서), 불릿 머리는
-  굵은 제목 (#번호), 불릿 하나는 **줄바꿈 없는 한 덩어리**(길어도 다섯 문장),
-  한국어 **높임말(합니다체)**, 제목/머리말 없음. 평서체가 섞였으면 고친다.
-- **고칠 것이 없으면 초안을 그대로 출력한다.** 다르게 쓰기 위해 다르게 쓰지 마라.
-- **검토 소감·수정 설명·구분선(---) 금지.** 최종 불릿만 출력한다.
-
-[초안]
-{draft}
-
-[오늘의 후보 — 중요한 것부터]
-{headline}
-
-[오늘 확정·변경]
-{changes}
-
-[내 활동]
-{activity}
-
-최종 본문만 출력하라:"""
-
 # 요약이 비었을 때의 문구 — 상황을 구분한다. 넷을 한 문장으로 뭉개면 도구 탓처럼
 # 읽히는데, 대부분은 **모델이 올릴 것이 없다고 판단한 결과**다(프롬프트가 이미
 # "쓸 것이 없으면 비워라"라고 지시한다). 실패를 '특이사항 없음'이라 말하면 거짓이
@@ -1670,6 +1687,14 @@ _HEADLINE_MSGS = 6         # 머리글 재료로 읽는 최근 메시지 수
 # 머리글도 같은 병을 앓을 자리다: 1콜에 6통뿐이라 예산을 키워도 총량이 작다
 # (6 × 2,000 = 12,000자). 앞뒤를 나눠 담으므로 결론이 먼저 잘리지도 않는다.
 _HEADLINE_BODY = 2000
+# 머리글 재료 총량 상한 — 주간의 MATERIAL_BUDGET(75,000자, 한 주치)과 같은 장치.
+# 후보 12건 × 6통 × 2,000자면 이론상 144,000자까지 간다.
+#
+# 값의 근거(2026-08-24 실측): **하루 100통 · 건당 신규 본문 1,000자**(관여 스레드
+# 47, 후보 풀 12)에서 재료가 28,049자였다. 30,000 이면 여유가 2KB 뿐이라 조금만
+# 무거워져도 후보가 잘리는데, 그러면 **가장 바쁜 날에 후보가 가장 적게 보이는**
+# 역방향이 된다. 그 두 배로 잡는다 — 주간의 75,000(한 주치)보다는 작다.
+HEADLINE_MATERIAL = 60_000
 
 
 # ── 인물 진단 (2026-08-18) ────────────────────────────────────────────
@@ -1823,12 +1848,16 @@ def _headline_block(store: Store, det: dict) -> str:
     hs = _headline_list(det)
     if not hs:
         return "(오늘 보고할 만한 건이 없다)"
-    # 예산은 건수와 무관하게 건당 6통 × 2,000자 그대로다(사용자 결정 2026-08-22) —
-    # 후보가 셋이면 입력이 최대 36,000자인데, 콜 1회짜리 절이고 줄이면 결론이
-    # 먼저 잘린다. 앞뒤를 나눠 담는 절단(smart_truncate)은 그대로다.
+    # 건당 예산은 6통 × 2,000자 그대로다(사용자 결정 2026-08-22) — 줄이면 결론이
+    # 먼저 잘린다. 대신 **총량에 상한**을 둔다(2026-08-24): 후보 풀이 3 → 12 로
+    # 넓어지면서 이론상 최대가 144,000자가 됐고, 주간에서 재료를 과하게 주면
+    # 산출이 오히려 얇아지는 것을 실측했다(777스레드 340KB → 커버 42, 76KB → 44).
+    # 무거운 순으로 담다가 예산을 넘으면 멈춘다. 첫 후보는 넘어도 싣는다.
     n_msgs, n_body = _HEADLINE_MSGS, _HEADLINE_BODY
-    out = []
+    out, used = [], 0
     for i, h in enumerate(hs, 1):
+        if out and used > HEADLINE_MATERIAL:
+            break
         who = max(h["people"], key=h["people"].get) if h.get("people") else ""
         head = (f"▶ 후보 {i}  [#{h['thread_id']}] {h.get('subject') or ''}"
                 f" · 상태 {h.get('state') or ''}")
@@ -1837,6 +1866,7 @@ def _headline_block(store: Store, det: dict) -> str:
         if who:
             head += f" · 상대 {who}"
         out.append(head)
+        mark = len(out)
         rows = store.db.execute(
             "SELECT is_sent, sent_on, new_content FROM messages "
             "WHERE thread_id=? ORDER BY sent_on DESC LIMIT ?",
@@ -1850,6 +1880,7 @@ def _headline_block(store: Store, det: dict) -> str:
                 out.append(f"- {'내 발신' if r['is_sent'] else '수신'} "
                            f"{(r['sent_on'] or '')[:16]}: {body}")
         out.append("")
+        used += sum(len(x) for x in out[mark - 1:])
     return "\n".join(out).rstrip()
 
 
@@ -1911,49 +1942,104 @@ def _exec_facts(det: dict) -> dict:
     return {"changes": block(changes), "activity": block(activity)}
 
 
+def _exec_verify(text: str, det: dict, facts: dict) -> str:
+    r"""머리글에서 **코드가 검증할 수 있는 것**만 검증한다.
+
+    머리글은 여러 통을 종합한 판단 문장이라 인용을 요구하지 않는다(불변식 7의
+    명시적 예외 — 강제하면 종합이 발췌로 퇴화한다). 그래서 여기엔 원래 아무
+    방어가 없었고, 유일한 재검토가 두 번째 콜이었다. 그 콜을 빼면서 **프롬프트
+    규율에 맡기던 것을 코드로 내린다**:
+
+    - `#번호` 가 오늘 후보에 실재하는가. 자릿수를 안 보는 `#(\d+)` 링크 규칙
+      때문에 모델이 `#1` 을 쓰면 없는 스레드로 링크가 걸린다(실측 1회 발생).
+    - **구별력 있는 수치**가 재료에 있는가 — 소수(3.2)·비율(35%)·세 자리 이상
+      (1,847). 없는 값이 섞인 불릿은 **버린다**(고칠 수 없으니 남기지 않는다).
+
+      작은 정수와 날짜는 **일부러 뺐다.** `8/25` 같은 환산 날짜는 재료에
+      "다음 주 화요일"로만 있어 정직한 서술이 탈락하고, `8`·`25` 로 쪼개 보면
+      더 나빠진다. 6일 27회 실측에서 환각 수치는 0 건이었으므로, 잡은 것 없이
+      오탐 위험만 지는 검사는 좁히는 쪽이 맞다.
+    """
+    ok_tids = {str(h["thread_id"]) for h in _headline_list(det)}
+    material = " ".join((facts.get("headline", "") + facts.get("changes", "")
+                         + facts.get("activity", "")).split())
+    kept = []
+    for line in text.splitlines():
+        body = line.strip()
+        if not body.startswith("- "):
+            kept.append(line)
+            continue
+        refs = _EXEC_REF_RX.findall(body)
+        if refs and not all(r in ok_tids for r in refs):
+            continue                       # 없는 스레드를 가리키는 불릿은 버린다
+        plain = _EXEC_DATE_RX.sub(" ", _EXEC_REF_RX.sub(" ", body))
+        nums = set(_EXEC_NUM_RX.findall(plain))
+        if any(n not in material for n in nums):
+            continue                       # 재료에 없는 수치가 섞였다
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
+_EXEC_REF_RX = re.compile(r"#(\d+)")
+_EXEC_DATE_RX = re.compile(r"\d{1,2}\s*[/월]\s*\d{1,2}일?")   # 8/25 · 8월 25일
+# 구별력 있는 수치만 본다 — 소수·비율·세 자리 이상. 작은 정수("3건")는 재료에서
+# 정당하게 세어 나올 수 있어 검사 대상이 아니다.
+_EXEC_NUM_RX = re.compile(r"\d+\.\d+%?|\d+%|\d{3,}")
+
+
 def ai_exec_summary(store: Store, cfg: Config, det: dict,
                     backend: str | None = None,
                     on_event=None, cancel=None, on_error=None) -> tuple[str, str]:
-    """데일리 머리글(Executive Summary) 생성 — 2패스(초안→고쳐쓰기), graceful.
+    """데일리 머리글(Executive Summary) 생성 — **1콜**, graceful.
 
     (본문, 상태) 를 돌려준다. 상태는 ok|none|failed — 빈 결과를 전부 'AI 요약
-    없음'으로 뭉개면 도구 탓처럼 읽히는데, 고를 만한 한 건이 없어서 안 쓴 것과
+    없음'으로 뭉개면 도구 탓처럼 읽히는데, 고를 만한 건이 없어서 안 쓴 것과
     호출이 실패한 것은 다른 사실이다(2026-08-01 사용자 확정).
 
-    대상 1건은 결정론으로 이미 골라져 있고(det["headline"]) 문장만 AI 가 쓴다.
-    문체 표본은 주간과 같은 함수를 쓴다 — 두 리포트의 어조가 갈리지 않게.
+    **무엇을 올릴지도 모델이 고른다**(2026-08-24). 재료로 그날 후보 전부를 주고
+    3건을 고르게 한다 — 근거는 HEADLINE_POOL 주석의 6일 실측이다. 종전 2패스
+    (초안→고쳐쓰기)는 없앴다: 선정을 고정하고 패스만 갈라 재니 2배 비싸고 품질은
+    동등하거나 못했다(1패스 95초·1콜 대 2패스 185초·2콜, 절 잇기 0.11 대 0.33).
+    고쳐쓰기의 검토 항목은 프롬프트의 자체 점검으로 옮겼고, 코드가 검증할 수
+    있는 부분은 _exec_verify 가 맡는다.
 
-    **2패스는 되면 좋은 것이지 필수가 아니다**(2026-08-15) — 고쳐쓰기가 실패하거나
-    빈 답을 주면 **초안을 그대로 쓴다.** 사용자가 잃는 것은 '조금 더 나은 문장'이지
-    머리글 자체가 아니다. 취소(AICancelled)는 여기서도 삼키지 않는다."""
-    if not _headline_list(det):
+    **폴백이 있다.** 후보 전체를 싣는 프롬프트는 커져서 빈 응답이 6일 60회 중
+    5회(8%) 나왔다. 그러면 종전 방식(무거운 순 3건만, 작은 프롬프트)으로 한 번
+    더 부른다 — 실패를 그대로 두면 사람이 가장 먼저 읽는 절이 빈다.
+    취소(AICancelled)는 여기서도 삼키지 않는다."""
+    pool = _headline_list(det)
+    if not pool:
         return "", "none"          # 고를 만한 건이 없다 = 특이사항 없음
     try:
         cmd = cfg.ai_cmd(backend)
     except SystemExit:
         return "", "failed"
     from . import weekly as weekly_mod   # 순환 방지(weekly 가 review 를 임포트)
-    facts = {"headline": _headline_block(store, det), **_exec_facts(det)}
-    prompt = EXEC_SUMMARY.format(tone=weekly_mod.tone_samples(store), **facts)
+    tone = weekly_mod.tone_samples(store)
+
+    def once(det_in: dict) -> str:
+        facts = {"headline": _headline_block(store, det_in), **_exec_facts(det_in)}
+        raw = ai_run(cmd, EXEC_SUMMARY.format(tone=tone, **facts),
+                     on_event=on_event, cancel=cancel)
+        text = _normalize_exec(strip_meta_preamble(strip_summary_header(raw)))
+        return _exec_verify(text, det_in, facts) if text else ""
+
+    err = None
     try:
-        out = ai_run(cmd, prompt, on_event=on_event, cancel=cancel)
+        text = once(det)
     except AIError as e:
-        _notify_error(on_error, e)         # 삼키는 자리가 곧 보고 자리
-        return "", "failed"
-    text = _normalize_exec(strip_meta_preamble(strip_summary_header(out)))
+        err, text = e, ""
+    if not text and len(pool) > HEADLINE_BULLETS:
+        # 폴백 — 후보를 무거운 순 3건으로 좁혀 작은 프롬프트로 한 번 더.
+        try:
+            text = once(dict(det, headlines=pool[:HEADLINE_BULLETS]))
+        except AIError as e:
+            err = err or e
     if not text:
+        if err is not None:
+            _notify_error(on_error, err)   # 삼키는 자리가 곧 보고 자리
         return "", "failed"
-    try:
-        out2 = ai_run(cmd, EXEC_REVISE.format(draft=text, **facts),
-                      on_event=on_event, cancel=cancel)
-        revised = _normalize_exec(strip_meta_preamble(strip_summary_header(out2)))
-    except AIError:
-        # **on_error 를 부르지 않는다** — 고쳐쓰기가 실패해도 초안이 그대로
-        # 실리므로 사용자가 잃은 것이 없다. 여기서 실패를 보고하면 회고 화면이
-        # "AI 호출 실패 — 결정론 리뷰만"이라고 말하는데, 정작 하루 요약은
-        # 멀쩡히 나와 있어 안내가 화면과 어긋난다(2026-08-15 점검).
-        revised = ""               # 초안은 살아 있다 — 실패해도 절이 비지 않는다
-    return (revised or text), "ok"
+    return text, "ok"
 
 
 def _append_log(cfg: Config, fname: str, analyze_name: str,
