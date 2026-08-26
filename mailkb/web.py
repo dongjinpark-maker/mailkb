@@ -5161,13 +5161,33 @@ _AI_MARK = {"have": ("●", "있음", "ok"), "ok": ("●", "응답", "ok"),
             "slow": ("▲", "무응답", "warn"), "fail": ("■", "실패", "fail"),
             "none": ("·", "없음", "none")}
 _AI_FIX = {
-    "fail": "그 CLI 가 이 모델을 부를 수 있는지, 로그인이 살아 있는지 "
-            "확인하세요. 이 백엔드를 쓰는 역할은 위 표에서 다른 이름으로 "
-            "바꿀 수 있습니다.",
-    "slow": "느린 백엔드일 수 있으니 한 번 더 눌러 보세요. 계속 이러면 그 CLI 를 "
-            "터미널에서 직접 실행해 로그인·프록시 설정을 확인하세요 — 모델이 "
+    "fail": "이 AI 가 응답하지 않습니다. 로그인이 풀렸거나 이 모델을 쓸 권한이 "
+            "없을 수 있습니다. 위 표에서 다른 AI 로 바꿀 수 있습니다.",
+    "slow": "원래 느린 AI 일 수 있으니 한 번 더 눌러 보세요. 계속 이러면 "
+            "터미널에서 직접 실행해 로그인·프록시를 확인하세요 — 모델이 "
             "없는 것과는 다른 증상입니다.",
 }
+
+# 드롭다운에 보이는 글자 — 값(백엔드 이름)과 분리한다. 이름 넷만 보고는 고를 수
+# 없어서 성격을 한 마디씩 붙인다. 내장 아닌 이름은 누가 설정했는지 알 수 없으므로
+# '직접 지정'과 **실제로 부르는 실행 파일**만 말한다.
+_BACKEND_NOTE = {
+    "sonnet": "Claude · 기본 · 속도와 품질의 균형",
+    "opus": "Claude · 가장 똑똑함 · 느리고 비쌈",
+    "haiku": "Claude · 가장 빠르고 쌈 · 가벼운 일에",
+}
+_BACKEND_ORDER = ("sonnet", "opus", "haiku", "internal")   # 기본에서 시작
+
+
+def _backend_label(cfg, name: str) -> str:
+    note = _BACKEND_NOTE.get(name)
+    if note:
+        return f"{name} — {note}"
+    try:
+        binary = cfg.ai_cmd(name)[0]
+    except SystemExit:                       # 선언도 내장도 없는 이름
+        return name
+    return f"{name} — 직접 지정 ({binary})"
 
 
 def _ai_roles_by_backend(cfg) -> dict[str, list[str]]:
@@ -5215,7 +5235,7 @@ def _run_aitest_job(cfg) -> None:
     rows = {}
     for b in _ai_backends(cfg):
         if not b["where"]:
-            rows[b["name"]] = ("none", "PATH 에 없습니다")
+            rows[b["name"]] = ("none", "이 PC 에 설치돼 있지 않습니다")
             continue
         try:
             out = review.ai_run(b["cmd"], "한 단어로만 답하라. 정상이면 OK.",
@@ -5246,15 +5266,14 @@ def _ai_status_html(cfg) -> str:
         aj = dict(_aitest_job)
     tested = aj.get("rows") or {}
     rows = _ai_backends(cfg)
-    live = [b for b in rows if b["where"]]
 
-    out = ["<h2>AI 백엔드 상태</h2>", "<div class='aichk'>"]
+    out = ["<h2>이 PC 에서 쓸 수 있는 AI</h2>", "<div class='aichk'>"]
     for b in rows:
         got = tested.get(b["name"])
         key = got[0] if got else ("have" if b["where"] else "none")
         mark, word, cls = _AI_MARK[key]
-        detail = got[1] if got else ("" if b["where"] else "PATH 에 없습니다")
-        role_s = " · ".join(b["roles"]) or "미사용"
+        detail = got[1] if got else ("" if b["where"] else "이 PC 에 설치돼 있지 않습니다")
+        role_s = " · ".join(b["roles"]) or "쓰는 기능 없음"
         out.append(
             f"<div class='airow {cls}'><span class='aimark'>{mark} {word}</span>"
             f"<span class='ainame'>{esc(b['name'])}</span>"
@@ -5265,16 +5284,16 @@ def _ai_status_html(cfg) -> str:
             out.append(f"<div class='aifix'>→ {esc(_AI_FIX[key])}</div>")
     if aj["running"]:
         out.append("<div data-aitest-running='1' class='airow'>"
-                   "<span class='spin'></span> 백엔드에 물어보는 중…"
-                   f" <span class='dim'>AI {len(live)}콜 · 완료되면 자동 전환</span>"
+                   "<span class='spin'></span> AI 에 물어보는 중…"
+                   " <span class='dim'>완료되면 자동 전환</span>"
                    "</div>")
     else:
         out.append("<form method='post' action='/settings/aitest'>"
                    "<button class='aibtn ghost compact'>응답 시험</button>"
                    + (f" <span class='dim'>{esc(aj['at'])} 기준 · 다시 물어보기</span>"
                       if tested else
-                      f" <span class='dim'>AI {len(live)}콜 — 실제로 불러 봅니다"
-                      "(없는 것은 안 부릅니다)</span>")
+                      " <span class='dim'>설치된 AI 마다 한 번씩 실제로 "
+                      "불러 봅니다</span>")
                    + "</form>")
     out.append("</div>")
     return "\n".join(out)
@@ -5340,10 +5359,15 @@ def render_settings(store, cfg) -> str:
                 f"<td><input type='number' name='{name}' value='{esc(str(val))}' "
                 f"min='{note[1]}' style='width:70px'></td>"
                 f"<td class='dim'>{esc(note[2])}</td></tr>")
-    backends = sorted(set(list(cfg.ai_backends) + list(cfgmod._BUILTIN_BACKENDS)))
+    known = set(list(cfg.ai_backends) + list(cfgmod._BUILTIN_BACKENDS))
+    backends = [b for b in _BACKEND_ORDER if b in known]
+    backends += sorted(known - set(backends))
     def _sel(name, cur):
+        # value 는 백엔드 이름, 표시는 설명 붙은 글자다. 둘을 붙여 두면 설명이
+        # 그대로 백엔드 이름으로 저장돼 설정이 깨진다.
         opts = "".join(
-            f"<option{' selected' if b == cur else ''}>{esc(b)}</option>"
+            f"<option value='{esc(b)}'{' selected' if b == cur else ''}>"
+            f"{esc(_backend_label(cfg, b))}</option>"
             for b in backends)
         return (f"<td><select name='{name}'>{opts}</select></td>")
     num_rows = (
@@ -5360,25 +5384,30 @@ def render_settings(store, cfg) -> str:
         + _num("ask_max_input_tokens",
                cfg.opt("ai", "ask_max_input_tokens",
                        default=ask_mod.ASK_MAX_INPUT_TOKENS),
-               ("분석 입력 상한(토큰)", 0,
-                "한 콜에 싣는 최대 입력 — 백엔드 창 크기 (0=제한 없음)")))
+               ("분석이 한 번에 읽는 양", 0,
+                "고른 AI 가 감당하는 크기에 맞춥니다. 모르면 그대로 "
+                "(0=제한 없음)")))
     out.append("<h2>판정 기준</h2>")
     out.append("<form method='post' action='/settings/save'>"
                "<table class='settbl'>" + num_rows
-               + "<tr><th>요약 백엔드</th>" + _sel("summary_backend", cfg.ai_summary_backend)
-               + "<td class='dim'>요약 · 회고</td></tr>"
-               + "<tr><th>AI 검색 백엔드</th>" + _sel("search_backend", cfg.ai_search_backend)
+               + "<tr><td colspan='3' class='dim'><b>어떤 AI 가 할까</b> — "
+                 "기능마다 다른 모델을 쓸 수 있습니다. 잘 모르겠으면 그대로 "
+                 "두세요.</td></tr>"
+               + "<tr><th>일일 회고·요약</th>"
+               + _sel("summary_backend", cfg.ai_summary_backend)
+               + f"<td class='dim'>하루 회고 · 스레드 요약 · 인물 카드 · "
+                 f"{review.DAILY_ETA}</td></tr>"
+               + "<tr><th>AI 검색</th>" + _sel("search_backend", cfg.ai_search_backend)
                + "<td class='dim'>흐릿한 기억으로 찾기</td></tr>"
-               + "<tr><th>분석 백엔드</th>" + _sel("ask_backend", cfg.ai_ask_backend)
-               + "<td class='dim'>질문 조사·답변 (한 질문 최대 12콜)</td></tr>"
-               + "<tr><th>현안 브리핑 백엔드</th>"
+               + "<tr><th>분석</th>" + _sel("ask_backend", cfg.ai_ask_backend)
+               + "<td class='dim'>질문에 근거를 달아 답합니다 · 보통 수 분</td></tr>"
+               + "<tr><th>현안 브리핑</th>"
                + _sel("diagnose_backend", cfg.ai_diagnose_backend)
-               + "<td class='dim'>스레드·인물 현안 브리핑 (누를 때 1콜 — 실측에서 "
-                 "opus 가 sonnet 보다 싸고 빨랐다)</td></tr>"
-               + "<tr><th>주간 백엔드</th>"
+               + "<td class='dim'>스레드·인물에서 [현안 브리핑]을 누를 때 · "
+                 "보통 1분 안</td></tr>"
+               + "<tr><th>주간 보고</th>"
                + _sel("weekly_backend", cfg.backend_for("weekly"))
-               + f"<td class='dim'>주간 보고 ({weekly.MAX_AI_CALLS}콜 · "
-                 f"{_weekly_eta(1)} · 미설정 시 요약 백엔드)</td></tr>"
+               + f"<td class='dim'>{_weekly_eta(1)}</td></tr>"
                + "</table><button class='btn-primary'>판정 기준 저장</button></form>")
     out.append(_ai_status_html(cfg))
 
@@ -7746,7 +7775,7 @@ def _ask_basis_footer(store, cfg) -> str:
         when = "동기화 기록 없음"
     return ("<div class='askbasis'>"
             f"<div>메일 {info['messages']:,}통 · {when}</div>"
-            "<div>새 분석 · <a href='/settings' title='분석 백엔드 설정'>"
+            "<div>새 분석 · <a href='/settings' title='분석을 어떤 AI 가 할지 고릅니다'>"
             f"{esc(cfg.ai_ask_backend)}</a></div></div>")
 
 

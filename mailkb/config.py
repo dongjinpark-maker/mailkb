@@ -204,13 +204,18 @@ _SUBJECT_NOISE_STRONG = ["invitation", "notification", "자동회신", "자동 �
                          "[nflow]", "[nwork]", "승계통보", "설문요청", "설문 요청"]
 _SUBJECT_NOISE_WEAK = ["weekly report", "주간보고", "주간 보고", "[회의록]"]
 
-# 내장 백엔드 기본값 — config.toml 에 [ai.backends.<name>] 이 없어도 이 이름들은
-# 동작한다. PC config 를 손대지 않아도 요약=sonnet / 분류=haiku 라우팅이 되도록
-# (config 에 명시하면 그 값이 우선). internal 은 사내 opencode 기본 호출.
 # 역할 이름표 — 사람이 읽는 쪽. 'diagnose' 만 찍으면 무엇이 안 되는지 모른다.
-ROLE_LABEL = {"summary": "요약·회고", "search": "AI 검색", "ask": "분석",
-              "weekly": "주간", "diagnose": "현안 브리핑"}
+# **설정 화면의 행 이름과 같은 말을 쓴다**(2026-08-26) — 한 화면이 한 가지를 두
+# 이름으로 부르면 안 된다. doctor 와 CLI `diagnose` 도 이 값으로 역할을 적는다.
+ROLE_LABEL = {"summary": "일일 회고·요약", "search": "AI 검색", "ask": "분석",
+              "weekly": "주간 보고", "diagnose": "현안 브리핑"}
 
+# 내장 백엔드 기본값 — config.toml 에 [ai.backends.<name>] 이 없어도 이 이름들은
+# 동작한다. PC config 를 손대지 않아도 요약=sonnet / 현안 브리핑=opus 라우팅이
+# 되도록(config 에 명시하면 그 값이 우선). internal 은 사내 opencode 기본 호출.
+# **haiku 는 지금 어느 역할도 안 쓴다** — 개입 AI 분류가 2026-07-30 에 정규식
+# 결정론으로 바뀌면서 소비처가 사라졌다. 그래도 목록에는 남긴다: 모델을 고르려는
+# 사람은 안 쓰는 것도 부를 수 있는지 알아야 한다(ARCHITECTURE §7.12).
 _BUILTIN_BACKENDS = {
     "internal": ["opencode", "run"],
     "sonnet": ["claude", "-p", "--model", "sonnet"],

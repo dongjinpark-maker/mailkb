@@ -7362,7 +7362,7 @@ class TestPeopleDossierAI(unittest.TestCase):
         # 따라왔다(2026-08-19 2차 점검: '진단 백엔드', '다른 인물 진단').
         for gone in ("진단 백엔드", "다른 인물 진단"):
             self.assertNotIn(gone, src, f"옛 이름이 남았다: {gone}")
-        self.assertIn("현안 브리핑 백엔드", src)
+        self.assertIn("<th>현안 브리핑</th>", src)
         # 버튼 이름을 부르는 곳은 web 만이 아니다 — CLI `--help`·실패 메시지와
         # 엔진 docstring 이 없는 버튼을 가리키고 있었다(2026-08-19). 웹만 훑으면
         # 여기가 남는다.
@@ -10518,7 +10518,7 @@ class TestWeb(unittest.TestCase):
         # [ai] weekly 는 run_ai_layer 가 이미 읽는 키 — 설정 화면에도 노출돼야
         # opus 같은 무거운 백엔드를 주간에만 지정할 수 있다(미설정=요약 상속).
         page = self.web.render_settings(self.store, self.cfg)
-        self.assertIn("주간 백엔드", page)
+        self.assertIn("<th>주간 보고</th>", page)
         self.assertIn("name='weekly_backend'", page)
         self.web._save_settings(self.cfg.home, {"weekly_backend": ["opus"]})
         import mailkb.config as cfgmod2
@@ -10556,11 +10556,11 @@ class TestWeb(unittest.TestCase):
         cfg = self._ai_cfg()
         with mock.patch("shutil.which", self._which_claude_only):
             page = self.web._ai_status_html(cfg)
-        self.assertIn("<h2>AI 백엔드 상태</h2>", page)
+        self.assertIn("<h2>이 PC 에서 쓸 수 있는 AI</h2>", page)
         for name in ("sonnet", "haiku", "opus", "internal"):
             self.assertIn(f"'ainame'>{name}<", page)
         self.assertIn("현안 브리핑", page)      # 역할이 붙는다(opus)
-        self.assertIn("미사용", page)           # haiku 를 지금 쓰는 역할은 없다
+        self.assertIn("쓰는 기능 없음", page)   # haiku 를 지금 쓰는 역할은 없다
 
     def test_ai_status_carries_no_install_time_checks(self):
         # doctor 전체를 옮기면 "이미 웹이 떴는데" 자명한 줄이 화면을 채운다.
@@ -10636,8 +10636,8 @@ class TestWeb(unittest.TestCase):
         self.assertIn("▲ 무응답", row)
         self.assertNotIn("실패", row)
         self.assertIn("30초 안에 응답 없음", row)
-        self.assertIn("느린 백엔드", page)          # 처방이 느림을 짚는다
-        self.assertNotIn("이 모델을 부를 수 있는지", page)   # 고장 처방은 안 붙는다
+        self.assertIn("원래 느린 AI", page)         # 처방이 느림을 짚는다
+        self.assertNotIn("로그인이 풀렸거나", page)  # 고장 처방은 안 붙는다
 
     def test_timeout_is_its_own_error_type(self):
         # AIError 하위라 기존 재시도·삼킴 경로는 그대로 — 갈라 둔 것은 사람이
@@ -12426,7 +12426,8 @@ class TestBackendRoles(unittest.TestCase):
                                         env=_LINUX_ENV)
                   if c.section == "AI"]
         labels = " ".join(c.name for c in checks)
-        for role_ko in ("요약·회고", "AI 검색", "분석", "주간", "현안 브리핑"):
+        for role_ko in ("일일 회고·요약", "AI 검색", "분석", "주간 보고",
+                        "현안 브리핑"):
             self.assertIn(role_ko, labels, f"{role_ko} 역할이 점검에서 빠졌다")
         self.assertIn("opus", labels)                 # 현안 브리핑 백엔드
         blob = " ".join(f"{c.name} {c.detail} {c.remedy}" for c in checks)
@@ -14230,7 +14231,7 @@ class TestAISearchWeb(unittest.TestCase):
 
     def test_settings_has_ai_search_backend(self):
         html = web.render_settings(self.store, self.cfg)
-        self.assertIn("AI 검색 백엔드", html)
+        self.assertIn("<th>AI 검색</th>", html)
         self.assertIn("search_backend", html)
 
     def test_save_settings_persists_search_backend(self):
