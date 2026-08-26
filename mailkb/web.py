@@ -5168,26 +5168,31 @@ _AI_FIX = {
             "없는 것과는 다른 증상입니다.",
 }
 
-# 드롭다운에 보이는 글자 — 값(백엔드 이름)과 분리한다. 이름 넷만 보고는 고를 수
-# 없어서 성격을 한 마디씩 붙인다. 내장 아닌 이름은 누가 설정했는지 알 수 없으므로
-# '직접 지정'과 **실제로 부르는 실행 파일**만 말한다.
+# 이름 넷만 보고는 고를 수 없어서 성격을 적는다 — 다만 **선택지 안이 아니라
+# 표 위 범례에** 적는다. `<select>` 는 가장 긴 선택지에 맞춰 폭이 정해지므로
+# 설명을 넣으면 2열이 8칸 → 45칸으로 부풀고, 같은 표를 쓰는 숫자 입력 여섯 줄까지
+# 그 폭에 끌려가 설명 열을 밀어낸다(2026-08-26 실측). 범례는 colspan 한 줄이라
+# 열 폭을 건드리지 않는다.
 _BACKEND_NOTE = {
-    "sonnet": "Claude · 기본 · 속도와 품질의 균형",
-    "opus": "Claude · 가장 똑똑함 · 느리고 비쌈",
-    "haiku": "Claude · 가장 빠르고 쌈 · 가벼운 일에",
+    "sonnet": "기본",
+    "opus": "가장 똑똑함(느리고 비쌈)",
+    "haiku": "가장 빠르고 쌈",
 }
 _BACKEND_ORDER = ("sonnet", "opus", "haiku", "internal")   # 기본에서 시작
 
 
-def _backend_label(cfg, name: str) -> str:
-    note = _BACKEND_NOTE.get(name)
-    if note:
-        return f"{name} — {note}"
-    try:
-        binary = cfg.ai_cmd(name)[0]
-    except SystemExit:                       # 선언도 내장도 없는 이름
-        return name
-    return f"{name} — 직접 지정 ({binary})"
+def _backend_legend(cfg, names) -> str:
+    """선택지 성격 한 줄 — 내장 아닌 이름은 실제로 부르는 실행 파일로 말한다."""
+    parts = []
+    for n in names:
+        note = _BACKEND_NOTE.get(n)
+        if not note:
+            try:
+                note = f"직접 지정({cfg.ai_cmd(n)[0]})"
+            except SystemExit:               # 선언도 내장도 없는 이름
+                continue
+        parts.append(f"<b>{esc(n)}</b> {esc(note)}")
+    return " · ".join(parts)
 
 
 def _ai_roles_by_backend(cfg) -> dict[str, list[str]]:
@@ -5367,7 +5372,7 @@ def render_settings(store, cfg) -> str:
         # 그대로 백엔드 이름으로 저장돼 설정이 깨진다.
         opts = "".join(
             f"<option value='{esc(b)}'{' selected' if b == cur else ''}>"
-            f"{esc(_backend_label(cfg, b))}</option>"
+            f"{esc(b)}</option>"
             for b in backends)
         return (f"<td><select name='{name}'>{opts}</select></td>")
     num_rows = (
@@ -5392,7 +5397,7 @@ def render_settings(store, cfg) -> str:
                "<table class='settbl'>" + num_rows
                + "<tr><td colspan='3' class='dim'><b>어떤 AI 가 할까</b> — "
                  "기능마다 다른 모델을 쓸 수 있습니다. 잘 모르겠으면 그대로 "
-                 "두세요.</td></tr>"
+                 "두세요.<br>" + _backend_legend(cfg, backends) + "</td></tr>"
                + "<tr><th>일일 회고·요약</th>"
                + _sel("summary_backend", cfg.ai_summary_backend)
                + f"<td class='dim'>하루 회고 · 스레드 요약 · 인물 카드 · "

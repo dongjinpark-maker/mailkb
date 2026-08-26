@@ -10525,6 +10525,27 @@ class TestWeb(unittest.TestCase):
         self.assertEqual(
             cfgmod2.read_overrides(self.cfg.home)["ai"]["weekly"], "opus")
 
+    def test_backend_options_stay_short_and_carry_their_value(self):
+        # `<select>` 는 **가장 긴 선택지에 맞춰 폭이 정해진다.** 선택지마다 성격을
+        # 붙였더니(`sonnet — Claude · 기본 …`) 2열이 8칸 → 45칸으로 부풀고, 같은
+        # 표를 쓰는 숫자 입력 여섯 줄까지 그 폭에 끌려가 설명 열을 밀어냈다
+        # (2026-08-26 실측: 표 전체 98칸 → 135칸). 성격은 표 위 범례가 말한다.
+        page = self.web.render_settings(self.store, self.cfg)
+        sel = re.search(r"<select name='summary_backend'>(.*?)</select>",
+                        page, re.S).group(1)
+        opts = re.findall(r"<option value='([^']+)'[^>]*>([^<]*)</option>", sel)
+        self.assertTrue(opts, "선택지에 value 속성이 없다")
+        for value, text in opts:
+            self.assertEqual(text, value,
+                             "선택지 글자가 값보다 길어지면 2열이 부푼다 — "
+                             "성격은 범례에 적는다")
+        # 값과 표시가 붙어 있으면 설명을 붙이는 순간 그 전체가 백엔드 이름으로
+        # 저장돼 설정이 조용히 깨진다. 분리는 유지한다.
+        self.assertIn("<option value='sonnet'", page)
+        # 고를 근거는 사라지지 않았다 — 범례가 넷을 나란히 놓는다
+        for note in ("기본", "가장 똑똑함", "가장 빠르고 쌈", "직접 지정"):
+            self.assertIn(note, page, f"범례에서 {note} 가 빠졌다")
+
     def test_settings_image_retain_knob(self):
         page = self.web.render_settings(self.store, self.cfg)
         self.assertIn("이미지 보존(일)", page)
