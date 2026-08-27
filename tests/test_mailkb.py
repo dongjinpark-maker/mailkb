@@ -5222,6 +5222,29 @@ class TestKnowledge(unittest.TestCase):
                       "버퍼 삽입은 면적 초과로 기각했습니다."),
         ])
         self.tid = _nth(self.store, 1)["thread_id"]
+        self._reset_kn()
+        self.addCleanup(self._reset_kn)
+
+    @staticmethod
+    def _reset_kn():
+        """지식 저장 잡 전역 초기화 — queue/done 은 **새 리스트**로 준다.
+        dict(_kn_job) 복사본은 같은 리스트를 가리켜 append 가 되돌려지지 않는다."""
+        with web._kn_lock:
+            web._kn_job.update(running=False, cid=0, day="", msg="",
+                               queue=[], done=[])
+
+    def _three_candidates(self):
+        """서로 다른 인용 세 개 — 제목이 겹치면 store 가 중복으로 걸러 낸다."""
+        lines = "".join(
+            f'- 제목: 지식 {i} | 내용: 본문 {i}. | #{self.tid} | 인용: "{q}"\n'
+            for i, q in enumerate(
+                ("useful skew 재배분으로 hold 3건 다 잡았습니다",
+                 "버퍼 삽입은 면적 초과로 기각했습니다",
+                 "상세는 https://wiki.nurisoft.co.kr/npx200/52 참고"), 1))
+        self._harvest_with(self._raw(lines))
+        rows = self.store.knowledge_candidates()
+        self.assertEqual(len(rows), 3, "후보 3건이 만들어져야 한다")
+        return [r["id"] for r in rows]
 
     def tearDown(self):
         self.store.close()
@@ -5436,25 +5459,164 @@ class TestKnowledge(unittest.TestCase):
         self.assertIn("지식으로 저장:", html2)
         self.assertNotIn("data-kn-running", html2)      # 폴링 종료 신호
 
-    def test_save_job_running_card_and_busy_slot(self):
-        self._harvest_with(self._raw(self._KN_LINE % {"t": self.tid}))
-        cid = self.store.knowledge_candidates()[0]["id"]
+    def test_save_job_running_card_and_queues_the_next(self):
+        # 종전엔 진행 중이면 두 번째 클릭을 거절했다("다른 지식 저장이 진행 중").
+        # 후보는 한 화면에 여럿이 뜨는데 하나 누르고 수십 초 기다렸다 다시 누르는
+        # 것이 원래 불편이었다 — 이제 줄을 세운다(2026-08-27).
+        a, b, _ = self._three_candidates()
         with web._kn_lock:
-            old_job = dict(web._kn_job)
-            web._kn_job.update(running=True, cid=cid, day="2026-07-20", msg="")
-        try:
-            html = web.render_daily(self.cfg, "2026-07-20", "2026-07-20",
-                                    self.store)
-            self.assertIn("data-kn-running", html)       # 폴링·meta refresh 마커
-            self.assertIn("보강해서 저장하는 중", html)
-            self.assertNotIn("지식으로 저장 (AI 보강)", html)  # 버튼 대신 대기 카드
-            # 단일 슬롯 — 진행 중엔 다른 저장을 받지 않는다(시작 안 됐음을 알림)
-            loc = web.perform_action(self.store, self.cfg,
-                                     f"/knowledge/{cid}/save", {})
-            self.assertIn("다른 지식 저장이 진행 중", urllib_unquote(loc))
-        finally:
-            with web._kn_lock:
-                web._kn_job.clear(); web._kn_job.update(old_job)
+            web._kn_job.update(running=True, cid=a, day="2026-07-20",
+                               msg="", queue=[], done=[])
+        html = web.render_daily(self.cfg, "2026-07-20", "2026-07-20", self.store)
+        self.assertIn("data-kn-running", html)       # 폴링·meta refresh 마커
+        self.assertIn("보강해서 저장하는 중", html)
+        # 처리 중인 것을 또 누르면 줄이 늘지 않는다
+        loc = web.perform_action(self.store, self.cfg,
+                                 f"/knowledge/{a}/save", {})
+        self.assertIn("이미 대기 중", urllib_unquote(loc))
+        with web._kn_lock:
+            self.assertEqual(web._kn_job["queue"], [])
+        # 다른 후보는 거절이 아니라 대기열로
+        loc = web.perform_action(self.store, self.cfg,
+                                 f"/knowledge/{b}/save", {})
+        self.assertIn("대기열에 넣었습니다", urllib_unquote(loc))
+        self.assertIn("앞에 1건", urllib_unquote(loc))
+        with web._kn_lock:
+            self.assertEqual(web._kn_job["queue"], [b])
+
+    def test_queued_card_offers_only_dismiss(self):
+        # 대기 카드에는 저장 버튼이 없다(이미 줄 서 있다). [유보]는 남긴다 —
+        # 그것이 곧 대기 취소다. 처리 중인 항목이 다른 날짜에 있을 수 있으므로
+        # 대기 카드도 마커를 달아야 폴링·meta refresh 가 멎지 않는다.
+        a, b, _ = self._three_candidates()
+        with web._kn_lock:
+            web._kn_job.update(running=True, cid=a, day="2026-07-20",
+                               msg="", queue=[b], done=[])
+        html = web.render_daily(self.cfg, "2026-07-20", "2026-07-20", self.store)
+        self.assertIn("대기 중 — 앞에 1건", html)
+        self.assertIn(f"/knowledge/{b}/dismiss", html)
+        self.assertNotIn(f"/knowledge/{b}/save", html)
+        self.assertEqual(html.count("data-kn-running"), 2)   # 처리 중 + 대기
+
+    def test_card_container_is_not_a_duplicate_id(self):
+        # 이 절은 두 패널에 **동시에** 뜰 수 있다(회고=우측 · 지식 탭=좌측).
+        # id 로 감싸면 한 문서에 같은 id 가 둘이라 HTML 위반이고, 나중에
+        # document.querySelector 를 쓰는 사람이 엉뚱한 쪽을 잡는다.
+        a, b, _ = self._three_candidates()
+        with web._kn_lock:
+            web._kn_job.update(running=True, cid=a, day="2026-07-20",
+                               msg="", queue=[b], done=[])
+        both = (web.render_daily(self.cfg, "2026-07-20", "2026-07-20", self.store)
+                + web.render_knowledge_page(self.store, self.cfg, {}))
+        self.assertEqual(both.count("id='kn-cards'"), 0)
+        self.assertEqual(both.count("data-kn-cards"), 2)   # 양쪽에 하나씩
+        self.assertIn("[data-kn-cards]", web._APP_JS)      # 폴링도 같은 선택자
+
+    def test_worker_drains_the_whole_queue(self):
+        a, b, c = self._three_candidates()
+        self.assertEqual(web._kn_claim(a, "2026-07-20"), ("start", 0))
+        self.assertEqual(web._kn_claim(b, "2026-07-20"), ("queued", 1))
+        self.assertEqual(web._kn_claim(c, "2026-07-20"), ("queued", 2))
+        self.assertEqual(web._kn_claim(b, "2026-07-20"), ("dup", 0))   # 중복 무시
+        with mock.patch.object(review, "ai_run",
+                               side_effect=review.AIError("x")):
+            web._run_kn_job(self.cfg, a)
+        for cid in (a, b, c):
+            self.assertEqual(self.store.knowledge_candidate(cid)["status"],
+                             "saved", f"#{cid} 가 처리되지 않았다")
+        with web._kn_lock:
+            self.assertFalse(web._kn_job["running"])
+            self.assertEqual(web._kn_job["queue"], [])
+            self.assertEqual(len(web._kn_job["done"]), 3)
+        self.assertEqual(
+            len(list((self.cfg.vault / "knowledge").glob("*.md"))), 3)
+
+    def test_dismiss_while_queued_skips_that_one(self):
+        # [유보]가 대기 취소다 — 워커가 차례에 도달하면 save_candidate 가
+        # "처리됨"으로 올리고, 그 한 건만 건너뛴 채 나머지는 계속 간다.
+        a, b, c = self._three_candidates()
+        web._kn_claim(a, "2026-07-20")
+        web._kn_claim(b, "2026-07-20")
+        web._kn_claim(c, "2026-07-20")
+        self.store.set_knowledge_status(b, "dismissed")
+        with mock.patch.object(review, "ai_run",
+                               side_effect=review.AIError("x")):
+            web._run_kn_job(self.cfg, a)
+        self.assertEqual(self.store.knowledge_candidate(b)["status"], "dismissed")
+        for cid in (a, c):
+            self.assertEqual(self.store.knowledge_candidate(cid)["status"], "saved")
+        with web._kn_lock:
+            self.assertFalse(web._kn_job["running"])
+
+    def test_render_snapshot_does_not_share_the_queue(self):
+        # dict(_kn_job) 은 얕은 복사라 queue 가 워커와 **같은 리스트**였다.
+        # 렌더가 `in` 을 통과한 직후 워커가 pop 하면 `.index()` 가 ValueError 를
+        # 던져 화면이 500 이 된다. 락 안에서 리스트를 떠 와야 한다.
+        a, b, c = self._three_candidates()
+        with web._kn_lock:
+            web._kn_job.update(running=True, cid=a, day="2026-07-20",
+                               msg="", queue=[b, c], done=[])
+        class Racy(list):
+            """`in` 통과와 `.index()` 사이에 워커가 끼어든 순간을 재현한다.
+            렌더가 **이 객체 위에서** index 를 부르면 ValueError 가 난다;
+            락 안에서 떠 온 복사본 위에서 부르면 아무 일도 없다."""
+            def index(self, x, *a):
+                self.remove(x)             # 워커가 그 사이에 꺼내 갔다
+                return list.index(self, x, *a)
+
+        with web._kn_lock:
+            web._kn_job["queue"] = Racy([b, c])
+        html = web.render_daily(self.cfg, "2026-07-20", "2026-07-20",
+                                self.store)
+        self.assertIn("대기 중 — 앞에", html)
+        with web._kn_lock:      # 렌더는 원본을 건드리지 않는다
+            self.assertEqual(list(web._kn_job["queue"]), [b, c])
+
+    def test_broken_drain_frees_the_queue_not_just_the_slot(self):
+        # 워커가 예외로 빠져나올 때 슬롯만 풀고 큐를 두면, 마커 없는 '대기 중'
+        # 카드가 남는다(마커는 running 일 때만 붙는다) — 폴링도 안 돌고 저장
+        # 버튼도 없어 그 후보를 영영 못 만진다.
+        a, b, c = self._three_candidates()
+        web._kn_claim(a, "2026-07-20")
+        web._kn_claim(b, "2026-07-20")
+        web._kn_claim(c, "2026-07-20")
+        with mock.patch.object(web, "Store", side_effect=OSError("DB 못 엶")):
+            with self.assertRaises(OSError):
+                web._run_kn_job(self.cfg, a)
+        with web._kn_lock:
+            self.assertFalse(web._kn_job["running"])   # 슬롯이 풀린다
+            self.assertEqual(web._kn_job["queue"], [])  # 큐도 비운다
+            self.assertTrue(any("중단됐습니다" in m
+                                for m in web._kn_job["done"]),
+                            "조용히 사라지면 안 된다")
+        # 후보 셋 다 다시 저장할 수 있다
+        html = web.render_daily(self.cfg, "2026-07-20", "2026-07-20", self.store)
+        self.assertEqual(html.count("지식으로 저장 (AI 보강)"), 3)
+        self.assertNotIn("data-kn-running", html)
+
+    def test_one_failure_does_not_stop_the_drain(self):
+        # 한 건이 터졌다고 뒤에 줄 선 것까지 버리면 안 된다.
+        a, b, c = self._three_candidates()
+        web._kn_claim(a, "2026-07-20")
+        web._kn_claim(b, "2026-07-20")
+        web._kn_claim(c, "2026-07-20")
+        real = knowledge.save_candidate
+
+        def flaky(cfg, store, cid):
+            if cid == b:
+                raise RuntimeError("디스크 꽉 참")
+            return real(cfg, store, cid)
+
+        with mock.patch.object(review, "ai_run",
+                               side_effect=review.AIError("x")), \
+             mock.patch.object(knowledge, "save_candidate", flaky):
+            web._run_kn_job(self.cfg, a)
+        for cid in (a, c):
+            self.assertEqual(self.store.knowledge_candidate(cid)["status"], "saved")
+        with web._kn_lock:
+            self.assertFalse(web._kn_job["running"])     # 슬롯은 반드시 풀린다
+            self.assertEqual(len(web._kn_job["done"]), 3)
+            self.assertTrue(any("디스크 꽉 참" in m for m in web._kn_job["done"]))
 
     def test_kn_marker_registered_for_js_off_fallback(self):
         # JS-off 환경은 meta refresh 가 유일한 갱신 경로 — 마커 누락이면 그

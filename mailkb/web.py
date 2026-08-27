@@ -150,11 +150,19 @@ _ask_lock = threading.Lock()
 _dossier_job = _new_job(addr="", name="", done_at=0.0)
 _dossier_lock = threading.Lock()
 
-# 지식 저장 백그라운드 잡(단일) — 보강 AI 1콜(수십 초). 요청 스레드에서 돌리면
+# 지식 저장 백그라운드 잡 — 보강 AI 1콜(수십 초). 요청 스레드에서 돌리면
 # 단일 스레드 서버가 통째로 멈춘다(실측: 20초 보강 동안 홈 GET 이 19초 대기,
 # 2026-08-14 사용자 보고). 실시간 진행이 필요 없는 작업이라 스트림 없이 완료
 # 메시지만 남기고, 회고 화면 폴링이 카드를 갈아 끼운다.
-_kn_job = _new_job(cid=0, day="", msg="")
+#
+# **여기만 대기열이 있다**(2026-08-27). 후보는 회고 화면에 여러 개가 한꺼번에 뜨고
+# 지식 탭은 날짜를 가리지 않고 전체 pending 을 보여 준다 — "여러 개를 처리해 둬라"가
+# 자연스러운 화면인데 단일 슬롯이 두 번째 클릭을 거절했다. 다른 잡(현안 브리핑·인물
+# 요약 등)은 "지금 이 화면을 보고 싶다"는 성격이라 줄을 세우지 않는다.
+#   queue — 대기 중인 후보 id, 넣은 순서
+#   done  — 이번 배수에서 끝난 결과 문구(화면이 끝난 것부터 쌓아 보여 준다)
+#   msg   — 가장 최근 결과 하나(종전 필드 유지)
+_kn_job = _new_job(cid=0, day="", msg="", queue=[], done=[])
 _kn_lock = threading.Lock()
 
 # 인물 진단 백그라운드 잡(단일, 2026-08-18) — 스레드 진단과 같은 모양을 사람
@@ -2988,11 +2996,19 @@ _APP_JS = r"""
     }, 3000);
   }
 
+  /* ---- 지식 저장 폴링. 대기열을 하나씩 비우므로 **진행 중에도 화면을 갱신한다**
+     — 3건을 넣고 몇 분간 아무것도 안 변하면 멈춘 것으로 읽힌다. 다만 inject() 는
+     scrollTop 을 0 으로 되돌리므로 3초마다 부르면 안 된다. [data-kn-cards]
+     안만 갈아 끼운다(patchJob 의 #{p}-extra 와 같은 방식). id 가 아닌 이유는
+     이 절이 두 패널에 동시에 뜰 수 있어서다(회고=우측 · 지식 탭=좌측). */
   function hookKnPolling(root) {
-    if (!root.querySelector("[data-kn-running]")) return;
+    var mk = root.querySelector("[data-kn-running]");
+    if (!mk) return;
+    var day = mk.getAttribute("data-kn-day") || "";
     setTimeout(function () {
       var u = new URL("/knowledge/status", location.origin);
       u.searchParams.set("frag", "1");
+      if (day) u.searchParams.set("date", day);  /* 보고 있는 날짜로 되돌려 받는다 */
       u.searchParams.set("_", Date.now());   /* 메모리 캐시 우회 */
       fetch(u.toString(), { headers: { "X-Requested-With": "fetch" } })
         .then(function (r) { return r.text(); })
@@ -3004,6 +3020,9 @@ _APP_JS = r"""
             inject("right", html, null);            /* 완료 → 결과 화면으로 교체 */
             return;
           }
+          var nc = tmp.querySelector("[data-kn-cards]"),
+              oc = right.querySelector("[data-kn-cards]");
+          if (nc && oc && nc.innerHTML !== oc.innerHTML) oc.innerHTML = nc.innerHTML;
           hookKnPolling(right);                     /* 다음 폴링 예약 */
         })
         .catch(function () { hookKnPolling(right); });
@@ -6648,30 +6667,88 @@ def render_daily(cfg, day: str, today: str | None = None, store=None) -> str:
     return "\n".join(out)
 
 
+def _kn_claim(cid: int, day: str) -> tuple[str, int]:
+    """슬롯을 잡거나 줄을 선다 — ("start"|"queued"|"dup", 앞에 몇 건).
+
+    한 락 안에서 판단해야 두 요청이 동시에 와도 한쪽만 "start" 를 받는다.
+    `_job_start` 를 쓰지 않는 이유는 그것이 **줄을 못 세우기** 때문이다(다른 잡
+    7종은 그 동작이 맞으므로 건드리지 않는다)."""
+    with _kn_lock:
+        if _kn_job["running"]:
+            if cid == _kn_job["cid"] or cid in _kn_job["queue"]:
+                return "dup", 0
+            _kn_job["queue"].append(cid)
+            return "queued", len(_kn_job["queue"])
+        _kn_job.update(_JOB_STREAM)     # 이전 배수의 수신 상태를 지운다
+        _kn_job.update(running=True, error="", cancel=threading.Event(),
+                       started=time.time(), cid=cid, day=day,
+                       msg="", queue=[], done=[])
+    return "start", 0
+
+
+def _kn_save_one(cfg, store, cid: int) -> str:
+    """후보 하나를 저장하고 사람이 읽을 결과 한 줄을 돌려준다.
+
+    보강 실패의 우아한 처리는 save_candidate 안에 있다(수확본으로 저장) —
+    여기 오는 예외는 비-AI 오류다. **어떤 예외도 밖으로 내보내지 않는다**:
+    한 건이 실패했다고 뒤에 줄 선 것까지 버리면 안 된다."""
+    from . import knowledge as knowledge_mod
+    try:
+        path = knowledge_mod.save_candidate(cfg, store, cid)
+        msg = f"지식으로 저장: {path.name}"
+        # 보강이 실패해도 저장은 된다 — 다만 조용히 두지 않는다. 본문이
+        # 수확본 그대로라는 사실은 사용자가 알아야 다시 눌러 볼 수 있다.
+        if not getattr(knowledge_mod.save_candidate, "last_enriched", True):
+            msg += " · AI 보강 실패(수확본 그대로 — 다시 저장하면 재시도)"
+        return msg
+    except ValueError as e:            # 후보 없음·이미 처리됨(대기 중 유보 포함)
+        return str(e)
+    except Exception as e:
+        return ("지식을 저장하지 못했습니다 — "
+                + (" ".join(str(e).split())[:120] or type(e).__name__))
+
+
 def _run_kn_job(cfg, cid: int) -> None:
     """지식 저장 워커 — 요청 스레드 밖. 자기 Store 연결을 연다(sqlite 스레드 규칙).
 
-    보강 실패의 우아한 처리는 save_candidate 안에 있다(수확본으로 저장) —
-    여기 오는 예외는 비-AI 오류다."""
-    from . import knowledge as knowledge_mod
-    try:
-        store = Store(cfg.db_path, cfg.my_addresses, cfg.my_names, noise=cfg)
-        try:
-            path = knowledge_mod.save_candidate(cfg, store, cid)
-            msg = f"지식으로 저장: {path.name}"
-            # 보강이 실패해도 저장은 된다 — 다만 조용히 두지 않는다. 본문이
-            # 수확본 그대로라는 사실은 사용자가 알아야 다시 눌러 볼 수 있다.
-            if not getattr(knowledge_mod.save_candidate, "last_enriched", True):
-                msg += " · AI 보강 실패(수확본 그대로 — 다시 저장하면 재시도)"
-        finally:
-            store.close()
-    except ValueError as e:            # 후보 없음·이미 처리됨
-        msg = str(e)
-    except Exception as e:
-        msg = ("지식을 저장하지 못했습니다 — "
-               + (" ".join(str(e).split())[:120] or type(e).__name__))
+    **대기열을 끝까지 비운다.** Store 는 배수 전체에 하나만 연다 — 항목마다 다시
+    열면 수십 건에서 연결 여닫기가 쌓인다."""
+    store = None
     with _kn_lock:
-        _kn_job.update(running=False, msg=msg)
+        mine = _kn_job["started"]      # 이 배수의 신분증 — finally 가 남의 배수를
+    try:                               # 끝내지 않게 한다(아래 참조)
+        store = Store(cfg.db_path, cfg.my_addresses, cfg.my_names, noise=cfg)
+        while True:
+            msg = _kn_save_one(cfg, store, cid)
+            with _kn_lock:
+                _kn_job["done"].append(msg)
+                _kn_job["msg"] = msg
+                if not _kn_job["queue"]:
+                    _kn_job.update(running=False)
+                    return
+                cid = _kn_job["queue"].pop(0)
+                _kn_job.update(cid=cid)
+            # 폴링 라우트가 day 로 화면을 다시 그린다 — DB 조회는 락 밖에서.
+            row = store.knowledge_candidate(cid)
+            if row is not None:
+                with _kn_lock:
+                    _kn_job.update(day=row["date"])
+    finally:
+        if store is not None:
+            store.close()
+        # 정상 종료는 위 루프가 이미 running=False 로 내려놨다. 여기 걸리는 것은
+        # 예외로 빠져나온 경우뿐 — 슬롯을 풀고 **대기열도 비운다**. 안 비우면
+        # 마커 없는 '대기 중' 카드가 남아(마커는 running 일 때만 붙는다) 폴링도
+        # 안 돌고 저장 버튼도 없어 그 후보를 영영 못 만진다.
+        # started 대조는 그 사이에 시작된 **다음 배수**를 끝내 버리지 않기 위한 것.
+        with _kn_lock:
+            if _kn_job["running"] and _kn_job["started"] == mine:
+                left = len(_kn_job["queue"])
+                _kn_job.update(running=False, queue=[])
+                if left:
+                    _kn_job["done"].append(
+                        f"저장이 중단됐습니다 — 대기 중이던 {left}건은 "
+                        "다시 눌러 주세요")
 
 
 def _run_diag_job(cfg, tid: int) -> None:
@@ -6870,27 +6947,54 @@ def _knowledge_cards(store, day: str, back: str | None = None) -> str:
     rows = store.knowledge_candidates(status="pending", date_iso=day)
     with _kn_lock:
         kj = dict(_kn_job)
-    kj_here = (kj["running"] or kj["msg"]) and (not day or kj["day"] == day)
+        # dict() 는 얕은 복사라 queue/done 이 **워커와 같은 리스트**다. 그대로
+        # 쓰면 `in` 을 통과한 직후 워커가 pop 해 `.index()` 가 ValueError 를
+        # 던진다(렌더 500). 락 안에서 떠 온다.
+        kj["queue"] = list(_kn_job["queue"])
+        kj["done"] = list(_kn_job["done"])
+    kj_here = (kj["running"] or kj["done"]) and (not day or kj["day"] == day)
     if not rows and not kj_here:
         return ""
     back = back or f"/records?tab=daily&date={_q(day)}"
-    out = [f"<h2>🔧 암묵지 후보 ({len(rows)})</h2>" if rows
+    # 마커는 이 화면이 폴링·meta refresh 를 걸지 정한다. day 를 함께 실어 폴링이
+    # **보고 있는 날짜**를 되돌려 받게 한다 — 배수가 다른 날짜로 넘어가도 화면이
+    # 남의 날로 갈아 끼워지지 않는다.
+    mark = (f" data-kn-running='1' data-kn-day='{esc(day)}'"
+            if kj["running"] else "")
+    out = ["<div data-kn-cards>",
+           f"<h2>🔧 암묵지 후보 ({len(rows)})</h2>" if rows
            else "<h2>🔧 암묵지 후보</h2>"]
     if rows:
         out.append("<p class='dim'>수확이 캐낸 조직 노하우 — 저장하면 "
                    "vault/knowledge/ 에 md 로 남고 검색·분석 문맥에 실립니다.</p>")
-    if kj_here and not kj["running"] and kj["msg"]:
-        # 직전 저장의 결과 한 줄 — 폴링이 대기 카드를 이걸로 갈아 끼운다
-        out.append(f"<p class='dim'>✅ {esc(kj['msg'])}</p>")
+    if kj_here and kj["done"]:
+        # 끝난 것부터 쌓아 보여 준다 — 배수 도중에도 진척이 보여야 한다
+        for m in kj["done"]:
+            out.append(f"<p class='dim'>✅ {esc(m)}</p>")
     for r in rows:
         if kj["running"] and kj["cid"] == r["id"]:
             # 저장 중 — 버튼 대신 대기 카드(마커가 폴링·meta refresh 를 건다)
             out.append(
-                "<div class='item waitcard' data-kn-running='1'>"
+                f"<div class='item waitcard'{mark}>"
                 f"⏳ <b>{esc(r['title'])}</b>"
                 "<div class='snip'>보강해서 저장하는 중 — 참조 스레드 전문을 "
                 "읽는 AI 1콜이라 수십 초 걸릴 수 있습니다. 다른 화면을 봐도 "
                 "됩니다(완료되면 여기 반영).</div></div>")
+            continue
+        if kj["running"] and r["id"] in kj["queue"]:
+            # 줄 서 있음 — 저장 버튼은 빼고 [유보]만 남긴다. 유보가 곧 대기
+            # 취소다(status 가 dismissed 가 되면 워커가 차례에 건너뛴다).
+            # 처리 중인 항목이 다른 날짜면 이 화면엔 마커가 없으므로 여기도 단다.
+            ahead = kj["queue"].index(r["id"]) + 1
+            out.append(
+                f"<div class='item waitcard'{mark}>"
+                f"⏳ <b>{esc(r['title'])}</b>"
+                f"<div class='snip'>대기 중 — 앞에 {ahead}건. 순서가 오면 "
+                "저장합니다.</div>"
+                "<div class='actions'>"
+                f"<form method='post' action='/knowledge/{r['id']}/dismiss'>"
+                f"<input type='hidden' name='back' value='{esc(back)}'>"
+                "<button>유보</button></form></div></div>")
             continue
         tids = [t for t in (r["threads"] or "").split(";") if t]
         refs = " ".join(f"<a href='/thread/{t}'>#{t}</a>" for t in tids)
@@ -6909,6 +7013,7 @@ def _knowledge_cards(store, day: str, back: str | None = None) -> str:
             f"<form method='post' action='/knowledge/{r['id']}/dismiss'>"
             f"<input type='hidden' name='back' value='{esc(back)}'>"
             "<button>유보</button></form></div></div>")
+    out.append("</div>")
     return "\n".join(out)
 
 
@@ -8448,9 +8553,14 @@ def perform_action(store, cfg, path: str, form: dict) -> str:
             row = store.knowledge_candidate(kid)
             if row is None or row["status"] != "pending":
                 return back + sep + "msg=" + _q(f"암묵지 후보 없음 또는 처리됨: #{kid}")
-            if _job_start(_kn_job, _kn_lock, cid=kid, day=row["date"],
-                          msg="") is None:
-                return back + sep + "msg=" + _q("다른 지식 저장이 진행 중입니다")
+            # 진행 중이면 거절하지 않고 줄을 세운다 — 후보는 한 화면에 여럿이
+            # 뜨고, 하나 누르고 수십 초 기다렸다 다시 누르는 것이 원래 불편이다.
+            how, ahead = _kn_claim(kid, row["date"])
+            if how == "dup":
+                return back + sep + "msg=" + _q("이미 대기 중입니다")
+            if how == "queued":
+                return back + sep + "msg=" + _q(
+                    f"대기열에 넣었습니다 — 앞에 {ahead}건")
             threading.Thread(target=_run_kn_job, args=(cfg, kid),
                              daemon=True).start()
             return back + sep + "msg=" + _q("보강해서 저장하는 중 — 완료되면 카드에 반영됩니다")
