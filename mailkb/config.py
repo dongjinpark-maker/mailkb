@@ -99,6 +99,9 @@ diagnose = "opus"
 
 [ai.backends.internal]
 # opencode headless — 프롬프트는 stdin 으로 전달됨
+# **Windows 는 이 값으로 안 된다** — opencode 가 WSL 안에만 있어 wsl.exe 를 거쳐야
+# 하고, 그 호출 형태에 함정이 넷 있다(로그인 셸·"$@"·--dir·--agent).
+# docs/OPENCODE-WINDOWS.md §1 의 값을 그대로 쓴다.
 cmd = ["opencode", "run"]
 # 추론 강도 플래그 opt-in — 이 CLI 가 지원함을 **직접 확인한 뒤** 플래그 이름을
 # 선언하면, 분석·주간 보고의 어려운 콜에 "<플래그> high" 가 붙는다. 미선언(기본)

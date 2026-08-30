@@ -691,6 +691,27 @@ def _is_opencode_cmd(cmd: list[str]) -> bool:
     return any(_OPENCODE_RX.search(str(part)) for part in cmd)
 
 
+def backend_program(cmd: list[str]) -> str:
+    """이 명령이 실제로 부르는 AI 프로그램 이름 — 표시·판정용.
+
+    래퍼 뒤에 숨은 것을 알아본다. `wsl.exe -e bash -lc 'exec opencode …'` 는
+    실행 파일이 `wsl.exe` 라, 화면이 cmd[0] 만 보면 **wsl 이 깔렸다는 사실을
+    opencode 가 있다는 뜻으로 말한다**(2026-08-30).
+
+    판별 순서는 `ai_run` 의 stream_kind 와 같다 — claude 가 먼저다. 두 곳이
+    갈리면 화면과 엔진이 다른 백엔드를 가리킨다.
+
+    알아보지 못한 명령은 실행 파일 이름을 그대로 돌려준다. 그때는
+    `which(cmd[0])` 가 진짜 답이라 판정을 낮출 이유가 없다."""
+    if not cmd:
+        return ""
+    if _is_claude_cmd(cmd):
+        return "claude"
+    if _is_opencode_cmd(cmd):
+        return "opencode"
+    return Path(str(cmd[0])).name
+
+
 # 응답 시험 1콜의 상한 — '안 된다'와 '늦는다'를 가르는 선이다(웹 설정 화면과
 # CLI `diagnose` 가 같은 값을 쓴다. 두 곳에 적으면 반드시 갈라진다).
 AITEST_TIMEOUT = 30
@@ -2829,10 +2850,12 @@ def _ai_search_run(cfg: Config, prompt: str, backend: str, timeout: int,
     비용·토큰을 받아 meter(usd/in/out/calls)에 누적하고 result 텍스트만 돌려준다.
     비-claude 백엔드나 JSON 파싱 실패는 일반 ai_run(평문)으로 자연 폴백.
 
-    on_event(스트리밍)은 일부러 받지 않는다 — 여기만 --output-format json 을
-    쓰고 그 봉투에서 비용을 읽는데, stream-json 으로 바꾸면 계측 경로가 함께
-    바뀐다. CLI 인자 구성 변경은 2026-07-28 실기기 사고(개행으로 뒤 인자 유실)를
-    낸 계열이라 한 번에 하나씩만 건드린다. cancel 은 콜 경계에서 동작한다."""
+    **호출부에서 on_event 를 받지 않는다** — 여기 화면(AI 검색)엔 대기 카드가
+    없어 진행을 실을 곳이 없다. claude 경로는 여전히 --output-format json 봉투
+    하나를 읽는다(stream-json 으로 바꾸면 계측 경로가 함께 바뀐다. CLI 인자 구성
+    변경은 2026-07-28 실기기 사고(개행으로 뒤 인자 유실)를 낸 계열이라 한 번에
+    하나씩만 건드린다). opencode 는 봉투가 없어 NDJSON 을 타야 하므로 **안에서만**
+    on_event 를 써 usage 만 줍는다(2026-08-30). cancel 은 콜 경계에서 동작한다."""
     cmd = cfg.ai_cmd(backend)
     if _is_claude_cmd(cmd):
         raw = ai_run(cmd + ["--output-format", "json"], prompt,
@@ -2849,6 +2872,31 @@ def _ai_search_run(cfg: Config, prompt: str, backend: str, timeout: int,
                 meter["calls"] += 1
             return str(data.get("result") or "")
         return raw                              # JSON 아니면 평문으로 취급
+    if _is_opencode_cmd(cmd):
+        # opencode 는 --format json 이 NDJSON 이라 봉투 하나로 못 읽는다. 그래서
+        # 스트림 경로를 그대로 타되 **진행 이벤트는 버리고 usage 만 줍는다** —
+        # 여기 화면(AI 검색)은 대기 카드가 없어 진행을 실을 곳이 없고, 필요한
+        # 것은 다른 화면과 **같은 자로 잰 토큰**뿐이다(합산식은 _usage_of_oc).
+        # ai_run 을 그대로 통과시키는 이유: 재시도·콜 계수·오류 판정이 claude
+        # 경로와 한 곳에서 갈리게 두기 위해서다(여기서 직접 부르면 retries=1 이
+        # 조용히 사라진다).
+        # step_finish 가 안 오고 끝나는 버전 결함이 알려져 있다 — 그때는 got 이
+        # 비어 계측만 건너뛴다(답은 그대로다). 없는 값을 0 으로 적으면 '안 썼다'로
+        # 읽히므로 **더하지 않는 쪽**을 고른다.
+        got: dict = {}
+
+        def _grab(info: dict) -> None:
+            if info.get("ev") == "usage":
+                got.update(info)
+
+        text = ai_run(cmd, prompt, timeout=timeout, retries=1,
+                      on_event=_grab, cancel=cancel)
+        if meter is not None and got:
+            meter["usd"] += got.get("usd", 0.0)
+            meter["in"] += got.get("in", 0)
+            meter["out"] += got.get("out", 0)
+            meter["calls"] += 1
+        return text
     return ai_run(cmd, prompt, timeout=timeout, retries=1, cancel=cancel)
 
 

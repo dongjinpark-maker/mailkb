@@ -4233,7 +4233,7 @@ class TestPersonDiagnosis(unittest.TestCase):
                           ai_backends={"internal": {"cmd": ["echo"]}})
         self.store.ingest([
             _rec("d1", "yoon@corp.example", [ME], "스펙 검토",
-                 "2026-07-20T09:00:00", body="검토 의견 회신 부탁드립니다. 4.3절 확인 필요합니다."),
+                 "2026-07-20T09:00:00", body="검토 의견 회신 부탁드립니다. 4.3절 확인 안 됨합니다."),
             _rec("d2", ME, ["yoon@corp.example"], "RE: 스펙 검토",
                  "2026-07-21T09:00:00", body="다음 주까지 정리해 회신하겠습니다."),
             _rec("x1", "lee@corp.example", [ME], "남의 스레드",
@@ -10758,6 +10758,61 @@ class TestWeb(unittest.TestCase):
         for gone in ("config.toml", "db.sqlite", "공휴일", "tomllib", "Outlook"):
             self.assertNotIn(gone, page, f"설치 시점 판정이 남았다: {gone}")
 
+    _WSL_OC = ["wsl.exe", "-e", "bash", "-lc",
+               'exec opencode run --pure --agent minerva "$@"', "oc"]
+
+    def _wrapped_cfg(self):
+        return Config(home=self.cfg.home, my_addresses=[ME],
+                      ai_summary_backend="sonnet", ai_search_backend="sonnet",
+                      ai_diagnose_backend="opus",
+                      ai_backends={"internal": {"cmd": self._WSL_OC}})
+
+    def test_wrapper_backend_does_not_claim_the_program_exists(self):
+        # `wsl.exe -e bash -lc 'exec opencode …'` 는 실행 파일이 wsl.exe 다.
+        # which(cmd[0]) 성공은 **WSL 이 깔렸다**는 뜻일 뿐인데, 종전에는 그걸
+        # `● 있음` 으로 말했다 — opencode 를 지워도 그대로였다(2026-08-30).
+        with mock.patch("shutil.which",
+                        lambda b: {"claude": "C:/x/claude.cmd",
+                                   "wsl.exe": "C:/w/wsl.exe"}.get(b)):
+            page = self.web._ai_status_html(self._wrapped_cfg())
+        row = [ln for ln in page.split("\n") if "'ainame'>internal<" in ln][0]
+        self.assertIn("확인 안 됨", row)
+        self.assertNotIn("● 있음", row)
+        self.assertIn("opencode (wsl.exe)", row)   # 런처만 보이던 자리
+        self.assertIn("[응답 시험]으로 확인하세요", page)
+        self.assertNotIn("aifix", page)            # 미지는 경고가 아니다
+
+    def test_wrapper_with_missing_launcher_is_still_plainly_absent(self):
+        # 런처 자체가 없는 것은 **알 수 있는 사실**이다 — 그건 그대로 '없음'.
+        with mock.patch("shutil.which",
+                        lambda b: {"claude": "C:/x/claude.cmd"}.get(b)):
+            page = self.web._ai_status_html(self._wrapped_cfg())
+        row = [ln for ln in page.split("\n") if "'ainame'>internal<" in ln][0]
+        self.assertIn("없음", row)
+        self.assertNotIn("확인 안 됨", row)
+
+    def test_direct_backend_verdict_is_unchanged(self):
+        # 래퍼가 아닌 명령은 which(cmd[0]) 가 진짜 답이다 — 판정을 낮추지 않는다.
+        cfg = self._ai_cfg()                       # internal = 내장 ["opencode","run"]
+        with mock.patch("shutil.which",
+                        lambda b: {"claude": "/x/claude",
+                                   "opencode": "/x/opencode"}.get(b)):
+            page = self.web._ai_status_html(cfg)
+        row = [ln for ln in page.split("\n") if "'ainame'>internal<" in ln][0]
+        self.assertIn("● 있음", row)
+        self.assertIn("'aibin'>opencode<", row)    # 괄호 없이 이름 그대로
+        self.assertNotIn("확인 안 됨", page)
+
+    def test_backend_program_sees_through_the_wrapper(self):
+        # 판별 순서는 ai_run 의 stream_kind 와 같아야 한다 — claude 가 먼저.
+        # 두 곳이 갈리면 화면과 엔진이 다른 백엔드를 가리킨다.
+        self.assertEqual(review.backend_program(self._WSL_OC), "opencode")
+        self.assertEqual(
+            review.backend_program(["claude", "-p", "--model", "sonnet"]),
+            "claude")
+        self.assertEqual(review.backend_program(["gateway", "--x"]), "gateway")
+        self.assertEqual(review.backend_program([]), "")
+
     def test_absent_backend_is_a_fact_not_a_warning(self):
         # opencode 는 안 깔린 것이 보통이다 — 경고로 만들면 매번 눈에 걸린다.
         cfg = self._ai_cfg()
@@ -14281,6 +14336,41 @@ class TestAISearchPipeline(unittest.TestCase):
         self.assertAlmostEqual(meter["usd"], 0.02)
         self.assertEqual(meter["calls"], 1)
         self.assertEqual(meter["in"] + meter["out"], 120)
+
+    def test_ai_search_run_meters_opencode_with_the_same_formula(self):
+        # 종전에는 claude 일 때만 쟀다 — 같은 화면의 '토큰'이 백엔드마다 다른
+        # 자로 세지면 비교가 안 된다. opencode 는 step_finish 가 같은 재료를 준다.
+        self.cfg.ai_backends["internal"] = {"cmd": [
+            "wsl.exe", "-e", "bash", "-lc", 'exec opencode run "$@"', "oc"]}
+        meter = {"usd": 0.0, "in": 0, "out": 0, "calls": 0}
+
+        def fake_ai_run(cmd, prompt, **kw):
+            # ai_run 이 스트림 경로에서 내보내는 usage 이벤트를 흉내낸다
+            kw["on_event"]({"ev": "call", "attempt": 1})
+            kw["on_event"]({"ev": "usage", "usd": 0.0, "in": 5071 + 2865,
+                            "out": 62})
+            return "from:윤성호 after:2026-07"
+
+        with mock.patch.object(review, "ai_run", side_effect=fake_ai_run) as run:
+            out = review._ai_search_run(self.cfg, "p", "internal", 30, meter)
+        self.assertEqual(out, "from:윤성호 after:2026-07")
+        # claude 전용 플래그가 opencode 명령에 붙으면 안 된다
+        self.assertNotIn("--output-format", run.call_args[0][0])
+        # 재시도·콜 계수는 ai_run 한 곳에서 갈린다(여기서 직접 부르면 사라진다)
+        self.assertEqual(run.call_args[1]["retries"], 1)
+        self.assertEqual(meter["calls"], 1)
+        self.assertEqual(meter["in"], 7936)     # 신규 + 캐시읽기 — claude 와 같은 식
+        self.assertEqual(meter["out"], 62)
+
+    def test_ai_search_run_leaves_unknown_backends_alone(self):
+        # 알아보지 못하는 백엔드는 종전 그대로 평문 경로 · 계측 없음.
+        self.cfg.ai_backends["gw"] = {"cmd": ["gateway", "-x"]}
+        meter = {"usd": 0.0, "in": 0, "out": 0, "calls": 0}
+        with mock.patch.object(review, "ai_run", return_value="평문") as run:
+            out = review._ai_search_run(self.cfg, "p", "gw", 30, meter)
+        self.assertEqual(out, "평문")
+        self.assertEqual(meter["calls"], 0)
+        self.assertIsNone(run.call_args[1].get("on_event"))
 
     def test_ai_search_run_basename_detection_skips_adapters(self):
         # _ai_request 와 같은 결함의 잔존 지점 — 절대 경로(~/claude_work/...)의

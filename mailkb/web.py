@@ -5185,7 +5185,12 @@ def _render_folder_scope(store, cfg) -> str:
 _AITEST_TIMEOUT = review.AITEST_TIMEOUT   # 점검 1콜의 상한(엔진 기본 300s 와 별개)
 _AI_MARK = {"have": ("●", "있음", "ok"), "ok": ("●", "응답", "ok"),
             "slow": ("▲", "무응답", "warn"), "fail": ("■", "실패", "fail"),
-            "none": ("·", "없음", "none")}
+            "none": ("·", "없음", "none"),
+            # 래퍼 명령 — 런처는 있는데 그 안은 못 본다. 경고가 아니라 미지(未知)라
+            # 흐린 색을 쓴다(없음과 같은 계열). '확인 필요'가 아니라 '확인 안 됨'인
+            # 이유: 잘 쓰고 있는 사람도 재시작마다 이 줄을 본다(시험 결과가
+            # 인메모리다). 사실만 말하고 시키지 않는다.
+            "wrap": ("○", "확인 안 됨", "none")}
 _AI_FIX = {
     "fail": "이 AI 가 응답하지 않습니다. 로그인이 풀렸거나 이 모델을 쓸 권한이 "
             "없을 수 있습니다. 위 표에서 다른 AI 로 바꿀 수 있습니다.",
@@ -5253,8 +5258,18 @@ def _ai_backends(cfg) -> list[dict]:
             cmd = cfg.ai_cmd(name)
         except SystemExit:                       # 선언도 내장도 없는 이름
             continue
-        rows.append({"name": name, "cmd": cmd, "binary": cmd[0],
-                     "where": shutil.which(cmd[0]), "roles": roles.get(name, [])})
+        # cmd[0] 은 래퍼면 런처다(`wsl.exe`). 그것만 보이면 어느 백엔드든
+        # 똑같이 `wsl.exe` 로 뜨고, which(런처) 성공을 **백엔드가 있다**는 뜻으로
+        # 말하게 된다 — opencode 를 지워도 `● 있음` 이었다(2026-08-30).
+        launcher = Path(str(cmd[0])).name
+        prog = review.backend_program(cmd)
+        wrapped = bool(prog) and prog.lower() != Path(launcher).stem.lower()
+        # 래퍼가 **아닐 때는 cmd[0] 을 그대로** 둔다 — 경로로 선언한 백엔드까지
+        # 표시가 바뀔 이유가 없다(이 변경의 대상은 래퍼뿐이다).
+        rows.append({"name": name, "cmd": cmd,
+                     "binary": f"{prog} ({launcher})" if wrapped else cmd[0],
+                     "where": shutil.which(cmd[0]), "wrapped": wrapped,
+                     "roles": roles.get(name, [])})
     return rows
 
 
@@ -5302,9 +5317,13 @@ def _ai_status_html(cfg) -> str:
     out = ["<h2>이 PC 에서 쓸 수 있는 AI</h2>", "<div class='aichk'>"]
     for b in rows:
         got = tested.get(b["name"])
-        key = got[0] if got else ("have" if b["where"] else "none")
+        key = got[0] if got else (
+            "wrap" if b.get("wrapped") and b["where"]
+            else "have" if b["where"] else "none")
         mark, word, cls = _AI_MARK[key]
-        detail = got[1] if got else ("" if b["where"] else "이 PC 에 설치돼 있지 않습니다")
+        detail = got[1] if got else (
+            "[응답 시험]으로 확인하세요" if key == "wrap"
+            else "" if b["where"] else "이 PC 에 설치돼 있지 않습니다")
         role_s = " · ".join(b["roles"]) or "쓰는 기능 없음"
         out.append(
             f"<div class='airow {cls}'><span class='aimark'>{mark} {word}</span>"

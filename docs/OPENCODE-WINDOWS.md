@@ -16,7 +16,7 @@
 ```toml
 [ai.backends.internal]
 cmd = ["wsl.exe", "-e", "bash", "-lc",
-       'exec opencode run --pure --dir "$HOME/.minerva-oc" --agent minerva "$@"', "oc"]
+       'exec opencode run --pure --dir /var/tmp/minerva-oc --agent minerva "$@"', "oc"]
 effort_flag = "--variant"      # opencode의 추론 강도: high / max / minimal
 ```
 
@@ -26,14 +26,25 @@ effort_flag = "--variant"      # opencode의 추론 강도: high / max / minimal
 |---|---|
 | `bash -lc` | `wsl -e opencode` 는 `execvpe(opencode) failed` — 로그인 셸이 없으면 `~/.opencode/bin`이 PATH에 없다 |
 | `"$@"` 와 끝의 `"oc"` | 코드가 argv 뒤에 붙이는 플래그(`--format json`·`effort_flag`)가 `$0`·`$1`이 되어 **조용히 사라진다** |
-| `--dir` | opencode가 cwd의 `AGENTS.md`/`CLAUDE.md`를 읽는다. 저장소에서 `serve`를 띄우면 **코딩 규칙이 메일 분석 프롬프트에 실린다** |
+| `--dir` | opencode가 `AGENTS.md`/`CLAUDE.md`를 읽는다 — **cwd 뿐 아니라 위로 올라가며** 찾는다(§1.1). 저장소에서 띄우면 **코딩 규칙이 메일 분석 프롬프트에 실린다** |
 | `--agent minerva` | 기본 `build` 에이전트가 콜마다 툴 스키마로 **~7,000 토큰**을 태우고, 메일 본문이 들어가는 프롬프트에 툴이 열려 있다 |
 
 `--format json`은 config에 쓰지 않는다. 코드(`_ai_run_stream_oc`)가 필요할 때만
 붙인다 — 직접 넣으면 진행 이벤트가 없는 블로킹 경로에서 NDJSON이 답으로 나가
 하류 파서가 전부 깨진다.
 
-### `~/.minerva-oc/.opencode/agent/minerva.md` (WSL 안)
+### `/var/tmp/minerva-oc/.opencode/agent/minerva.md` (WSL 안)
+
+**손으로 쓰지 않는다** — 저장소가 나르는 것을 이름만 바꿔 복사한다. 내용이 저장소와
+어긋나면 도구 목록이 조용히 낡는다.
+
+```bash
+mkdir -p /var/tmp/minerva-oc/.opencode/agent
+cp /mnt/c/<저장소>/tools/opencode/minerva-agent.md \
+   /var/tmp/minerva-oc/.opencode/agent/minerva.md
+```
+
+내용은 이렇다.
 
 ```markdown
 ---
@@ -62,8 +73,62 @@ tools:
 ```
 
 claude 백엔드의 `--tools ""`에 해당한다(`review._ai_request`). opencode는 그 채널이
-없어 에이전트 파일로 같은 일을 한다. **실측: 같은 프롬프트 입력 8,129토큰 → 1,204토큰.**
-분석(`ask`)은 한 질문에 최대 12콜이므로 질문당 약 83,000토큰 차이다.
+없어 에이전트 파일로 같은 일을 한다. 분석(`ask`)은 한 질문에 최대 12콜이라 이 차이가
+그대로 곱해진다 — 토큰만이 아니라 **콜 시간도 같이 는다**.
+
+한 단어 답 1콜의 입력 토큰(2026-08-30 실측, 같은 질문):
+
+| 설정 | 입력 합 |
+|---|---|
+| 아무것도 안 함(기본 `build`) | 7,765 |
+| 설정 `tools` 키로 도구만 끄기 | 2,909 |
+| **전용 에이전트**(이 절) | **1,059** |
+
+가운데 줄은 **검토했으나 안 쓴 길**이다. opencode 설정 스키마에 최상위 `tools`
+(`{도구이름: false}`)가 있어 `--agent` 없이 JSON 한 장으로 끌 수 있다 — 그런데 절반만
+줄고(2,909), 목록을 더 늘려도 안 줄었다(전부 끄나 절반만 끄나 2,910 대 2,909). 남는
+몫은 도구가 아니라 `build` 에이전트 정의 자체가 싣는 것이라 에이전트를 갈아야 사라진다.
+설정을 **전역**(`~/.config/opencode/opencode.jsonc`)에 두는 길도 있지만, 그러면
+사용자가 opencode 로 코딩할 때도 도구가 꺼진다 — mailkb 만 조용해야 한다.
+
+### 1.1 함정 둘 — 둘 다 조용하다
+
+**`--dir` 은 `$HOME` 아래에 두면 안 된다.** opencode 는 지시문 파일을 `--dir` 에서만
+찾지 않고 **위로 올라가며** 찾는다. 세 번 재서 확인했다(2026-08-30, 1.18.25 —
+부모에 canary 지시문을 심고 답 끝에 그 표시가 붙는지 봤다).
+
+| 실험 | 결과 |
+|---|---|
+| 두 칸 위 `CLAUDE.md` | 붙는다 — **깊이로는 못 막는다** |
+| 가까운 `AGENTS.md` · 먼 `CLAUDE.md` | 가까운 것만 — 거리가 아니라 **종류** 우선순위였다 |
+| 가까운 `AGENTS.md` · 먼 `AGENTS.md` | **둘 다 붙는다** — 위아래가 합쳐진다 |
+
+세 번째가 결론이다. 같은 종류는 합쳐지므로 가까운 자리에 빈 `AGENTS.md` 를 방패로
+두는 것도 소용없다. 위로 올라가도 나올 것이 없는 자리를 써야 하고, `/var/tmp` 가
+그렇다(`/var/tmp` → `/var` → `/`). `$HOME/.minerva-oc` 는 부모가 `$HOME` 이라
+사용자가 홈에 `AGENTS.md`·`CLAUDE.md` 를 두는 순간 **모든 메일 분석 콜에 실린다** —
+개발자 홈에는 흔한 파일이다.
+
+설정으로는 막을 수 없다. 스키마의 `instructions` 키는 *"Additional instruction files"*
+라 **더하기만 하고 끄지 못한다.**
+
+**에이전트 파일이 없으면 실패하지 않는다.** 이름이 틀리거나 자리가 어긋나면 이렇게
+된다(실측).
+
+```
+! agent "minerva" not found. Falling back to default agent   ← stderr, 그리고 계속 간다
+{"type":"step_start", …}
+{"type":"step_finish", … "tokens":{"input":5411, … "cache":{"read":2353}}}
+종료코드 0
+```
+
+**exit 0 에 정상 NDJSON 이라 mailkb 는 아무 이상을 못 본다.** 대가는 입력 1,059 →
+7,764 토큰(약 7배)이고, 그보다 **도구가 열린 채로 메일 본문이 들어간다**. 이 저장소가
+`--tools ""` 와 전용 에이전트로 막아 온 바로 그 축이 조용히 열린다.
+
+지금은 화면에 신호가 없다. 의심되면 `[응답 시험]` 이나 `mailkb diagnose --backend
+internal` 을 돌리고, 그 콜의 stderr 에 위 경고가 있는지 본다. (계측을 붙이는 것은
+§5 참고 — `_ai_run_once` 가 성공 시 stderr 를 버리고 있어 그 계약부터 건드려야 한다.)
 
 ---
 
@@ -138,11 +203,13 @@ python -m mailkb --home <home> diagnose --backend internal
 
 ## 5. 아직 안 한 것
 
-- **`_ai_backends`의 `shutil.which(cmd[0])`** — wsl 형태면 항상 `wsl.exe`를 찾으므로
-  설정 화면이 `internal wsl.exe`로 뜨고 `· 없음` 판정이 무의미해진다. `[응답 시험]`이
-  진짜 답을 주니 치명적이진 않지만 표시가 거짓말을 한다.
-- **`_ai_search_run`의 계측** — claude일 때만 토큰을 잰다. opencode의 `step_finish`가
-  같은 재료를 주므로 대칭이 가능하다.
+- **에이전트 폴백을 화면에 올리기**(§1.1) — 에이전트 파일이 없으면 stderr 경고
+  한 줄만 남기고 조용히 `build` 로 떨어져 토큰이 7배가 된다. `[응답 시험]` 이 그
+  경고를 잡아 주는 것이 맞지만, `_ai_run_once` 가 성공 시 stderr 를 버리고 있어
+  그 계약부터 건드려야 한다. **지금 이 저장소에서 가장 값비싼 조용한 실패다.**
+- **`[응답 시험]` 결과가 재시작을 못 넘긴다** — 인메모리라 서버를 다시 띄우면
+  래퍼 백엔드가 다시 `○ 확인 안 됨` 으로 돌아간다. 잘 쓰는 사람이 매번 그 표시를
+  본다.
 - **`ask_max_input_tokens`** — 기본 120,000은 Claude 창 기준이다. opencode가 부르는
   모델에 맞춰 낮춰야 할 수 있다.
 - **`opencode serve` + `--attach`** — 콜당 기동 비용(~6초)을 없앨 수 있지만 프로세스
