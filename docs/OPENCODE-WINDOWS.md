@@ -1,0 +1,149 @@
+# Windows에서 opencode를 AI 백엔드로 쓰기
+
+`internal` 백엔드(opencode)를 Windows PC에서 실제로 쓰기 위한 설정과, 그걸
+가능하게 하려고 코드에 넣은 것. 전제는 **opencode가 WSL 안에만 설치돼 있는**
+환경이다 — 회사 PC의 실제 모양이고, Windows 네이티브 설치라면 §1의 `cmd`만
+`["opencode", "run", "--pure"]`로 줄이면 나머지는 같다.
+
+측정값은 전부 2026-08-30 Windows 11 + WSL2(Ubuntu) + opencode 1.18.25 실기기다.
+
+---
+
+## 1. 설정 — 이것만 하면 돈다
+
+### `<home>/config.toml`
+
+```toml
+[ai.backends.internal]
+cmd = ["wsl.exe", "-e", "bash", "-lc",
+       'exec opencode run --pure --dir "$HOME/.minerva-oc" --agent minerva "$@"', "oc"]
+effort_flag = "--variant"      # opencode의 추론 강도: high / max / minimal
+```
+
+네 조각이 각각 하나씩 막는다.
+
+| 조각 | 없으면 |
+|---|---|
+| `bash -lc` | `wsl -e opencode` 는 `execvpe(opencode) failed` — 로그인 셸이 없으면 `~/.opencode/bin`이 PATH에 없다 |
+| `"$@"` 와 끝의 `"oc"` | 코드가 argv 뒤에 붙이는 플래그(`--format json`·`effort_flag`)가 `$0`·`$1`이 되어 **조용히 사라진다** |
+| `--dir` | opencode가 cwd의 `AGENTS.md`/`CLAUDE.md`를 읽는다. 저장소에서 `serve`를 띄우면 **코딩 규칙이 메일 분석 프롬프트에 실린다** |
+| `--agent minerva` | 기본 `build` 에이전트가 콜마다 툴 스키마로 **~7,000 토큰**을 태우고, 메일 본문이 들어가는 프롬프트에 툴이 열려 있다 |
+
+`--format json`은 config에 쓰지 않는다. 코드(`_ai_run_stream_oc`)가 필요할 때만
+붙인다 — 직접 넣으면 진행 이벤트가 없는 블로킹 경로에서 NDJSON이 답으로 나가
+하류 파서가 전부 깨진다.
+
+### `~/.minerva-oc/.opencode/agent/minerva.md` (WSL 안)
+
+```markdown
+---
+description: Minerva 메일 분석 전용 — 도구 없이 주어진 텍스트만 읽는다
+mode: primary
+tools:
+  bash: false
+  edit: false
+  write: false
+  read: false
+  grep: false
+  glob: false
+  list: false
+  patch: false
+  apply_patch: false
+  batch: false
+  task: false
+  todowrite: false
+  todoread: false
+  question: false
+  webfetch: false
+  lsp: false
+  skill: false
+---
+주어진 텍스트만 읽고 답한다. 도구를 쓰지 않는다. 파일·셸·네트워크에 접근하지 않는다.
+```
+
+claude 백엔드의 `--tools ""`에 해당한다(`review._ai_request`). opencode는 그 채널이
+없어 에이전트 파일로 같은 일을 한다. **실측: 같은 프롬프트 입력 8,129토큰 → 1,204토큰.**
+분석(`ask`)은 한 질문에 최대 12콜이므로 질문당 약 83,000토큰 차이다.
+
+---
+
+## 2. 코드에 들어간 것
+
+| 곳 | 무엇 | 왜 |
+|---|---|---|
+| `review._is_opencode_cmd` | **명령 전체**를 보는 백엔드 판별자 | `_is_claude_cmd`처럼 `cmd[:2]`만 보면 실행 파일이 `wsl.exe`라 영영 못 찾는다 |
+| `review._ai_run_stream_oc` | `--format json` NDJSON 파서 | 진행 이벤트를 claude와 **같은 중립 어휘**로 흘린다 |
+| `review._usage_of_oc` | `step_finish` → 토큰 계측 | 입력 합산식을 claude와 같게(신규+캐시생성+캐시읽기) — 한 화면의 숫자가 백엔드마다 다른 것을 세면 비교가 안 된다 |
+| `review.aitest_timeout` | 응답 시험 상한을 백엔드별로 | 30초는 claude 기준이다. opencode는 콜드 스타트만 ~20초라 멀쩡한 백엔드가 늘 '무응답'으로 떴다 |
+| `web._job_live_line` | 무수신 워치독에 `stream` 게이트 | `last_ev`는 콜 시작(`ev:call`)으로도 찍히고 그건 백엔드와 무관하다 — 게이트가 없으면 이벤트 0건인 백엔드가 정상 진행 중에 경고를 받는다 |
+| `web._STALL_SECS_OPENCODE` | 무수신 기준 30→90초 | opencode는 첫 이벤트가 20~46초 뒤에 온다. 같은 기준을 쓰면 정상 구간마다 경고가 떠 배경음이 된다 |
+| `web._job_stream_event` | `ev:call`에서 `phase`·`recv` 리셋 | 콜 단위 리셋을 원래 `model` 이벤트가 했는데 **opencode는 모델 이름을 안 흘린다** |
+| `web._job_live_line` | `phase: tool` → `도구 사용 중` | 메일 분석에 툴이 돌면 그건 메일 본문이 유발했다는 뜻이다. 조용히 넘기지 않는다 |
+
+### 이벤트 대응표
+
+opencode 1.18.25 `run` 핸들러 기준.
+
+| opencode | 조건 | 중립 어휘 |
+|---|---|---|
+| `step_start` | 단계마다 | `phase: thinking` |
+| `reasoning` | `--thinking` 필요 | `phase: thinking` + `delta` |
+| `text` | `time.end` 있을 때 = **완결분 1건** | `phase: writing` + `delta`(text 포함) |
+| `tool_use` | 툴 완료/오류 | `phase: tool` |
+| `step_finish` | `tokens`·`cost` | `usage` |
+| `error` | `session.error`, exit 1 동반 | `AIError` |
+
+**바이트 단위 델타가 없다.** text는 다 쓴 뒤 한 번에 온다 — 그래서 수신량은 답
+직전에 0에서 한 번에 뛰고, 진행바는 끝까지 인디터미닛이며, 모델 배지는 빈다
+(이 포맷에 모델 이름이 없다). 관측되지 않는 것은 지어내지 않고 `.waitslot:empty`가
+그 슬롯을 접는다.
+
+### 평문 폴백
+
+`--format json`이 셸 래퍼에 삼켜지면(§1의 `"$@"` 누락) opencode는 평문을 뱉는다.
+그때 `_ai_run_stream_oc`는 **실패시키지 않고 그대로 답으로 쓴다** — 진행 표시만
+잃는다. 설정 한 줄의 실수가 AI 기능 전체를 죽이면 안 된다. claude 경로가
+2026-07-28에 이 폴백이 없어 분석이 전부 죽었던 그 자리와 같은 판단이다.
+
+---
+
+## 3. 실측 숫자
+
+| | |
+|---|---|
+| WSL interop 오버헤드 | 0.1초 — 무시해도 된다 |
+| opencode 프로세스 콜드 스타트 | ~20초 (웜 ~6초) |
+| 첫 진행 이벤트까지 | 20~46초 |
+| 한 단어 답 1콜 총시간 | **3초 ~ 60초** — 무료 모델 티어라 편차가 크다 |
+| 입력 토큰 (`build` / 툴 없는 에이전트) | 8,129 / 1,204 |
+
+콜 하나가 60초를 넘는 일이 흔하다는 것이 이 백엔드의 성격이고, 그래서 진행 표시가
+claude보다 **더** 중요하다. 그냥 두면 화면이 몇 분간 죽은 것처럼 보인다.
+
+---
+
+## 4. 확인
+
+```bash
+python -m mailkb --home <home> diagnose --backend internal
+```
+
+`● 응답`이면 끝이다. `▲ 무응답`이면 늦는 것이지 고장이 아닐 수 있다 — 상한은
+`review.AITEST_TIMEOUT_OPENCODE`(150초)이고, 그걸 넘으면 WSL에서 `opencode run`을
+직접 돌려 로그인·모델 설정을 본다.
+
+웹은 설정 › **이 PC에서 쓸 수 있는 AI**의 `[응답 시험]`이 같은 일을 한다.
+
+---
+
+## 5. 아직 안 한 것
+
+- **`_ai_backends`의 `shutil.which(cmd[0])`** — wsl 형태면 항상 `wsl.exe`를 찾으므로
+  설정 화면이 `internal wsl.exe`로 뜨고 `· 없음` 판정이 무의미해진다. `[응답 시험]`이
+  진짜 답을 주니 치명적이진 않지만 표시가 거짓말을 한다.
+- **`_ai_search_run`의 계측** — claude일 때만 토큰을 잰다. opencode의 `step_finish`가
+  같은 재료를 주므로 대칭이 가능하다.
+- **`ask_max_input_tokens`** — 기본 120,000은 Claude 창 기준이다. opencode가 부르는
+  모델에 맞춰 낮춰야 할 수 있다.
+- **`opencode serve` + `--attach`** — 콜당 기동 비용(~6초)을 없앨 수 있지만 프로세스
+  수명 관리가 늘고 "아웃바운드는 AI 뿐"(CLAUDE.md §2) 근거를 다시 따져야 한다.

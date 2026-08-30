@@ -45,6 +45,10 @@ from .store import Store, image_cutoff_for
 _JOB_STREAM = {"phase": "", "recv": 0, "model": "", "retry": "", "tail": "",
                "failed": "", "fatal": False, "last_ev": 0.0, "stream": False,
                "cancel": None, "calls": 0,
+               # 무수신 경고 기준(초). 0 = 미지정이고 _job_live_line 이 기본값을
+               # 쓴다 — _arm_job_backend 가 백엔드를 보고 실제 값을 심는다.
+               # 첫 이벤트까지의 '정상 침묵'이 백엔드마다 다르기 때문이다.
+               "stall": 0,
                "started": 0.0}
 
 
@@ -5175,7 +5179,10 @@ def _render_folder_scope(store, cfg) -> str:
 
 # 상태 넷 — **'안 된다'와 '느리다'를 가른다.** 사내 게이트웨이를 거치는 CLI 는
 # 한 단어 답에도 30초를 넘길 수 있는데, 그걸 '실패'로 찍으면 고장으로 읽힌다.
-_AITEST_TIMEOUT = 30                      # 점검 1콜의 상한(엔진 기본 300s 와 별개)
+# 상한은 백엔드마다 다르다(review.aitest_timeout) — opencode 는 콜드 스타트만
+# ~20초라 claude 기준 30초로 재면 멀쩡한 백엔드가 늘 '무응답'이 된다. 값을 여기
+# 두면 CLI `diagnose` 와 갈라지므로 엔진 한 곳에서만 정한다.
+_AITEST_TIMEOUT = review.AITEST_TIMEOUT   # 점검 1콜의 상한(엔진 기본 300s 와 별개)
 _AI_MARK = {"have": ("●", "있음", "ok"), "ok": ("●", "응답", "ok"),
             "slow": ("▲", "무응답", "warn"), "fail": ("■", "실패", "fail"),
             "none": ("·", "없음", "none")}
@@ -5261,12 +5268,13 @@ def _run_aitest_job(cfg) -> None:
         if not b["where"]:
             rows[b["name"]] = ("none", "이 PC 에 설치돼 있지 않습니다")
             continue
+        limit = review.aitest_timeout(b["cmd"])
         try:
             out = review.ai_run(b["cmd"], "한 단어로만 답하라. 정상이면 OK.",
-                                timeout=_AITEST_TIMEOUT, retries=0)
+                                timeout=limit, retries=0)
             rows[b["name"]] = ("ok", (out.splitlines() or [""])[0][:60])
         except review.AITimeout:    # 안 되는 것이 아니라 늦는 것 — 갈라 적는다
-            rows[b["name"]] = ("slow", f"{_AITEST_TIMEOUT}초 안에 응답 없음")
+            rows[b["name"]] = ("slow", f"{limit}초 안에 응답 없음")
         except Exception as e:      # AIError·AIAuthError·OSError 전부 한 줄로
             rows[b["name"]] = ("fail",
                                " ".join(str(e).split())[:160] or type(e).__name__)
@@ -7034,6 +7042,12 @@ def _job_stream_event(job: dict, lock):
                 # 진행 중 화면의 '지금까지 몇 콜' — 잡 단위 누계라 model 이벤트의
                 # 콜 단위 리셋(recv)과 달리 잡이 끝날 때까지 안 지운다.
                 job["calls"] = int(job.get("calls") or 0) + 1
+                # 콜 단위 리셋은 원래 model 이벤트가 했는데 **opencode 는 모델
+                # 이름을 안 흘린다** — 여기서도 리셋하지 않으면 이전 콜의 수신량이
+                # 다음 콜로 이월돼 '받고 있다'는 신호가 거짓이 된다. retry/failed 는
+                # 건드리지 않는다(다음 콜이 도는 동안에도 직전 실패는 화면에 남아야
+                # 한다). tail 은 잡 시작에만 지운다 — model 이벤트와 같은 이유.
+                job["phase"], job["recv"] = "", 0
             elif ev == "model":
                 job.update(model=_plain(str(info.get("model") or "")),
                            phase="", recv=0, retry="", failed="")
@@ -7072,6 +7086,12 @@ def _plain(text: str) -> str:
 
 
 _STALL_SECS = 30      # 이 시간 무수신이면 '응답 대기' 경고로 바꾼다 (2d)
+# opencode 는 첫 이벤트가 늦다 — 프로세스 콜드 스타트 + 모델 대기 뒤에야
+# step_start 가 온다(2026-08-30 실측: 20~46초). claude 는 system/init 이 거의
+# 즉시 오므로 30초로 충분하지만, 같은 값을 쓰면 여기선 **정상 구간마다** 경고가
+# 떠 배경음이 된다. '평소보다 긴 침묵'이라는 뜻을 지키려면 기준이 백엔드마다
+# 달라야 한다.
+_STALL_SECS_OPENCODE = 90
 def _job_live_line(st: dict) -> str:
     """수신 상황 한 줄(평문 — esc 는 렌더 쪽).
 
@@ -7096,7 +7116,13 @@ def _job_live_line(st: dict) -> str:
         # 남기지 않으면 실패 구간 내내 '살아 있는데 조용한' 화면이 된다.
         return _plain(f"직전 호출 실패 — 이어서 진행 ({st['failed']})")
     idle = int(time.time() - st["last_ev"])
-    if idle >= _STALL_SECS:
+    # **워치독은 스트리밍 백엔드에만.** `last_ev` 는 스트리밍 이벤트뿐 아니라
+    # 콜 시작(`ev:call`)으로도 찍히는데, 그건 백엔드와 무관하게 온다 — 그래서
+    # 이 게이트가 없으면 이벤트가 애초에 0건인 백엔드가 정상 진행 중에 30초 뒤
+    # '무수신'으로 뜬다(_arm_job_backend 가 막으려던 그 오탐을 `call` 이 뒷문으로
+    # 되살렸다). opencode 는 콜 하나가 60초를 넘기는 일이 흔해 그게 기본 표시가
+    # 됐다(2026-08-30 실측).
+    if st.get("stream") and idle >= (st.get("stall") or _STALL_SECS):
         return f"응답 대기 — {idle}초째 무수신"
     recv = st.get("recv") or 0
     # 수신 0 은 정보가 아니다 — 사고 구간은 모델·백엔드에 따라 내용이 아예 안 오고
@@ -7107,6 +7133,11 @@ def _job_live_line(st: dict) -> str:
         return "작성 중" + tail
     if st.get("phase") == "thinking":
         return "모델 사고 중" + tail
+    if st.get("phase") == "tool":
+        # opencode 전용 — claude 는 --tools "" 로 애초에 툴이 없다. 메일 분석
+        # 프롬프트는 툴이 필요 없으니 이게 뜨면 **메일 본문이 툴을 유발했다**는
+        # 뜻이다. 조용히 넘기지 않는다.
+        return "도구 사용 중" + tail
     return "모델 응답 대기 중"
 
 
@@ -7135,10 +7166,11 @@ def _job_preview(st: dict) -> str:
 def _arm_job_backend(job: dict, lock, cfg, backend_name) -> None:
     """잡이 쓸 백엔드를 보고 (1) 무수신 워치독을 무장하고 (2) 스트리밍 여부를 심는다.
 
-    워치독은 claude 백엔드만 — 스트리밍 이벤트가 애초에 없는 백엔드(opencode
-    등)에 잡 시작 시각을 심으면 정상 진행 중에도 '무수신' 오탐이 난다.
-    job["stream"] 은 중지 버튼의 안내 문구가 갈라지는 근거다(_cancel_hint):
-    스트리밍이면 진행 중 호출을 즉시 끊지만, 블로킹 경로는 콜 경계에서만 멈춘다."""
+    워치독은 스트리밍 백엔드(claude·opencode)만 — 이벤트가 애초에 없는 백엔드에
+    잡 시작 시각을 심으면 정상 진행 중에도 '무수신' 오탐이 난다.
+    job["stream"] 은 중지 버튼의 안내 문구가 갈라지는 근거이자(_cancel_hint):
+    스트리밍이면 진행 중 호출을 즉시 끊지만 블로킹 경로는 콜 경계에서만 멈춘다 —
+    _job_live_line 의 무수신 워치독 게이트이기도 하다."""
     try:
         cmd = cfg.ai_cmd(backend_name)
     except (SystemExit, Exception):
@@ -7147,10 +7179,13 @@ def _arm_job_backend(job: dict, lock, cfg, backend_name) -> None:
         # 여기서 죽으면 running=True 인 채 슬롯이 영구 점유돼 서버를 다시 띄울
         # 때까지 그 기능이 막힌다.
         return
-    stream = review._is_claude_cmd(cmd)
+    oc = review._is_opencode_cmd(cmd)
+    stream = review._is_claude_cmd(cmd) or oc
     with lock:
         if job["running"]:
             job["stream"] = stream
+            # 무수신 기준도 백엔드가 정한다 — 첫 이벤트까지의 정상 침묵이 다르다
+            job["stall"] = _STALL_SECS_OPENCODE if oc else _STALL_SECS
             if stream:
                 job["last_ev"] = time.time()
 

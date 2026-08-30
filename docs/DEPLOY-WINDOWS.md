@@ -14,6 +14,8 @@ README의 짧은 설치 절차를 실제로 따라 할 때 필요한 세부. 사
    `opencode run`을 부른다(`config._BUILTIN_BACKENDS`). 사내 CLI를 쓴다면
    §2의 `[ai.backends.*] cmd`로 지정한다. **없어도 AI 기능만 빠지고 나머지는
    전부 동작한다** — 수집·검색·회고·웹 UI는 네트워크 호출이 0이다.
+   opencode가 **WSL 안에만** 있으면 호출 형태에 함정이 셋 있다 —
+   [OPENCODE-WINDOWS.md](OPENCODE-WINDOWS.md)에 설정과 근거를 따로 적었다.
 4. **저장소를 받는다.** `git`이 없는 PC라면 GitHub의 **Code › Download ZIP**으로
    받아 풀어도 된다 — 그때는 갱신도 다시 받는 방식이고, 웹의 '최신으로 업데이트'
    버튼은 git이 없다고 안내만 한다.

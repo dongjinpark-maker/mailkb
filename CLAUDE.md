@@ -250,5 +250,6 @@ Windows 실기기 확인이 필요한 변경은 그렇다고 말하고 넘긴다
 |---|---|
 | [README.md](README.md) | 설치·데모·명령 — 사람이 따라 하는 순서 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 목적·모듈 지도·데이터 모델·파이프라인·기능 상세·설계 결정 |
+| [docs/OPENCODE-WINDOWS.md](docs/OPENCODE-WINDOWS.md) | `internal`(opencode) 백엔드를 Windows에서 쓰기 — WSL 호출 형태의 함정과 진행 표시 |
 | [agent-guides/](agent-guides/) | 조사 에이전트용 CLI 계약 — 어떤 명령이 읽기 전용이고 어떤 것이 AI를 부르는지 |
 | [.claude/skills/mail-research/](.claude/skills/mail-research/) | 사용자용 조사 스킬(`/mail-research`) — **계약의 원본이 아니다**. agent-guides 를 가리키기만 하므로, 그쪽 파일 이름이 바뀌면 여기도 고친다(테스트가 막는다) |

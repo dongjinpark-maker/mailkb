@@ -955,13 +955,14 @@ def cmd_diagnose(args) -> None:
             continue
         print(f"  {name}" + (f" ({roles_s})" if roles_s else "")
               + f" — {' '.join(cmd)}")
+        limit = review.aitest_timeout(cmd)   # 백엔드별 — 웹 점검과 같은 값
         try:
             out = review.ai_run(cmd, "한 단어로만 답하라. 정상이면 OK.",
-                                timeout=30, retries=0)
+                                timeout=limit, retries=0)
             print(f"    ● 응답: {out.splitlines()[0][:60]!r}")
         except review.AITimeout:
             # '안 된다'가 아니라 '늦는다' — 웹 점검 화면과 같은 어휘를 쓴다
-            print("    ▲ 무응답: 30초 안에 대답이 없습니다")
+            print(f"    ▲ 무응답: {limit}초 안에 대답이 없습니다")
             print("    → 느린 백엔드일 수 있습니다. 다시 돌려 보고, 계속 이러면 "
                   "그 CLI 를 직접 실행해 로그인·프록시를 확인하세요.")
         except (review.AIError, review.AIAuthError) as e:

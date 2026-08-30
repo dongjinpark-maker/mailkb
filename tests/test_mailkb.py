@@ -12785,7 +12785,13 @@ class TestDoctorLinux(unittest.TestCase):
                         side_effect=AssertionError("subprocess 호출됨")), \
              mock.patch("subprocess.Popen",
                         side_effect=AssertionError("subprocess 호출됨")):
-            checks = self.doctor.run(cfg, self.home, _probe(), env=_WIN_ENV)
+            # **which 를 주입한다.** 안 그러면 판정이 이 기계의 PATH 에 달린다 —
+            # 개발 PC 에 opencode 를 깔면 `found == seen` 이 되어 안내가
+            # `--backend` 없는 쪽으로 바뀌고 이 테스트가 깨진다(2026-08-30 실제
+            # 발생). 여기서 재는 것은 '호출을 안 한다'이지 그 PC 의 설치 상태가
+            # 아니다.
+            checks = self.doctor.run(cfg, self.home, _probe(), env=_WIN_ENV,
+                                     which=lambda x: None)
         ai = [c for c in checks if c.section == "AI"]
         self.assertTrue(any("diagnose --backend" in " ".join(c.extra) for c in ai))
 
@@ -13608,6 +13614,144 @@ class TestWindowsCompat(unittest.TestCase):
             # 봉투가 이상해도 0 으로 답하고 호출을 깨지 않는다
             self.assertEqual(review._usage_of({"usage": "이상함"}),
                              {"usd": 0.0, "in": 0, "out": 0})
+
+    def _fake_opencode_backend(self, tmpdir):
+        """opencode `--format json` 각본을 뱉는 가짜 백엔드 — basename 이
+        opencode 라 스트리밍 게이트에 걸린다.
+
+        **`--format json` 이 argv 에 실제로 왔을 때만** NDJSON 을 낸다. 안 왔으면
+        평문을 뱉어, 셸 래퍼가 플래그를 삼키는 Windows 설정(`bash -lc "…"` 에
+        `"$@"` 누락)을 그대로 재현한다."""
+        script = Path(tmpdir) / "opencode"
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "p = sys.stdin.read()\n"
+            "if 'FAIL' in p:\n"
+            "    sys.stderr.write('가짜 opencode 오류'); sys.exit(3)\n"
+            # SWALLOW = 셸 래퍼가 --format json 을 삼킨 상태(argv 로는 재현할 수
+            # 없다 — 러너가 argv 에 직접 붙이므로). 프롬프트 표식으로 흉내 낸다.
+            "if 'SWALLOW' in p or '--format' not in sys.argv:\n"
+            "    print('평문 답변입니다'); sys.exit(0)\n"
+            "def out(d): print(json.dumps(d, ensure_ascii=False))\n"
+            "if 'ERREV' in p:\n"
+            "    out({'type':'error','error':{'message':'과부하 — 잠시 후'}})\n"
+            "    sys.exit(0)\n"
+            "out({'type':'step_start','part':{'type':'step-start'}})\n"
+            "if 'TOOL' in p:\n"
+            "    out({'type':'tool_use','part':{'type':'tool','tool':'bash'}})\n"
+            "out({'type':'reasoning','part':{'type':'reasoning','text':'생각'}})\n"
+            "out({'type':'text','part':{'type':'text','text':'최종 본문'}})\n"
+            "out({'type':'step_finish','part':{'type':'step-finish','cost':0.25,\n"
+            "     'tokens':{'input':10,'output':7,'reasoning':3,\n"
+            "               'cache':{'write':100,'read':1000}}}})\n",
+            encoding="utf-8")
+        script.chmod(0o755)
+        return str(script)
+
+    def test_is_opencode_cmd_sees_whole_command(self):
+        # **명령 전체를 본다** — _is_claude_cmd 처럼 cmd[:2] 만 보면 Windows 의
+        # 실제 설정을 영원히 못 찾는다. 거기선 opencode 가 WSL 안에만 있어
+        # `wsl -e opencode` 가 PATH 해석에 실패하고(2026-08-30 실측), 설정은
+        # `wsl.exe -e bash -lc 'exec opencode run … "$@"' oc` 가 되어 실행 파일
+        # 이름은 wsl.exe 다.
+        wsl = ["wsl.exe", "-e", "bash", "-lc",
+               'exec opencode run --pure --dir "$HOME/.minerva-oc" "$@"', "oc"]
+        for cmd in (["opencode", "run"], wsl,
+                    ["/home/u/.opencode/bin/opencode", "run"],
+                    ["C:\\tools\\opencode.cmd", "run"]):
+            self.assertTrue(review._is_opencode_cmd(cmd), cmd)
+        for cmd in (["claude", "-p", "--model", "sonnet"],
+                    ["wsl.exe", "-e", "bash", "-lc", 'exec claude -p "$@"', "c"],
+                    ["/opt/opencoder/bin/tool"],       # 부분 문자열 오탐 금지
+                    ["echo"]):
+            self.assertFalse(review._is_opencode_cmd(cmd), cmd)
+        # claude 판별이 먼저다 — 둘 다 걸리는 명령에서 파서가 갈리면 조용히 깨진다
+        self.assertTrue(review._is_claude_cmd(["claude", "-p"]))
+
+    def test_opencode_stream_runner_events_and_usage(self):
+        # opencode 이벤트를 **claude 와 같은 중립 어휘**로 옮긴다. 어휘가 갈리면
+        # 화면(_job_stream_event)이 백엔드마다 다른 코드를 타게 된다.
+        with tempfile.TemporaryDirectory() as t:
+            script = self._fake_opencode_backend(t)
+            events = []
+            out = review._ai_run_stream_oc([script], "질문", 30, events.append)
+            self.assertEqual(out, "최종 본문")
+            phases = [e["phase"] for e in events if e["ev"] == "phase"]
+            self.assertEqual(phases, ["thinking", "thinking", "writing"])
+            deltas = [e for e in events if e["ev"] == "delta"]
+            self.assertEqual([d["phase"] for d in deltas],
+                             ["thinking", "writing"])
+            # 작성분만 text 를 싣는다(사고는 초안 미리보기 재료가 아니다)
+            self.assertIsNone(deltas[0]["text"])
+            self.assertEqual(deltas[1]["text"], "최종 본문")
+            # 입력 합산식은 claude 와 같다 — 신규 + 캐시생성 + 캐시읽기.
+            # 한 화면의 '토큰'이 백엔드마다 다른 것을 세면 비교가 안 된다.
+            self.assertEqual([e for e in events if e["ev"] == "usage"],
+                             [{"ev": "usage", "usd": 0.25, "in": 1110, "out": 7}])
+            # 봉투가 이상해도 0 으로 답하고 호출을 깨지 않는다
+            self.assertEqual(review._usage_of_oc({"tokens": "이상함"}),
+                             {"usd": 0.0, "in": 0, "out": 0})
+            # 툴 사용은 화면에 보여야 한다 — 메일 분석 프롬프트는 툴이 필요
+            # 없으니 이게 뜨면 메일 본문이 유발했다는 뜻이다
+            events2 = []
+            review._ai_run_stream_oc([script], "TOOL", 30, events2.append)
+            self.assertIn("tool",
+                          [e.get("phase") for e in events2 if e["ev"] == "phase"])
+
+    def test_opencode_stream_plain_fallback_and_errors(self):
+        with tempfile.TemporaryDirectory() as t:
+            script = self._fake_opencode_backend(t)
+            # 셸 래퍼가 --format json 을 삼킨 경우(Windows 의 `bash -lc "…"` 에
+            # `"$@"` 누락) — 진행 표시만 잃고 호출은 성공해야 한다. 이 폴백이
+            # 없으면 잘못된 설정 한 줄이 AI 기능 전체를 죽인다(2026-08-30 실기기
+            # 확인: 그 형태에서 플래그가 $0·$1 이 되어 사라지고 오류도 안 난다).
+            evs = []
+            out = review._ai_run_stream_oc([script], "SWALLOW", 30, evs.append)
+            self.assertEqual(out, "평문 답변입니다")
+            self.assertEqual(evs, [])          # 관측 못 한 것을 지어내지 않는다
+            # exit != 0 → AIError, stderr 가 메시지에 실린다
+            with self.assertRaises(review.AIError) as cm:
+                review._ai_run_stream_oc([script], "FAIL", 30, lambda e: None)
+            self.assertIn("가짜 opencode 오류", str(cm.exception))
+            # exit 0 이어도 error 이벤트는 실패다 — 부분 텍스트를 살리지 않는다
+            with self.assertRaises(review.AIError) as cm2:
+                review._ai_run_stream_oc([script], "ERREV", 30, lambda e: None)
+            self.assertIn("과부하", str(cm2.exception))
+
+    def test_ai_run_routes_opencode_to_its_stream(self):
+        with tempfile.TemporaryDirectory() as t:
+            script = self._fake_opencode_backend(t)
+            events = []
+            out = review.ai_run([script], "질문", timeout=30, retries=0,
+                                on_event=events.append)
+            self.assertEqual(out, "최종 본문")
+            self.assertEqual(events[0], {"ev": "call", "attempt": 1})
+            self.assertTrue(any(e["ev"] == "delta" for e in events))
+            # on_event 없이는 지금까지와 같은 블로킹 경로 — argv 에 --format 을
+            # 붙이지 않으므로 가짜 백엔드가 평문을 낸다
+            self.assertEqual(
+                review.ai_run([script], "질문", timeout=30, retries=0),
+                "평문 답변입니다")
+
+    def test_aitest_timeout_is_per_backend(self):
+        # opencode 는 콜드 스타트만 ~20초다(2026-08-30 실측: 한 단어 답이 3초일
+        # 때도 60초일 때도 있었다). claude 기준 30초로 재면 멀쩡한 백엔드가 늘
+        # '무응답'으로 뜬다 — 그 오판이 '설치가 잘못됐나'로 읽힌다.
+        self.assertEqual(review.aitest_timeout(["claude", "-p"]),
+                         review.AITEST_TIMEOUT)
+        self.assertEqual(
+            review.aitest_timeout(["wsl.exe", "-e", "bash", "-lc",
+                                   'exec opencode run "$@"', "oc"]),
+            review.AITEST_TIMEOUT_OPENCODE)
+        self.assertGreater(review.AITEST_TIMEOUT_OPENCODE,
+                           review.AITEST_TIMEOUT)
+        # 웹 점검과 CLI diagnose 가 같은 함수를 쓴다 — 두 곳에 상수를 적으면
+        # 반드시 갈라진다(백엔드 라우팅을 config.backend_for 로 모은 것과 같은 이유)
+        src = (Path(__file__).resolve().parent.parent / "mailkb")
+        for name in ("web.py", "cli.py"):
+            self.assertIn("aitest_timeout",
+                          (src / name).read_text(encoding="utf-8"))
 
     def test_ai_request_claude_flags_and_holdouts(self):
         # 재도입: --system-prompt·--tools ""·--no-session-persistence·
@@ -17955,12 +18099,21 @@ class TestWeekly(unittest.TestCase):
             with web._weekly_lock:                # 30초 무수신 → 정체 경고 (2d)
                 web._weekly_job.update(running=True, stage="s", date="", error="",
                                        phase="thinking", recv=10, model="m",
-                                       retry="", tail="",
+                                       retry="", tail="", stream=True,
                                        last_ev=time.time() - 45)
             inner, _ = web.render_weekly_status(self.cfg)
             self.assertIn("초째 무수신", inner)
+            # **스트리밍 백엔드일 때만.** last_ev 는 콜 시작(ev:call)으로도 찍히고
+            # 그건 백엔드와 무관하게 오므로, 게이트가 없으면 이벤트가 애초에 0건인
+            # 백엔드가 정상 진행 중에 '무수신'으로 뜬다. opencode 는 콜 하나가
+            # 60초를 넘는 일이 흔해 그게 기본 표시가 됐다(2026-08-30 실측).
+            with web._weekly_lock:
+                web._weekly_job.update(stream=False)
+            inner, _ = web.render_weekly_status(self.cfg)
+            self.assertNotIn("무수신", inner)
             with web._weekly_lock:                # 재시도 안내는 정체보다 우선
-                web._weekly_job.update(retry="호출 실패 — 재시도 1/2 (2초 뒤)")
+                web._weekly_job.update(stream=True,
+                                       retry="호출 실패 — 재시도 1/2 (2초 뒤)")
             inner, _ = web.render_weekly_status(self.cfg)
             self.assertIn("재시도 1/2", inner)
             self.assertNotIn("무수신", inner)
@@ -17968,7 +18121,7 @@ class TestWeekly(unittest.TestCase):
             with web._weekly_lock:
                 web._weekly_job.update(running=False, stage="", date="", error="",
                                        phase="", recv=0, model="", retry="",
-                                       tail="", last_ev=0.0)
+                                       tail="", stream=False, last_ev=0.0)
 
     def test_weekly_status_cancelled_branch(self):
         try:
@@ -18061,7 +18214,7 @@ class TestJobStreamHelpers(unittest.TestCase):
         # 이벤트가 없으면 빈 줄. 모델은 이 줄이 아니라 전용 배지 담당.
         self.assertEqual(web._job_live_line({"last_ev": 0.0}), "")
         st = {"last_ev": time.time(), "phase": "thinking", "recv": 1234,
-              "model": "claude-x", "retry": "", "failed": ""}
+              "model": "claude-x", "retry": "", "failed": "", "stream": True}
         self.assertEqual(web._job_live_line(st), "모델 사고 중 · 수신 1.2KB")
         st["phase"] = "writing"
         self.assertIn("작성 중 · 수신 1.2KB", web._job_live_line(st))
@@ -18074,6 +18227,20 @@ class TestJobStreamHelpers(unittest.TestCase):
         self.assertEqual(web._job_live_line(dict(zero, phase="writing")), "작성 중")
         st["last_ev"] = time.time() - 31
         self.assertIn("초째 무수신", web._job_live_line(st))
+        # 무수신은 **스트리밍 백엔드에만** 묻는다. last_ev 는 콜 시작(ev:call)
+        # 으로도 찍히는데 그건 백엔드와 무관하게 오므로, 게이트가 없으면 이벤트가
+        # 애초에 0건인 백엔드가 정상 진행 중에 이 경고를 받는다.
+        self.assertNotIn("무수신", web._job_live_line(dict(st, stream=False)))
+        # 기준도 백엔드가 정한다 — opencode 는 첫 이벤트가 20~46초 뒤에 온다
+        # (콜드 스타트 + 모델 대기, 2026-08-30 실측). 30초로 재면 정상 구간마다
+        # 경고가 떠 배경음이 된다.
+        self.assertNotIn("무수신",
+                         web._job_live_line(dict(st, stall=web._STALL_SECS_OPENCODE)))
+        self.assertGreater(web._STALL_SECS_OPENCODE, web._STALL_SECS)
+        # opencode 전용 단계 — 메일 분석에 툴이 돌면 그건 화면에 있어야 한다
+        self.assertIn("도구 사용 중",
+                      web._job_live_line(dict(st, phase="tool", recv=0,
+                                              last_ev=time.time())))
         st["retry"] = "호출 실패 — 재시도 1/2 (2초 뒤)"
         self.assertIn("재시도 1/2", web._job_live_line(st))
         self.assertNotIn("무수신", web._job_live_line(st))
