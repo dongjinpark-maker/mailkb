@@ -5190,8 +5190,14 @@ _AI_MARK = {"have": ("●", "있음", "ok"), "ok": ("●", "응답", "ok"),
             # 흐린 색을 쓴다(없음과 같은 계열). '확인 필요'가 아니라 '확인 안 됨'인
             # 이유: 잘 쓰고 있는 사람도 재시작마다 이 줄을 본다(시험 결과가
             # 인메모리다). 사실만 말하고 시키지 않는다.
-            "wrap": ("○", "확인 안 됨", "none")}
+            "wrap": ("○", "확인 안 됨", "none"),
+            # 응답은 왔는데 설정이 안 먹었다 — '응답'으로 적으면 조용한 실패가
+            # 된다. 고장은 아니므로 warn(▲) 이고 처방을 함께 단다.
+            "setup": ("▲", "설정 안 먹음", "warn")}
 _AI_FIX = {
+    "setup": "부른 것은 대답했지만 지정한 설정이 적용되지 않았습니다. 그대로 두면 "
+             "토큰이 몇 배로 나가고 메일 본문에 도구가 열립니다 — "
+             "docs/OPENCODE-WINDOWS.md §1.1 의 자리와 파일 이름을 확인하세요.",
     "fail": "이 AI 가 응답하지 않습니다. 로그인이 풀렸거나 이 모델을 쓸 권한이 "
             "없을 수 있습니다. 위 표에서 다른 AI 로 바꿀 수 있습니다.",
     "slow": "원래 느린 AI 일 수 있으니 한 번 더 눌러 보세요. 계속 이러면 "
@@ -5284,10 +5290,27 @@ def _run_aitest_job(cfg) -> None:
             rows[b["name"]] = ("none", "이 PC 에 설치돼 있지 않습니다")
             continue
         limit = review.aitest_timeout(b["cmd"])
+        # '돌긴 도는데 설정이 안 먹은' 상태는 예외로 안 온다 — 성공 경로의
+        # stderr 에만 있다. 그것을 잡으려고 시험이 존재한다(§1.1).
+        # **opencode 에만 on_event 를 넘긴다.** on_event 가 있으면 ai_run 이
+        # 스트리밍 경로로 가는데, claude 까지 그렇게 하면 점검 콜이 종전 블로킹
+        # 에서 stream-json 으로 바뀐다 — 잘 쓰던 사람에게 없던 위험을 새로 만든다.
+        # 이 신호(setup 경고)를 내는 백엔드는 지금 opencode 뿐이라 대가가 없다.
+        notes: list = []
+
+        def _note(info: dict, _n=notes) -> None:
+            if info.get("ev") == "notice":
+                _n.append(str(info.get("text") or ""))
+
+        watch = _note if review._is_opencode_cmd(b["cmd"]) else None
         try:
             out = review.ai_run(b["cmd"], "한 단어로만 답하라. 정상이면 OK.",
-                                timeout=limit, retries=0)
-            rows[b["name"]] = ("ok", (out.splitlines() or [""])[0][:60])
+                                timeout=limit, retries=0, on_event=watch)
+            line = (out.splitlines() or [""])[0][:60]
+            # 응답했지만 설정이 안 먹었으면 '응답'으로 넘기지 않는다 — 그게
+            # 조용한 실패의 정의다. 색은 warn(▲)이고 처방은 아래 _AI_FIX.
+            rows[b["name"]] = (("setup", notes[0]) if notes
+                               else ("ok", line))
         except review.AITimeout:    # 안 되는 것이 아니라 늦는 것 — 갈라 적는다
             rows[b["name"]] = ("slow", f"{limit}초 안에 응답 없음")
         except Exception as e:      # AIError·AIAuthError·OSError 전부 한 줄로

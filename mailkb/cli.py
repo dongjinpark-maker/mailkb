@@ -956,10 +956,21 @@ def cmd_diagnose(args) -> None:
         print(f"  {name}" + (f" ({roles_s})" if roles_s else "")
               + f" — {' '.join(cmd)}")
         limit = review.aitest_timeout(cmd)   # 백엔드별 — 웹 점검과 같은 값
+        notes: list = []
+
+        def _note(info: dict, _n=notes) -> None:
+            if info.get("ev") == "notice":
+                _n.append(str(info.get("text") or ""))
+
+        # 웹 점검과 같은 이유로 opencode 에만 — on_event 는 실행 경로를 바꾼다
+        watch = _note if review._is_opencode_cmd(cmd) else None
         try:
             out = review.ai_run(cmd, "한 단어로만 답하라. 정상이면 OK.",
-                                timeout=limit, retries=0)
+                                timeout=limit, retries=0, on_event=watch)
             print(f"    ● 응답: {out.splitlines()[0][:60]!r}")
+            # 웹 [응답 시험]과 같은 어휘 — 대답은 왔는데 설정이 안 먹은 상태다
+            for n in notes:
+                print(f"    ▲ 설정 안 먹음: {n}")
         except review.AITimeout:
             # '안 된다'가 아니라 '늦는다' — 웹 점검 화면과 같은 어휘를 쓴다
             print(f"    ▲ 무응답: {limit}초 안에 대답이 없습니다")

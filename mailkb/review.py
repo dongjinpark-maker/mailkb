@@ -712,6 +712,41 @@ def backend_program(cmd: list[str]) -> str:
     return Path(str(cmd[0])).name
 
 
+# 성공했는데 **설정이 안 먹은** 경우 — 여기가 이 저장소에서 가장 값비싼 조용한
+# 실패다. opencode 는 에이전트를 못 찾으면 실패하지 않고 stderr 경고 한 줄만 남긴
+# 채 기본 `build` 로 떨어져 exit 0 으로 끝난다(2026-08-30 실측). 그러면 입력이
+# 1,059 → 7,764 토큰이 되고, 그보다 **도구가 열린 채로 메일 본문이 들어간다** —
+# `--tools ""` 와 전용 에이전트로 막아 온 축이 통째로 열린다.
+#
+# 오류가 아니라 경고라서 예외 경로로는 절대 안 잡힌다. 점검이 stderr 를 봐야 한다.
+_SETUP_WARN_RX = re.compile(r'agent\s+"([^"]+)"\s+not\s+found', re.I)
+
+
+def setup_warning(stderr: str) -> str:
+    """호출은 성공했지만 설정이 안 먹었을 때의 한 줄 — 없으면 빈 문자열.
+
+    성공 경로에서만 쓸모가 있다(실패는 예외가 이미 말한다). 문구는 **무엇이
+    나빠지는지**를 말한다 — '못 찾았다'만으로는 사용자가 넘길 수 있다."""
+    m = _SETUP_WARN_RX.search(stderr or "")
+    if not m:
+        return ""
+    return (f"에이전트 '{m.group(1)}' 를 못 찾아 기본값으로 돌았습니다 — "
+            "도구가 열리고 입력 토큰이 7배입니다 (docs/OPENCODE-WINDOWS.md §1.1)")
+
+
+def _emit_setup_warning(on_event, stderr: str, cmd: list[str]) -> None:
+    """성공했지만 설정이 안 먹었으면 알린다 — 세 실행 경로가 같은 것을 쓴다."""
+    warn = setup_warning(stderr)
+    if not warn:
+        return
+    _log_ai_error({"reason": "setup_warning", "cmd": cmd, "warning": warn})
+    if on_event is not None:
+        try:
+            on_event({"ev": "notice", "text": warn})
+        except Exception:
+            pass
+
+
 # 응답 시험 1콜의 상한 — '안 된다'와 '늦는다'를 가르는 선이다(웹 설정 화면과
 # CLI `diagnose` 가 같은 값을 쓴다. 두 곳에 적으면 반드시 갈라진다).
 AITEST_TIMEOUT = 30
@@ -805,8 +840,14 @@ def _log_ai_error(record: dict) -> None:
         pass
 
 
-def _ai_run_once(cmd: list[str], prompt: str, timeout: int) -> str:
-    """단발 호출. transient 실패는 AIError 로, 설정 문제는 FileNotFoundError 로."""
+def _ai_run_once(cmd: list[str], prompt: str, timeout: int,
+                 on_event=None) -> str:
+    """단발 호출. transient 실패는 AIError 로, 설정 문제는 FileNotFoundError 로.
+
+    on_event 는 **성공 경로의 setup 경고**만 흘린다(`notice`). 이 경로는 원래
+    stderr 를 성공 시 버리는데, opencode 의 에이전트 폴백처럼 '돌긴 도는데 설정이
+    안 먹은' 상태가 거기에만 남는다. 진행 이벤트는 여기서 안 낸다 — 블로킹이라
+    낼 것이 없다."""
     t0 = time.time()
     try:
         proc = subprocess.run(
@@ -846,6 +887,7 @@ def _ai_run_once(cmd: list[str], prompt: str, timeout: int) -> str:
                        "prompt_bytes": len(prompt.encode("utf-8"))})
         # 빈 응답이라도 stderr 에 인증 만료가 찍혀 있으면 그걸로 판정한다
         raise _ai_error("AI 응답이 비어 있음", proc.stderr)
+    _emit_setup_warning(on_event, proc.stderr, cmd)
     return out
 
 
@@ -1086,6 +1128,7 @@ def _ai_run_stream(cmd: list[str], prompt: str, timeout: int,
                        "prompt_bytes": len(prompt.encode("utf-8"))})
         raise _ai_error("AI 응답이 비어 있음: " + (tail or "출력 없음")[:300],
                         "".join(stderr_acc))
+    _emit_setup_warning(emit, "".join(stderr_acc), cmd)
     return out
 
 
@@ -1260,6 +1303,7 @@ def _ai_run_stream_oc(cmd: list[str], prompt: str, timeout: int,
                        "prompt_bytes": len(prompt.encode("utf-8"))})
         raise _ai_error("AI 응답이 비어 있음: " + (tail or "출력 없음")[:300],
                         "".join(stderr_acc))
+    _emit_setup_warning(emit, "".join(stderr_acc), cmd)
     return out
 
 MAIL_EVIDENCE_SYSTEM = """당신은 Minerva의 업무 메일 근거 분석기다.
@@ -1399,7 +1443,7 @@ def ai_run(cmd: list[str], prompt: str, timeout: int = 300, retries: int = 2,
                 if stream and stream_kind == "opencode":
                     return _ai_run_stream_oc(cmd, prompt, timeout, on_event,
                                              cancel)
-                return _ai_run_once(cmd, prompt, timeout)
+                return _ai_run_once(cmd, prompt, timeout, on_event)
             except AIAuthError as e:
                 # 백엔드 전체가 죽은 상태 — 같은 백엔드 재시도(2·4s 백오프)는
                 # 낭비다. 대기 화면엔 failed 로 안내를 남기고 즉시 올린다.

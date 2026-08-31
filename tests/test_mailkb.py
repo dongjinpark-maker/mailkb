@@ -8676,7 +8676,9 @@ class TestAIAuthError(unittest.TestCase):
     def test_ai_run_fails_fast_without_retries(self):
         calls, events = [], []
 
-        def dead(cmd, prompt, timeout):
+        def dead(cmd, prompt, timeout, on_event=None):
+            # on_event 는 성공 경로의 setup 경고용이라 여기선 안 쓴다 —
+            # 시그니처만 맞춘다(2026-08-31 _ai_run_once 에 추가됨).
             calls.append(1)
             raise review.AIAuthError(review.AUTH_DEAD_HINT)
 
@@ -10812,6 +10814,44 @@ class TestWeb(unittest.TestCase):
             "claude")
         self.assertEqual(review.backend_program(["gateway", "--x"]), "gateway")
         self.assertEqual(review.backend_program([]), "")
+
+    def test_setup_warning_is_not_reported_as_a_healthy_response(self):
+        # opencode 는 에이전트를 못 찾아도 **실패하지 않는다** — stderr 경고 한 줄만
+        # 남기고 기본 build 로 떨어져 exit 0 으로 끝난다. 그러면 입력 토큰이 7배가
+        # 되고 메일 본문에 도구가 열린다. 예외 경로로는 절대 안 잡히므로 점검이
+        # 성공 경로의 stderr 를 봐야 한다(2026-08-30 실측).
+        self.assertEqual(review.setup_warning(""), "")
+        warn = review.setup_warning(
+            'agent "minerva" not found. Falling back to default agent')
+        self.assertIn("minerva", warn)
+        self.assertIn("토큰", warn)          # 무엇이 나빠지는지 말한다
+
+        cfg = self._ai_cfg()
+        cfg.ai_backends["internal"] = {"cmd": ["opencode", "run"]}
+
+        def answered_but_warned(cmd, prompt, timeout, on_event=None, cancel=None):
+            if on_event is not None and "opencode" in cmd[0]:
+                on_event({"ev": "notice", "text": warn})
+            return "OK"
+
+        # 두 경로를 다 막는다 — 점검이 on_event 를 넘기면서부터 opencode 는
+        # 스트림 경로로 간다(claude 는 블로킹 그대로).
+        self.addCleanup(self.web._aitest_job.update, rows=None, at="")
+        with mock.patch("shutil.which",
+                        lambda b: "/x/" + b if b in ("claude", "opencode") else None), \
+             mock.patch.object(review, "_ai_run_stream_oc",
+                               side_effect=answered_but_warned), \
+             mock.patch.object(review, "_ai_run_once",
+                               side_effect=answered_but_warned):
+            self.web._run_aitest_job(cfg)
+            page = self.web._ai_status_html(cfg)
+        row = [ln for ln in page.split("\n") if "'ainame'>internal<" in ln][0]
+        self.assertIn("설정 안 먹음", row)
+        self.assertNotIn("● 응답", row)       # '응답'으로 넘기면 조용한 실패다
+        self.assertIn("aifix", page)          # 어떻게 하는지까지
+        # 멀쩡한 백엔드는 그대로 '응답'
+        ok = [ln for ln in page.split("\n") if "'ainame'>sonnet<" in ln][0]
+        self.assertIn("● 응답", ok)
 
     def test_absent_backend_is_a_fact_not_a_warning(self):
         # opencode 는 안 깔린 것이 보통이다 — 경고로 만들면 매번 눈에 걸린다.
