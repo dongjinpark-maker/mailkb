@@ -7365,6 +7365,31 @@ def weekly_files(cfg) -> list[str]:
     return sorted(out, reverse=True)
 
 
+# 주간 md 의 첫 줄 — `# 2026-08-04 ~ 2026-08-31 주간 보고`(weekly.py 가 고정 형식으로
+# 쓴다). 파일 이름은 **만든 날**이라 대상 기간이 아니다 — 4주 보고를 `2026-08-31` 로만
+# 보이면 사용자가 그 한 주짜리로 읽는다(2026-08-31 확인). 화면이 틀린 말을 하진 않지만
+# 틀리게 읽도록 둔다.
+_WEEKLY_SPAN_RX = re.compile(
+    r"^#\s*(\d{4}-\d{2}-\d{2})\s*~\s*(\d{4}-\d{2}-\d{2})")
+
+
+def _weekly_span(md: str) -> str:
+    """주간 md → '2026-08-04 ~ 2026-08-31 (4주)'. 형식이 다르면 빈 문자열.
+
+    주수는 날짜에서 센다 — 파일에 안 적혀 있고, 적으면 두 곳이 갈린다."""
+    m = _WEEKLY_SPAN_RX.match((md or "").lstrip().splitlines()[0]
+                              if (md or "").strip() else "")
+    if not m:
+        return ""
+    a, b = m.group(1), m.group(2)
+    try:
+        days = (date.fromisoformat(b) - date.fromisoformat(a)).days + 1
+    except ValueError:
+        return f"{a} ~ {b}"
+    weeks = max(1, round(days / 7))
+    return f"{a} ~ {b} ({weeks}주)"
+
+
 def render_weekly(cfg, qs, store=None) -> str:
     """기억 › 주간 — 저장된 보고 렌더 + 기간 선택·생성 버튼 + 지난 보고 목록."""
     from . import weekly as weekly_mod
@@ -7408,7 +7433,13 @@ def render_weekly(cfg, qs, store=None) -> str:
         path = cfg.vault / "weekly" / f"{cur}.md"
         try:
             back = f"/records?tab=weekly&date={_q(cur)}"
-            out.append(_md_to_html(path.read_text(encoding="utf-8"), back,
+            md = path.read_text(encoding="utf-8")
+            # 이동 줄은 '어느 보고'(파일 날짜), 부제는 '무엇을 담았나'(대상 기간).
+            # 한 줄에 섞으면 앞뒤 링크와 어휘가 갈린다.
+            span = _weekly_span(md)
+            if span:
+                out.append(f"<p class='dim'>{esc(span)}</p>")
+            out.append(_md_to_html(md, back,
                                    _done_set(store), cards=_cards(cfg)))
             out.append(_done_fold(store, back))
         except OSError:

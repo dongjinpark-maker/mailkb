@@ -18125,6 +18125,29 @@ class TestWeekly(unittest.TestCase):
         self.assertIn("무언가 진행됨", out)
         self.assertNotIn("저장된 주간 보고가 없습니다", out)
 
+    def test_weekly_tab_shows_the_covered_span(self):
+        # 파일 이름은 **만든 날**이지 대상 기간이 아니다. _md_to_html 이 첫 `#` 줄을
+        # 건너뛰는데(일간에선 날짜뿐이라 옳다) 주간은 거기에만 기간이 있어서,
+        # 4주 보고가 화면에 `2026-08-31` 한 줄로만 보였다(2026-08-31 확인).
+        self._saved("2026-08-31",
+                    "# 2026-08-04 ~ 2026-08-31 주간 보고\n\n## 내 차례 (9건)\n- x")
+        out = web.render_weekly(self.cfg, {})
+        self.assertIn("2026-08-04 ~ 2026-08-31 (4주)", out)
+        self.assertIn("2026-08-31", out)      # 이동 줄의 식별자는 그대로
+        # 본문의 첫 `#` 는 여전히 건너뛴다 — 부제와 두 벌이 되면 안 된다
+        self.assertNotIn("<h1>2026-08-04", out)
+        self.assertNotIn("<h2>2026-08-04", out)
+
+    def test_weekly_span_helper_is_quiet_on_other_shapes(self):
+        # 형식이 다르면 **아무 말도 안 한다** — 없는 기간을 지어내면 안 된다.
+        for md in ("# 2026-08-31\n",          # 일간 형식
+                   "",                        # 빈 파일
+                   "본문부터 시작하는 옛 파일\n",
+                   "# 8/4 ~ 8/31 주간 보고\n"):  # 날짜 형식이 다름
+            self.assertEqual(web._weekly_span(md), "", md[:20])
+        self.assertEqual(web._weekly_span("# 2026-08-25 ~ 2026-08-31 주간 보고"),
+                         "2026-08-25 ~ 2026-08-31 (1주)")
+
     def test_weekly_tab_empty_state(self):
         out = web.render_weekly(self.cfg, {})
         self.assertIn("저장된 주간 보고가 없습니다", out)
