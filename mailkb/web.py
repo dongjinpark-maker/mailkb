@@ -2004,6 +2004,8 @@ def format_detail(store, cfg, thread_id: int) -> dict:
             "to_full": to_full,                          # 툴팁 전문(이름 <주소>)
             "attach": _visible_attach(m["attach_names"]),
             "gone": bool(_row_get(m, "gone_at")),
+            # 메일별 플래그(2026-09-02) — 늦은 컬럼이라 구 DB 방어로 _row_get.
+            "flagged": bool(_row_get(m, "flagged")),
             "html": (m["body_html"] or "").strip(),
             "body": (m["new_content"] or "").splitlines(),
         })
@@ -3627,6 +3629,46 @@ _APP_JS = r"""
     m = f && f.getAttribute("action").match(/^\/thread\/(\d+)/);
     return m ? m[1] : null;
   }
+  /* f 의 대상 = **메일 하나**(2026-09-02). 우측에 스레드가 열려 있으면 그 안의
+     커서 메일(msgCurId), 커서가 없으면 첫 메일. 열린 스레드가 없으면 목록 커서
+     행의 메일(행 링크의 ?focus= 가 그 번호다). h(숨김)는 여전히 스레드라
+     toggleRow 와 갈라 둔다 — 한 함수로 묶으면 대상이 다른 것이 안 보인다. */
+  function flagTargetMid() {
+    if (openTid()) {
+      var cur = msgCurId && right.querySelector("#" + msgCurId);
+      var el = cur || right.querySelector(".msg");     /* 커서 없으면 첫 메일 */
+      var m = el && el.id.match(/^msg-(\d+)$/);
+      return m ? m[1] : null;
+    }
+    var rows = navRows(), i = curIdx(rows);
+    if (i < 0) return null;
+    var row = rows[i];
+    var a = (row.matches && row.matches("a[href^='/thread/']")) ? row
+          : (row.querySelector ? row.querySelector("a[href^='/thread/']") : null);
+    var m = a && a.getAttribute("href").match(/[?&]focus=(\d+)/);
+    return m ? m[1] : null;
+  }
+
+  function toggleFlag() {
+    var mid = flagTargetMid();
+    if (!mid) return false;
+    fetch("/mail/" + mid + "/flag-toggle",
+          { method: "POST", headers: { "X-Requested-With": "fetch" } })
+      .then(function (r) { return r.text(); })
+      .then(function (tok) {
+        toast(tokenToast(tok));
+        var tid = openTid();
+        if (tid) {                        /* 우측 상세 동기화 — 그 메일의 배지 */
+          var rsc = right.scrollTop;
+          load("/thread/" + tid, "right", false)
+            .then(function () { right.scrollTop = rsc; })
+            .catch(function () {});
+        }
+      })
+      .catch(function () {});
+    return true;
+  }
+
   function toggleRow(kind) {
     /* 대상 = 우측에 열린 스레드(보고 있는 것) 1순위 — 우측 안에서 다른 스레드로
        이동해 목록 커서와 어긋나도 화면의 메일에 동작한다. 없으면 커서 행. */
@@ -3736,7 +3778,7 @@ _APP_JS = r"""
       e.preventDefault(); i = curIdx(rows);
       focusRow(rows, i < 0 ? rows.length - 1 : Math.max(i - 1, 0));
     } else if (k === "f") {        /* 플래그 토글 */
-      if (toggleRow("flag")) e.preventDefault();
+      if (toggleFlag()) e.preventDefault();
     } else if (k === "h") {        /* 숨김 토글 */
       if (toggleRow("hide")) e.preventDefault();
     } else if (k === "n") {        /* 스레드 안 다음(과거) 메일 */
@@ -4316,7 +4358,7 @@ def render_mail(store, cfg, offset: int = 0, flt: str = "", g: str = "") -> str:
         if flt == "unread":
             tcond += " AND (m.read_at IS NULL OR m.read_at='')"
         elif flt == "flagged":
-            tcond += " AND t.flagged=1"
+            tcond += " AND m.flagged=1"     # 메일 단위(2026-09-02)
         elif flt == "noted":
             # 노트는 스레드 단위다 — 메일함 행(메일)에는 '이 메일의 스레드에
             # 노트가 있다'로 잇는다. 📝 배지가 이미 같은 규칙이다.
@@ -4325,7 +4367,7 @@ def render_mail(store, cfg, offset: int = 0, flt: str = "", g: str = "") -> str:
     # people 조인 하나로 관계 배지 재료까지 같이 — 행당 추가 조회 없음(N+1 방지).
     raw = store.db.execute(
         "SELECT m.id, m.thread_id, m.subject, m.sender_name, m.sender_addr, "
-        "m.sent_on, m.read_at, t.flagged, "
+        "m.sent_on, m.read_at, m.flagged, "
         "p.from_count AS p_from, p.to_count AS p_to, p.first_seen AS p_first "
         "FROM messages m JOIN threads t ON t.id=m.thread_id "
         "LEFT JOIN people p ON p.addr = m.sender_addr "
@@ -4377,7 +4419,7 @@ def render_mail(store, cfg, offset: int = 0, flt: str = "", g: str = "") -> str:
           COALESCE(SUM(CASE WHEN {visible} AND {real} THEN 1 ELSE 0 END),0) total,
           COALESCE(SUM(CASE WHEN {visible} AND {real}
             AND (m.read_at IS NULL OR m.read_at='') THEN 1 ELSE 0 END),0) unread,
-          COALESCE(SUM(CASE WHEN {visible} AND {real} AND t.flagged=1
+          COALESCE(SUM(CASE WHEN {visible} AND {real} AND m.flagged=1
             THEN 1 ELSE 0 END),0) flagged,
           COALESCE(SUM(CASE WHEN {visible} AND {real} AND n.thread_id IS NOT NULL
             THEN 1 ELSE 0 END),0) noted,
@@ -4440,6 +4482,12 @@ def _thread_span_days(first: str, last: str) -> int:
         return 0
 
 
+# 스레드 축의 플래그 — 메일 하나라도 표시돼 있으면 그 스레드는 표시된 것이다.
+# 부분 인덱스(idx_messages_flagged)가 있어 EXISTS 가 싸다.
+_THREAD_HAS_FLAG = ("EXISTS (SELECT 1 FROM messages mf "
+                    "WHERE mf.thread_id = t.id AND mf.flagged = 1)")
+
+
 def render_threads(store, cfg, offset: int = 0, flt: str = "", g: str = "") -> str:
     """스레드 — 메일함과 같은 목록 UI: 제목 [N통] · 마지막 발신인 · 날짜.
 
@@ -4452,11 +4500,16 @@ def render_threads(store, cfg, offset: int = 0, flt: str = "", g: str = "") -> s
     noted = _noted(store, cfg)                # 📝 배지 — 내 노트 있는 스레드
     ncsv = ",".join(str(int(i)) for i in noise_ids)
     nx = f" AND t.id NOT IN ({ncsv})" if noise_ids else ""    # alias t. (행 쿼리·unread)
-    nxb = f" AND id NOT IN ({ncsv})" if noise_ids else ""     # bare id (agg: FROM threads)
+    # 집계는 FROM threads t — 플래그 롤업(_THREAD_HAS_FLAG)이 t 별칭을 요구해
+    # 2026-09-02 부터 테이블에 별칭을 달았다. 그래서 여기도 t.id 다.
+    nxb = f" AND t.id NOT IN ({ncsv})" if noise_ids else ""
     if flt == "hidden":
         cond = "WHERE t.hidden=1"
     elif flt == "flagged":
-        cond = "WHERE t.flagged=1 AND (t.hidden IS NULL OR t.hidden=0)" + nx
+        # 플래그는 메일에 붙는다 — 스레드 축에서는 "표시한 메일이 있나"로 굴린다
+        # (2026-09-02). 캐시 컬럼을 두지 않는 이유: 두 곳이 갈리면 조용히 틀린다.
+        cond = ("WHERE " + _THREAD_HAS_FLAG
+                + " AND (t.hidden IS NULL OR t.hidden=0)" + nx)
     elif flt == "noted":
         # 숨김·노이즈 규칙은 플래그와 **똑같이** 둔다 — 탭마다 다르면 어느 탭에
         # 뭐가 빠지는지 아무도 못 외운다. (숨긴 스레드의 노트는 검색으로 찾는다.)
@@ -4468,7 +4521,8 @@ def render_threads(store, cfg, offset: int = 0, flt: str = "", g: str = "") -> s
     else:
         cond = "WHERE (t.hidden IS NULL OR t.hidden=0)" + nx
     rows = store.db.execute(
-        f"""SELECT t.id, t.flagged, t.hidden, t.first_date, t.last_date,
+        f"""SELECT t.id, {_THREAD_HAS_FLAG} AS flagged,
+                  t.hidden, t.first_date, t.last_date,
                   first.subject, s.message_count AS n,
                   last.sender_name AS last_name, last.sender_addr AS last_addr,
                   last.sent_on AS last_on, last.sent_on AS sent_on,
@@ -4515,9 +4569,10 @@ def render_threads(store, cfg, offset: int = 0, flt: str = "", g: str = "") -> s
         return "".join(items) + more
     # total/미개봉/플래그는 노이즈 제외, 숨김(hid)은 노이즈 포함(복구용).
     agg = store.db.execute(
-        "SELECT COALESCE(SUM(CASE WHEN (hidden IS NULL OR hidden=0)" + nxb + " THEN 1 ELSE 0 END),0) total, "
-        "COALESCE(SUM(CASE WHEN flagged=1 AND (hidden IS NULL OR hidden=0)" + nxb + " THEN 1 ELSE 0 END),0) flag, "
-        "COALESCE(SUM(CASE WHEN hidden=1 THEN 1 ELSE 0 END),0) hid FROM threads").fetchone()
+        "SELECT COALESCE(SUM(CASE WHEN (t.hidden IS NULL OR t.hidden=0)" + nxb + " THEN 1 ELSE 0 END),0) total, "
+        # 플래그는 메일에 붙으므로 스레드 축에서는 EXISTS 로 굴린다(2026-09-02)
+        "COALESCE(SUM(CASE WHEN " + _THREAD_HAS_FLAG + " AND (t.hidden IS NULL OR t.hidden=0)" + nxb + " THEN 1 ELSE 0 END),0) flag, "
+        "COALESCE(SUM(CASE WHEN t.hidden=1 THEN 1 ELSE 0 END),0) hid FROM threads t").fetchone()
     n_unread = store.db.execute(
         "SELECT COUNT(*) c FROM threads t JOIN thread_state s ON s.thread_id=t.id "
         "WHERE s.unread_received_count>0 AND (t.hidden IS NULL OR t.hidden=0)" + nx
@@ -4594,7 +4649,6 @@ def _noted(store, cfg) -> frozenset:
 
 def _actions_bar(tid: int, t, has_attach: bool, decider: str = "",
                  has_note: bool = False, editing: bool = False) -> str:
-    flagged = bool(t["flagged"]) if t else False
     hidden = bool(t["hidden"]) if t else False
     forms: list[str] = []
 
@@ -4603,15 +4657,10 @@ def _actions_bar(tid: int, t, has_attach: bool, decider: str = "",
         forms.append(f"<form method='post' action='/thread/{tid}/{action}'>"
                      f"<button class='{cls}'{tt}>{esc(label)}</button></form>")
 
-    # 플래그: 아이콘으로 유/무 (⚐ 없음 / ⚑ 색 있음)
-    if flagged:
-        forms.append(f"<form method='post' action='/thread/{tid}/unflag'>"
-                     "<button class='iconbtn flag on' title='플래그 해제' "
-                     "aria-label='플래그 해제' aria-pressed='true'>⚑</button></form>")
-    else:
-        forms.append(f"<form method='post' action='/thread/{tid}/flag'>"
-                     "<button class='iconbtn flag' title='플래그' "
-                     "aria-label='플래그' aria-pressed='false'>⚐</button></form>")
+    # 플래그 버튼은 여기 없다(2026-09-02). 표시는 **메일에** 붙으므로 머리에 두면
+    # 버튼 자리와 작용 대상이 어긋난다 — 그게 정확히 종전 불편의 원인이었다.
+    # 메일마다의 토글은 _mail_flag_btn 이 메일 머리글에 단다. 표시된 메일이 있는
+    # 스레드는 **스레드 목록**에서 🚩 로 찾는다(_THREAD_HAS_FLAG).
     # 숨기기: 목록·추적에서 제외, 새 수신 메일이 오면 자동 해제 (숨김 탭에서 복구).
     # 구 '추적 제외'는 2026-07-12 폐지 — 숨기기가 흡수.
     if hidden:
@@ -4657,6 +4706,21 @@ def _mail_analyses(store, mids: set[int]) -> dict[int, dict]:
             out[mid] = {"id": r["id"], "created": r["created"] or "",
                         "basis": int(m.group(1))}
     return out
+
+
+def _mail_flag_btn(flagged: bool, mid: int) -> str:
+    """메일 하나의 플래그 토글 — 분석 버튼과 같은 줄(2026-09-02).
+
+    스레드 머리가 아니라 여기 있는 이유: 표시가 메일에 붙으니 버튼도 그 메일
+    옆이어야 한다. 아이콘으로 유/무를 낸다(⚑ 켜짐 / ⚐ 꺼짐) — 종전 스레드 머리
+    버튼과 같은 어휘라 눈이 옮겨 가기 쉽다."""
+    act = "unflag" if flagged else "flag"
+    on = " on" if flagged else ""
+    label = "플래그 해제" if flagged else "플래그"
+    return (f"<form class='mh-ai' method='post' action='/mail/{int(mid)}/{act}'>"
+            f"<button class='iconbtn flag{on}' title='{label}' "
+            f"aria-label='{label}' aria-pressed='{str(flagged).lower()}'>"
+            f"{'⚑' if flagged else '⚐'}</button></form>")
 
 
 def _mail_ai_controls(store, mid: int, hit: dict | None,
@@ -5008,6 +5072,7 @@ def render_thread(store, cfg, tid: int, qs=None) -> str:
                "폴더로 옮긴 메일입니다. 내용은 여기 남아 있고 미답변 판정에서는 "
                "빠집니다'>Outlook에 없음</span>" if blk.get("gone") else "")
             + f"<span class='mh-when'>{esc(blk['sent_on'])}</span>"
+            f"{_mail_flag_btn(bool(blk.get('flagged')), blk['id'])}"
             f"{_mail_ai_controls(store, blk['id'], analyses.get(blk['id']), tid)}"
             "</div>"
             # 제목이 원문 그대로가 된 뒤로는 사실상 늘 그려진다. 조건은 제목이
@@ -8466,15 +8531,24 @@ def render_records(store, cfg, qs, today: str) -> str:
 
 # ─────────────────────────────────────────────────── 조작(POST) 동작
 
+def _toggle_mail(store, mid: int) -> str:
+    """단축키 f — **메일 하나**의 플래그를 뒤집는다(2026-09-02).
+
+    h(숨김)와 대상이 갈린다: f 는 메일, h 는 스레드다. 표시가 메일에 붙으니
+    단축키도 그래야 한다 — 종전에는 f 가 스레드에 걸려, 14통짜리에서 한 통을
+    표시하면 어느 통이었는지 되찾을 수 없었다.
+    """
+    on = not store.mail_flagged(mid)
+    store.set_mail_flag(mid, on)
+    return "flag:on" if on else "flag:off"
+
+
 def _toggle_thread(store, cfg, tid: int, kind: str) -> str:
-    """목록 단축키(f/h)용 상태 토글 — DB 현재값을 뒤집고 결과 토큰을 돌려준다.
-    버튼(flag/unflag·hide/unhide)과 달리 클라이언트가 상태를 몰라도
-    되게 서버가 판정한다. 토큰(예: 'flag:on')을 app.js 가 상태명 토스트로 매핑."""
-    if kind == "flag":
-        cur = store.thread(tid)
-        on = not (cur and cur["flagged"])
-        store.set_flag(tid, on)
-        return "flag:on" if on else "flag:off"
+    """목록 단축키(h)용 상태 토글 — DB 현재값을 뒤집고 결과 토큰을 돌려준다.
+    버튼(hide/unhide)과 달리 클라이언트가 상태를 몰라도 되게 서버가 판정한다.
+    토큰(예: 'hide:on')을 app.js 가 상태명 토스트로 매핑.
+
+    플래그(f)는 여기 없다 — 메일 단위라 _toggle_mail 이 맡는다."""
     if kind == "hide":
         cur = store.thread(tid)
         on = not (cur and cur["hidden"])
@@ -8676,18 +8750,29 @@ def perform_action(store, cfg, path: str, form: dict) -> str:
             store.set_knowledge_status(kid, "dismissed")
             return back + sep + "msg=" + _q("유보됨")
 
+    # 플래그는 메일에 붙는다(2026-09-02) — 번호는 화면이 이미 쓰는 messages.id 다
+    # (목록 링크의 ?focus=, 스레드 본문의 #msg-<id>). 되돌아갈 곳은 그 메일이 있는
+    # 스레드이고, 그 메일로 스크롤되게 focus 를 붙인다.
+    if len(parts) == 3 and parts[0] == "mail" and parts[2] in ("flag", "unflag"):
+        try:
+            mid = int(parts[1])
+        except ValueError:
+            return "/?msg=" + _q("잘못된 메일")
+        row = store.db.execute(
+            "SELECT thread_id FROM messages WHERE id=?", (mid,)).fetchone()
+        if row is None:
+            return "/?msg=" + _q(f"메일 없음: #{mid}")
+        on = parts[2] == "flag"
+        store.set_mail_flag(mid, on)
+        return (f"/thread/{row['thread_id']}?focus={mid}&msg="
+                + _q("플래그 표시" if on else "플래그 해제"))
+
     if len(parts) == 3 and parts[0] == "thread":
         try:
             tid = int(parts[1])
         except ValueError:
             return "/?msg=" + _q("잘못된 스레드")
         action, back = parts[2], f"/thread/{tid}"
-        if action == "flag":
-            store.set_flag(tid, True)
-            return back + "?msg=" + _q("플래그 표시")
-        if action == "unflag":
-            store.set_flag(tid, False)
-            return back + "?msg=" + _q("플래그 해제")
         if action == "hide":
             # 숨김: 목록·추적에서 제외, 새 수신 메일이 오면 자동 해제
             store.hide_thread(tid, True)
@@ -9137,8 +9222,20 @@ class _Handler(BaseHTTPRequestHandler):
         # (2026-08-15). 짧게 끊고 "다시 눌러 주세요"로 돌려보내는 편이 정직하다.
         store.db.execute(f"PRAGMA busy_timeout={Store.UI_WRITE_WAIT_MS}")
         try:
-            tog = re.match(r"^/thread/(\d+)/(flag|hide)-toggle$", path)
-            if tog:                                   # 목록 단축키(f/h) — 상태 토큰 200
+            # f 와 h 는 **대상이 다르다**(2026-09-02) — f 는 메일, h 는 스레드다.
+            # 한 정규식으로 묶으면 그 차이가 코드에서 안 보인다.
+            tog = re.match(r"^/mail/(\d+)/flag-toggle$", path)
+            if tog:                                   # 목록·스레드 단축키(f)
+                token = _toggle_mail(store, int(tog.group(1)))
+                body = token.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return                                # finally 가 store.close()
+            tog = re.match(r"^/thread/(\d+)/(hide)-toggle$", path)
+            if tog:                                   # 목록 단축키(h)
                 token = _toggle_thread(store, self.cfg, int(tog.group(1)), tog.group(2))
                 body = token.encode("utf-8")
                 self.send_response(200)

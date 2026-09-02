@@ -356,7 +356,7 @@ def _harvest_items(store: Store, cfg: Config, start_day: str, end_day: str,
     그 중복이 기록을 겹치지 않게 store.add_signal 이 (날짜·축·대상·스레드·인용)
     을 열쇠로 거른다.
     """
-    rows, subject_of, flagged = [], {}, set()
+    rows, subject_of, flagged = [], {}, set()   # flagged: 표시된 메일이 있는 스레드
     # 숨긴 스레드는 수확 재료에서 뺀다 — 안 거르면 숨긴 대화의 원문이 프롬프트에
     # 실린다(2026-08-02 점검). 숨긴 스레드만 신규면 blocks 가 비어 AI 콜 자체가
     # 없고 마커도 안 전진한다 — 다음 실행이 재확인할 뿐 비용은 0.
@@ -371,7 +371,11 @@ def _harvest_items(store: Store, cfg: Config, start_day: str, end_day: str,
         if review.thread_kind(cfg, msgs) != "work":
             continue
         subject_of[tid] = msgs[0]["subject"]
-        if t["flagged"]:
+        # 플래그는 **메일**에 붙는다(2026-09-02). 스레드 집합은 정렬용으로만 쓴다 —
+        # 표시된 메일이 든 스레드를 프롬프트 앞으로 보내되, 곁다리로 얹는 것은
+        # 그 스레드 전부가 아니라 표시된 메일뿐이다(종전에는 14통짜리에서 한 통을
+        # 표시하면 14통이 다 실렸다).
+        if any(m["flagged"] for m in msgs):
             flagged.add(tid)
         for m in msgs:
             when = m["sent_on"] or ""
@@ -400,7 +404,7 @@ def _harvest_items(store: Store, cfg: Config, start_day: str, end_day: str,
     # 않는다 — 다음 실행이 다시 싣지만 잃지는 않는다.
     extra, spent = [], 0
     for r in rest:
-        if r[1] not in flagged:
+        if not r[2]["flagged"]:          # 표시된 **그 메일**만 얹는다
             continue
         size = len(r[2]["new_content"] or "")
         if spent + size > HARVEST_FLAG_EXTRA:
@@ -427,10 +431,11 @@ def _harvest_items(store: Store, cfg: Config, start_day: str, end_day: str,
         for m in msgs:
             who = "나" if m["is_sent"] else (m["sender_name"] or m["sender_addr"])
             when = m["sent_on"][5:10] + " " + m["sent_on"][11:16]
-            body += (f"\n  ({when} {who}) "
+            # 🚩 는 스레드 머리가 아니라 **그 메일 줄**에 붙는다 — 스레드에 붙이면
+            # 어느 통이 중요한지 모델도 모른다.
+            body += (f"\n  ({when} {who}){' 🚩' if m['flagged'] else ''} "
                      + smart_truncate((m["new_content"] or "").strip(), _CAP_BODY))
-        blocks.append(f"[#{tid}]{' 🚩' if tid in flagged else ''} "
-                      + subject_of.get(tid, "") + body)
+        blocks.append(f"[#{tid}] " + subject_of.get(tid, "") + body)
     # 워터마크는 **앞머리 끝**이다 — 얹은 플래그 메일은 rest 를 앞지르지 않는다.
     mark = take[-1][0]
     if rest:

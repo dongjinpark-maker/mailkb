@@ -2261,12 +2261,12 @@ class TestStoreOpenIsReadOnly(unittest.TestCase):
         self.addCleanup(st.close)
         st.ingest([_rec("u1", "kim@corp.example", [ME], "건",
                         "2026-08-10T09:00:00")])
-        tid = _nth(st, 1)["thread_id"]
+        mid = _nth(st, 1)["id"]
         self._writer(path)
         st.db.execute("PRAGMA busy_timeout=300")      # do_POST 가 하는 일
         t0 = time.time()
         with self.assertRaises(sqlite3.OperationalError):
-            st.set_flag(tid, True)
+            st.set_mail_flag(mid, True)
         self.assertLess(time.time() - t0, 3.0)        # 30초 대기 금지
 
     def test_old_db_without_late_column_still_opens(self):
@@ -5019,21 +5019,26 @@ class TestHarvest(unittest.TestCase):
         self.assertFalse(self.store.get_state("harvest_owed_from"))
 
     def _flagged_thread(self, mid: str, subject: str, when: str, body: str) -> int:
+        """그 메일 하나에 플래그를 달고 스레드 id 를 준다(2026-09-02: 메일 단위)."""
         self.store.ingest([_rec(mid, "lee@corp.example", [ME], subject,
                                 when, body=body)])
-        tid = self.store.db.execute(
-            "SELECT thread_id t FROM messages WHERE subject=?",
-            (subject,)).fetchone()["t"]
-        self.store.set_flag(tid, True)
-        return tid
+        r = self.store.db.execute(
+            "SELECT id, thread_id t FROM messages WHERE subject=?",
+            (subject,)).fetchone()
+        self.store.set_mail_flag(r["id"], True)
+        return r["t"]
 
     def test_flagged_thread_comes_first_and_is_marked(self):
         ftid = self._flagged_thread("fh1", "플래그건", "2026-07-20T08:00:00",
                                     "중요 사안 초기 논의입니다.")
         items, mark, deferred = distill._harvest_items(
             self.store, self.cfg, "2026-07-20", "2026-07-20", "")
+        # 표시된 메일이 든 스레드가 앞이다(정렬은 종전 그대로)
         self.assertLess(items.index(f"[#{ftid}]"), items.index(f"[#{self.tid}]"))
-        self.assertIn(f"[#{ftid}] 🚩", items)        # 모델이 중요도를 볼 수 있게
+        # 🚩 는 **그 메일 줄**에 붙는다(2026-09-02) — 스레드 머리에 붙이면
+        # 어느 통이 중요한지 모델도 모른다.
+        self.assertNotIn(f"[#{ftid}] 🚩", items)
+        self.assertRegex(items, r"\(07-20 08:00 lee\) 🚩 중요 사안")
         self.assertEqual(deferred, 0)               # 예산이 넉넉하면 아무것도 안 미룬다
         self.assertTrue(mark.startswith("2026-07-20"))
 
@@ -5057,7 +5062,9 @@ class TestHarvest(unittest.TestCase):
             items, mark, deferred = distill._harvest_items(
                 self.store, self.cfg, "2026-07-20", "2026-07-20", "")
         self.assertGreater(deferred, 0)             # 예산이 실제로 물었다
-        self.assertIn(f"[#{ftid}] 🚩", items)        # 그런데도 실렸다
+        # 그런데도 실렸다 — 🚩 는 그 메일 줄에 붙는다(2026-09-02)
+        self.assertIn(f"[#{ftid}]", items)
+        self.assertRegex(items, r"\(07-20 23:00 lee\) 🚩 마감 관련")
         self.assertLess(items.index(f"[#{ftid}]"), 10)   # 맨 앞이다
         # 워터마크는 **앞머리 끝**이지 얹은 플래그 메일 시각이 아니다 —
         # 아니면 그 사이 메일이 통째로 사라진다(이 절의 원래 결함).
@@ -11556,24 +11563,34 @@ class TestWeb(unittest.TestCase):
         self.assertIn("data-more='/mail?unread=1&offset=",
                       web._more_html("/mail?unread=1", 30))
 
-    # ─────────────────── 플래그 (기능 2) — 아이콘 유/무
+    # ─────────────────── 플래그 (기능 2) — **메일 단위**(2026-09-02)
     def test_flag_toggle_action_and_badge(self):
-        tid = _nth(self.store, 1)["thread_id"]
+        # 종전에는 스레드 머리에 토글이 하나 있었다. 14통짜리에서 한 통을 표시하면
+        # 목록 14줄이 같은 배지로 떠 어느 통이었는지 되찾을 수 없었다 — 켤 때 이미
+        # 정보를 버리고 있었다. 이제 버튼이 **메일 머리글**에 있다.
+        row = _nth(self.store, 1)
+        tid, mid = row["thread_id"], row["id"]
         out = self.web.render_thread(self.store, self.cfg, tid)
-        self.assertIn(f"action='/thread/{tid}/flag'", out)       # 플래그 버튼
-        self.assertIn("⚐", out)                                  # 색 없는 flag(미표시)
+        self.assertIn(f"action='/mail/{mid}/flag'", out)          # 메일별 버튼
+        self.assertIn("⚐", out)                                   # 색 없는 flag(미표시)
         self.assertIn("aria-label='플래그' aria-pressed='false'", out)
-        self.web.perform_action(self.store, self.cfg, f"/thread/{tid}/flag", {})
-        self.assertEqual(self.store.thread(tid)["flagged"], 1)
+        # 스레드 머리에는 더 이상 플래그 버튼이 없다
+        self.assertNotIn(f"action='/thread/{tid}/flag'", out)
+
+        self.web.perform_action(self.store, self.cfg, f"/mail/{mid}/flag", {})
+        self.assertTrue(self.store.mail_flagged(mid))
         out2 = self.web.render_thread(self.store, self.cfg, tid)
-        self.assertIn(f"action='/thread/{tid}/unflag'", out2)     # 이제 해제 버튼
-        self.assertIn("flag on", out2)                            # 색 있는 flag(표시)
+        self.assertIn(f"action='/mail/{mid}/unflag'", out2)        # 이제 해제 버튼
+        self.assertIn("flag on", out2)                             # 색 있는 flag(표시)
         self.assertIn("⚑", out2)
         self.assertIn("aria-label='플래그 해제' aria-pressed='true'", out2)
+        # 스레드 축은 롤업 — 표시한 메일이 있는 스레드가 목록에 뜬다
         self.assertIn("🚩", self.web.render_threads(self.store, self.cfg, flt="flagged"))
         # 해제
-        self.web.perform_action(self.store, self.cfg, f"/thread/{tid}/unflag", {})
-        self.assertEqual(self.store.thread(tid)["flagged"], 0)
+        self.web.perform_action(self.store, self.cfg, f"/mail/{mid}/unflag", {})
+        self.assertFalse(self.store.mail_flagged(mid))
+        self.assertIn("🚩 플래그 0", self.web.render_threads(
+            self.store, self.cfg, flt="flagged"))    # 탭 라벨의 🚩 는 늘 있다
 
     def test_threads_bold_reflects_read_state(self):
         # 스레드 목록 볼드 = 실제 미개봉 (메일함과 동일 규칙)
@@ -11585,11 +11602,63 @@ class TestWeb(unittest.TestCase):
         self.assertIn("class='mrow read'", out2)       # 다 읽음 → 볼드 해제
         self.assertNotIn("class='mrow'>", out2)
 
+    def test_flag_marks_only_that_mail_not_its_siblings(self):
+        # 이 변경의 이유 그 자체 — 종전에는 형제 줄이 전부 같은 배지로 떠서
+        # 어느 통을 표시했는지 되찾을 수 없었다(사용자 보고).
+        self.store.ingest([
+            _rec("sib1", "lee@corp.example", [ME], "형제건",
+                 "2026-07-07T09:00:00"),
+            _rec("sib2", "lee@corp.example", [ME], "RE: 형제건",
+                 "2026-07-07T10:00:00", reply_to="sib1"),
+            _rec("sib3", "lee@corp.example", [ME], "RE: 형제건",
+                 "2026-07-07T11:00:00", reply_to="sib2")])
+        ids = [r["id"] for r in self.store.db.execute(
+            "SELECT id FROM messages WHERE subject LIKE '%형제건' ORDER BY id")]
+        self.assertEqual(len(ids), 3)
+        self.store.set_mail_flag(ids[1], True)          # 가운데 한 통만
+
+        out = self.web.render_mail(self.store, self.cfg, flt="flagged")
+        self.assertEqual(out.count(f"?focus={ids[1]}'"), 1)
+        for other in (ids[0], ids[2]):
+            self.assertNotIn(f"?focus={other}'", out)   # 형제는 안 걸린다
+        self.assertIn("🚩 플래그 1", out)                # 3 이 아니라 1
+
+    def test_old_db_without_flag_column_still_opens(self):
+        # 늦은 컬럼 규칙(불변식 5) — _SCHEMA 에 인덱스를 두면 구 DB 가 아예
+        # 안 열린다(2026-08-13 ingest_seq 사례). 컬럼도 인덱스도 늦게 만든다.
+        import sqlite3 as sq
+        path = Path(self.tmp.name) / "old.sqlite"
+        self.store.db.commit()
+        # WAL 이라 커밋만으로는 본 파일에 안 내려간다 — 체크포인트 없이 복사하면
+        # 스키마가 통째로 빠진 사본이 나온다(no such table: messages).
+        self.store.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        shutil.copy(Path(self.tmp.name) / "t.sqlite", path)
+        db = sq.connect(path)
+        db.execute("DROP INDEX IF EXISTS idx_messages_flagged")   # 인덱스 먼저
+        for c in ("flagged_at", "flagged"):
+            db.execute(f"ALTER TABLE messages DROP COLUMN {c}")
+        db.commit(); db.close()
+
+        st = Store(path, [ME])
+        try:
+            cols = {r["name"] for r in st.db.execute("PRAGMA table_info(messages)")}
+            self.assertIn("flagged", cols)
+            self.assertIn("flagged_at", cols)
+            self.assertTrue(st.db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' "
+                "AND name='idx_messages_flagged'").fetchone())
+            mid = st.db.execute("SELECT id FROM messages LIMIT 1").fetchone()["id"]
+            st.set_mail_flag(mid, True)
+            self.assertTrue(st.mail_flagged(mid))
+        finally:
+            st.close()
+
     def test_threads_flag_filter_only_flagged(self):
+        # 플래그는 메일에 붙지만 **스레드 축에서는 롤업**이다(2026-09-02) —
+        # 표시한 메일이 하나라도 있으면 그 스레드가 목록·필터·카운트에 뜬다.
         self.store.ingest([_rec("f2", "lee@corp.example", [ME], "다른 건",
                                 "2026-07-06T09:00:00")])
-        tid = _nth(self.store, 1)["thread_id"]
-        self.store.set_flag(tid, True)
+        self.store.set_mail_flag(_nth(self.store, 1)["id"], True)
         out = self.web.render_threads(self.store, self.cfg, flt="flagged")
         self.assertIn("검토 요청", out)        # 플래그된 것
         self.assertNotIn("다른 건", out)        # 미플래그 제외
@@ -15480,13 +15549,15 @@ class TestSignalDismiss(unittest.TestCase):
 
 
     def test_toggle_flag_and_hide_flip(self):
+        # f 와 h 는 **대상이 다르다**(2026-09-02) — f 는 메일, h 는 스레드다.
         tid = self._seed()
-        self.assertEqual(web._toggle_thread(self.store, self.cfg, tid, "flag"),
-                         "flag:on")
-        self.assertEqual(self.store.thread(tid)["flagged"], 1)
-        self.assertEqual(web._toggle_thread(self.store, self.cfg, tid, "flag"),
-                         "flag:off")
-        self.assertEqual(self.store.thread(tid)["flagged"], 0)
+        mid = self.store.db.execute(
+            "SELECT id FROM messages WHERE thread_id=? ORDER BY id LIMIT 1",
+            (tid,)).fetchone()["id"]
+        self.assertEqual(web._toggle_mail(self.store, mid), "flag:on")
+        self.assertTrue(self.store.mail_flagged(mid))
+        self.assertEqual(web._toggle_mail(self.store, mid), "flag:off")
+        self.assertFalse(self.store.mail_flagged(mid))
         self.assertEqual(web._toggle_thread(self.store, self.cfg, tid, "hide"),
                          "hide:on")
         self.assertEqual(self.store.thread(tid)["hidden"], 1)

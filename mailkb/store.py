@@ -5,7 +5,7 @@
 
 다만 이 파일에는 **재수집으로 복구되지 않는 것**도 함께 들어 있다 —
 knowledge_candidates(암묵지 후보) · ask_cache(분석 이력) · people_dossier(인물 요약) ·
-action_overrides(신호 해제) · threads.flagged/hidden(플래그·숨김).
+action_overrides(신호 해제) · messages.flagged(플래그) · threads.hidden(숨김).
 그래서 db.sqlite 삭제는 백업 없이 되돌릴 수 없다. 연 200~300MB, 백업은 파일 복사 한 번.
 """
 
@@ -608,6 +608,13 @@ class Store:
             # 적재 순서(messages DDL 주석 참고). 구 DB 는 id 가 곧 적재 순서였으므로
             # 아래에서 id 로 되메운다 — 그게 정확히 옳은 값이다.
             ("messages", "ingest_seq", "INTEGER"),
+            # 플래그를 스레드에서 메일로 내렸다(2026-09-02). threads.flagged 는
+            # 죽었다 — 읽는 곳이 없다. 키를 messages.id 로 잡는 근거: sync 는 이미
+            # 있는 message_id 를 건너뛰므로(ingest 의 멱등 계약) 한 번 붙은 번호가
+            # 그 DB 안에서 안 바뀐다. flagged_at 은 지금 읽는 곳이 없지만, 나중에
+            # '최근 표시순'이 필요할 때 없으면 못 만든다.
+            ("messages", "flagged", "INTEGER DEFAULT 0"),
+            ("messages", "flagged_at", "TEXT"),
         )
         for table, col, decl in specs:
             cols = {r["name"] for r in
@@ -648,6 +655,9 @@ class Store:
                 "AND name='messages'").fetchone():
             self.db.execute("CREATE INDEX IF NOT EXISTS "
                             "idx_messages_ingest_seq ON messages(ingest_seq)")
+            # 플래그는 전체의 극소수라 부분 인덱스가 크기·갱신 비용 모두 유리하다.
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_messages_flagged "
+                            "ON messages(flagged) WHERE flagged=1")
 
     def _is_hard_noise(self, sender: str, subject: str) -> bool:
         """액션 fold 가 무시할 확실한 노이즈 메시지인가 (판정자 없으면 항상 False)."""
@@ -1748,7 +1758,9 @@ class Store:
         if "received" in fl:
             conds.append("m.is_sent = 0")
         if "flagged" in fl:
-            conds.append("COALESCE(t.flagged, 0) = 1")
+            # 메일 단위다(2026-09-02) — 종전에는 t.flagged 라 표시한 메일의
+            # 형제까지 전부 걸렸다. DSL 문법(is:flagged)은 그대로다.
+            conds.append("COALESCE(m.flagged, 0) = 1")
         if q.has_attach:
             conds.append("m.attach_names != ''")
         for f in q.files:
@@ -2264,12 +2276,28 @@ class Store:
             "DELETE FROM action_overrides WHERE thread_id=?", (thread_id,))
         self.db.commit()
 
-    def set_flag(self, thread_id: int, on: bool) -> None:
-        """수동 플래그(중요 표시) 설정/해제."""
+    def set_mail_flag(self, message_id: int, on: bool) -> None:
+        """수동 플래그(중요 표시)를 **메일 하나**에 설정/해제 (2026-09-02).
+
+        종전에는 스레드에 붙었다. 14통짜리 스레드에서 한 통을 표시하면 목록의
+        14줄이 전부 같은 배지로 떠, **어느 통을 표시했는지 되찾을 방법이 없었다**
+        (사용자 보고). 켤 때 이미 정보를 버리고 있었다.
+
+        키가 messages.id 인 근거: sync 는 이미 있는 message_id 를 건너뛰므로
+        (ingest 의 멱등 계약) 한 번 붙은 번호는 그 DB 안에서 안 바뀐다.
+        """
         self.db.execute(
-            "UPDATE threads SET flagged=? WHERE id=?", (1 if on else 0, thread_id)
-        )
+            "UPDATE messages SET flagged=?, flagged_at=? WHERE id=?",
+            (1 if on else 0,
+             datetime.now().strftime("%Y-%m-%dT%H:%M:%S") if on else None,
+             message_id))
         self.db.commit()
+
+    def mail_flagged(self, message_id: int) -> bool:
+        """그 메일이 표시돼 있나 — 토글이 현재값을 뒤집을 때 쓴다."""
+        r = self.db.execute("SELECT flagged FROM messages WHERE id=?",
+                            (message_id,)).fetchone()
+        return bool(r and r["flagged"])
 
     def hide_thread(self, thread_id: int, on: bool) -> None:
         """숨김 설정/해제. 숨기면 추적(미답변·개입)·메일함·스레드 기본목록과
