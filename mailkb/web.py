@@ -3527,10 +3527,13 @@ _APP_JS = r"""
             rt.style.setProperty("--read-zoom", String(fv / 16));
           }
         }
-        /* 스레드 상태 변경(플래그·숨김·신호 해제/복원)은 왼쪽(홈·메일함·
-           스레드 목록)에도 즉시 반영 — 큐·탭 카운트·확인 후보가 같이 갱신된다 */
+        /* 상태 변경(플래그·숨김·신호 해제/복원)은 왼쪽(홈·메일함·스레드 목록)
+           에도 즉시 반영 — 큐·탭 카운트·배지가 같이 갱신된다.
+           **플래그는 /mail/… 이다**(2026-09-02 메일 단위) — 여기를 /thread/ 로만
+           두면 표시해도 왼쪽 숫자가 그대로라 "반영이 안 된다"로 보인다. */
         if (leftCur &&
-            /\/thread\/\d+\/(flag|unflag|hide|unhide|note-save)$/.test(action)) {
+            (/\/thread\/\d+\/(hide|unhide|note-save)$/.test(action)
+             || /\/mail\/\d+\/(flag|unflag)$/.test(action))) {
           var sc = left.scrollTop;
           load(leftCur, "left", false)
             .then(function () { left.scrollTop = sc; })   /* 스크롤 유지 */
@@ -3635,8 +3638,11 @@ _APP_JS = r"""
      toggleRow 와 갈라 둔다 — 한 함수로 묶으면 대상이 다른 것이 안 보인다. */
   function flagTargetMid() {
     if (openTid()) {
-      var cur = msgCurId && right.querySelector("#" + msgCurId);
-      var el = cur || right.querySelector(".msg");     /* 커서 없으면 첫 메일 */
+      /* 선택자는 msgNav 와 **같아야 한다** — 갈리면 n/p 가 도는 목록과 f 가
+         고르는 목록이 달라진다(스레드 밖에 .msg 가 생기는 순간 어긋난다). */
+      var msgs = right.querySelectorAll(".mthread .msg");
+      var cur = msgCurId && right.querySelector(".mthread #" + msgCurId);
+      var el = cur || msgs[0];                         /* 커서 없으면 첫 메일 */
       var m = el && el.id.match(/^msg-(\d+)$/);
       return m ? m[1] : null;
     }
@@ -3662,6 +3668,13 @@ _APP_JS = r"""
           var rsc = right.scrollTop;
           load("/thread/" + tid, "right", false)
             .then(function () { right.scrollTop = rsc; })
+            .catch(function () {});
+        }
+        /* 왼쪽도 — 탭 카운트와 목록 배지가 같이 움직여야 한다(폼 경로와 동일) */
+        if (leftCur) {
+          var lsc = left.scrollTop;
+          load(leftCur, "left", false)
+            .then(function () { left.scrollTop = lsc; })
             .catch(function () {});
         }
       })

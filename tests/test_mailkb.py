@@ -11602,6 +11602,22 @@ class TestWeb(unittest.TestCase):
         self.assertIn("class='mrow read'", out2)       # 다 읽음 → 볼드 해제
         self.assertNotIn("class='mrow'>", out2)
 
+    def test_flag_action_refreshes_the_left_panel(self):
+        # 라우트를 /thread/…/flag 에서 /mail/…/flag 로 옮기면서 app.js 의 좌측
+        # 재렌더 조건에서 빠졌다 — 표시해도 왼쪽 카운트·배지가 그대로라
+        # "반영이 안 된다"로 보였다(2026-09-02 사용자 보고). 서버는 정상이었고
+        # 새로고침하면 맞았다. 이 어긋남은 조용해서 테스트로 막는다.
+        js = self.web._APP_JS
+        self.assertIn("/\\/mail\\/\\d+\\/(flag|unflag)$/.test(action)", js)
+        # 숨김은 여전히 스레드 경로다 — 두 대상이 갈린 것이 코드에 남아야 한다
+        self.assertIn("/\\/thread\\/\\d+\\/(hide|unhide|note-save)$/.test(action)", js)
+        self.assertNotIn("thread\\/\\d+\\/(flag|unflag|hide", js)   # 옛 묶음
+        # f 키 경로도 좌측을 다시 그린다(폼 경로와 같은 계약)
+        self.assertEqual(js.count('load(leftCur, "left", false)'), 2)
+        # f 가 고르는 목록과 n/p 가 도는 목록은 같은 선택자여야 한다 —
+        # 갈리면 커서와 대상이 어긋난다(스레드 밖 .msg 가 생기는 순간).
+        self.assertEqual(js.count('querySelectorAll(".mthread .msg")'), 2)
+
     def test_flag_marks_only_that_mail_not_its_siblings(self):
         # 이 변경의 이유 그 자체 — 종전에는 형제 줄이 전부 같은 배지로 떠서
         # 어느 통을 표시했는지 되찾을 수 없었다(사용자 보고).
@@ -11856,8 +11872,10 @@ class TestWeb(unittest.TestCase):
         self.assertIn("noteLeft", js)
         self.assertIn("isTrusted", js)                 # 마우스 클릭 → 키보드 커서 동기화
         self.assertIn('classList.contains("selected")', js)  # curIdx 선택 항목 폴백
-        # 스레드 상태 변경(플래그·숨김) 시 왼쪽 목록 즉시 갱신
-        self.assertIn("flag|unflag|hide|unhide", js)
+        # 상태 변경(플래그·숨김) 시 왼쪽 목록 즉시 갱신 — 2026-09-02 부터 플래그는
+        # /mail/… 이라 두 갈래다(자세한 계약은 test_flag_action_refreshes_the_left_panel)
+        self.assertIn("hide|unhide|note-save", js)
+        self.assertIn("(flag|unflag)$", js)
         self.assertNotIn("signal-off", js)   # 신호 UI 제거(2026-07-30)
 
     def test_appjs_fh_toggle_keys(self):
