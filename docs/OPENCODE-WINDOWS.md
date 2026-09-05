@@ -36,7 +36,8 @@ effort_flag = "--variant"      # opencode의 추론 강도: high / max / minimal
 ### `/var/tmp/minerva-oc/.opencode/agent/minerva.md` (WSL 안)
 
 **손으로 쓰지 않는다** — 저장소가 나르는 것을 이름만 바꿔 복사한다. 내용이 저장소와
-어긋나면 도구 목록이 조용히 낡는다.
+어긋나면 도구 목록이 조용히 낡는다. 저장소 파일이 바뀌어도 **복사본은 따라오지
+않는다** — 그때마다 아래 `cp` 를 다시 돌린다.
 
 ```bash
 mkdir -p /var/tmp/minerva-oc/.opencode/agent
@@ -51,26 +52,15 @@ cp /mnt/c/<저장소>/tools/opencode/minerva-agent.md \
 description: Minerva 메일 분석 전용 — 도구 없이 주어진 텍스트만 읽는다
 mode: primary
 tools:
-  bash: false
-  edit: false
-  write: false
-  read: false
-  grep: false
-  glob: false
-  list: false
-  patch: false
-  apply_patch: false
-  batch: false
-  task: false
-  todowrite: false
-  todoread: false
-  question: false
-  webfetch: false
-  lsp: false
-  skill: false
+  "*": false          # 이름을 하나씩 적지 않는다 — 목록은 낡는다
 ---
 주어진 텍스트만 읽고 답한다. 도구를 쓰지 않는다. 파일·셸·네트워크에 접근하지 않는다.
 ```
+
+**도구를 하나씩 적지 않는다.** 2026-09-05 까지는 17개를 열거했는데, 그 목록에
+`websearch` 가 없어 계속 켜져 있었고(이름이 `webfetch` 가 아니다) 적어 둔 것 중
+6개는 존재하지도 않는 이름이었다. MCP 를 쓰면 그 도구들은 애초에 이름을 모른다.
+`"*": false` 한 줄이 셋을 함께 닫는다 — 열거는 반드시 낡는다.
 
 claude 백엔드의 `--tools ""`에 해당한다(`review._ai_request`). opencode는 그 채널이
 없어 에이전트 파일로 같은 일을 한다. 분석(`ask`)은 한 질문에 최대 12콜이라 이 차이가
@@ -82,7 +72,7 @@ claude 백엔드의 `--tools ""`에 해당한다(`review._ai_request`). opencode
 |---|---|
 | 아무것도 안 함(기본 `build`) | 7,765 |
 | 설정 `tools` 키로 도구만 끄기 | 2,909 |
-| **전용 에이전트**(이 절) | **1,059** |
+| **전용 에이전트**(이 절, 열거식으로 잰 값) | **1,059** |
 
 가운데 줄은 **검토했으나 안 쓴 길**이다. opencode 설정 스키마에 최상위 `tools`
 (`{도구이름: false}`)가 있어 `--agent` 없이 JSON 한 장으로 끌 수 있다 — 그런데 절반만
@@ -90,6 +80,24 @@ claude 백엔드의 `--tools ""`에 해당한다(`review._ai_request`). opencode
 몫은 도구가 아니라 `build` 에이전트 정의 자체가 싣는 것이라 에이전트를 갈아야 사라진다.
 설정을 **전역**(`~/.config/opencode/opencode.jsonc`)에 두는 길도 있지만, 그러면
 사용자가 opencode 로 코딩할 때도 도구가 꺼진다 — mailkb 만 조용해야 한다.
+
+표는 2026-08-30 회사 PC(wsl.exe 다리) 값이다. 2026-09-05 에 이 WSL 에서 다시 재니
+열거식 1,049 → `"*": false` 154 였다. 모델도 환경도 달라 위 표와 직접 비교할 수는
+없지만, 열거가 남기던 몫이 실재한다는 것은 같다.
+
+**MCP 를 쓴다면 한 줄 더 있다.** 전역 설정에 MCP 서버가 있으면 `opencode run` 이 콜마다
+그 서버를 띄운다 — `--pure` 는 플러그인만 끄지 MCP 는 안 끈다(실측). 도구가 프롬프트에
+실리는 것은 `"*": false` 가 막지만 **프로세스가 뜨는 것은 못 막는다.** 그것까지 끄려면
+에이전트 폴더 옆에 설정을 둔다.
+
+`/var/tmp/minerva-oc/.opencode/opencode.json`
+
+```json
+{ "mcp": { "<서버이름>": { "enabled": false } } }
+```
+
+이름은 `opencode mcp list` 로 확인한다 — 거기 아무것도 안 뜨면 **이 파일도 만들지
+않는다.** 없는 이름을 적는 것은 무해하지만, JSON 이 깨지면 콜이 exit 1 로 죽는다.
 
 ### 1.1 함정 둘 — 둘 다 조용하다
 
