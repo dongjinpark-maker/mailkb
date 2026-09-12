@@ -11217,6 +11217,39 @@ class TestWeb(unittest.TestCase):
         # 메일 원본 HTML 은 인라인 pt 가 상속을 이김 — zoom 비례 확대 + 이중 확대 방지
         self.assertIn(".mailhtml { font-size: 16px; zoom: var(--read-zoom, 1); }", css)
 
+    def test_css_lets_a_wide_table_scroll_inside_the_card(self):
+        # 넓은 표가 스크롤바도 없이 잘렸다(2026-09-12 실측: 창 1280px 에서 18열 표
+        # 1042px 대 본문 819px). 원인은 `.msg` 의 overflow:hidden — 둥근 모서리용
+        # 인데 넘친 가로 내용까지 삼켰고, 바깥 #right(overflow-x:auto)까지 넘침이
+        # 닿지 않았다. 스크롤은 **본문에** 둔다: 카드 모서리를 지키면서 넘침만 받는다.
+        css = self.web._CSS
+        self.assertIn(".msg .mbody { overflow-x: auto; }", css)
+        self.assertIn(".msg .mbody { padding: 12px 14px; "
+                      "font-size: var(--read-fs, 16px); }", css)   # 기존 규칙 온전
+        self.assertIn(".msg .mbody table.tblwide { min-width: max-content; }", css)
+        # 버튼은 .mailhtml 안에 꽂히므로 다크 평탄화에서 제 색을 되찾아야 한다
+        self.assertIn(":root[data-theme='dark'] .mailhtml .tblwbtn", css)
+
+    def test_wide_table_button_measures_instead_of_guessing(self):
+        # '표 펴기'는 판정하지 않는다 — 버튼을 보일지만 정하고, 그 기준은 겉모습이
+        # 아니라 그려진 폭이다. 속성 휴리스틱은 기각됐다(실측: role·cellpadding 으로
+        # 가르면 문단이 든 데이터 표가 2042px 한 줄이 됐다).
+        js = self.web._APP_JS
+        self.assertIn("hookWideTables(el);", js)              # fragment 주입 경로
+        self.assertIn("hookWideTables(document)", js)         # 서버가 그린 첫 화면
+        self.assertIn("getBoundingClientRect().width > avail + 1", js)
+        self.assertIn("tblwide", js)
+        self.assertIn("tblwbtn", js)
+        # 중첩 표는 가장 안쪽만 — 조판표 안 데이터 표에서 바깥까지 펴면 글이 늘어난다
+        self.assertIn("t.contains(cut[k])", js)
+        # 판정 기준이 실측 하나임을 못박는다 — 선택자로 표 종류를 맞히는 코드가
+        # 들어오면 이 단정이 깨진다(주석에는 기각 이력이 남아 있어 문자열 검사로는
+        # 가를 수 없다).
+        hook = js.split("function wideTablesIn", 1)[1].split("function addWideBtn", 1)[0]
+        self.assertIn("getBoundingClientRect", hook)
+        for attr in ('[role=', '[cellpadding', '[border', '[width'):
+            self.assertNotIn(attr, hook, msg=attr)
+
     def test_inline_assets_have_no_mangled_octal_escapes(self):
         # _CSS·report.CSS·REPORT_JS 는 raw 문자열이 아니다(_APP_JS 만 r""").
         # CSS 이스케이프를 `\201C` 로 쓰면 파이썬이 \201 을 8진수로 먹어 제어문자

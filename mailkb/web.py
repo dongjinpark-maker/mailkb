@@ -808,6 +808,26 @@ details.mynote .ihint { cursor: help; color: var(--ink-3); font-size: 12px; }
    현행(본문 16px 상속·pre 13px 모노)과 동일해 시각 변화 없음. 크롬(mhead·칩)은 고정. */
 .msg .mbody { padding: 12px 14px; font-size: var(--read-fs, 16px); }
 .msg .mbody pre { font-size: var(--read-fs, 13px); }
+/* 넓은 표는 잘리지 말고 밀려야 한다(2026-09-12). `.msg` 의 overflow:hidden 은
+   둥근 모서리용인데, 표가 카드보다 넓으면 넘친 열을 **스크롤바도 없이** 삼켰다
+   (실측: 창 1280px 에서 18열 표 1042px 대 본문 819px — 223px 이 사라졌다).
+   바깥 #right 는 overflow-x:auto 지만 `.msg` 가 먼저 잘라 넘침이 거기 닿지 않는다.
+   스크롤을 **본문에** 두는 이유: 카드 테두리·모서리를 지키면서 넘침만 받는다. */
+.msg .mbody { overflow-x: auto; }
+/* 눌린 표를 원래 폭으로 — 사람이 누른 표에만. 자동 판정은 기각했다: 속성만으로는
+   숫자표와 조판표를 못 가른다(실측 — 표 전체에 max-content 를 주면 평범한 안내
+   메일이 가로로 늘어났고, role·cellpadding 휴리스틱은 문단이 든 데이터 표를
+   2042px 한 줄로 만들었다). 버튼은 app.js hookWideTables 가 **실제로 넘치는**
+   표에만 단다 — 겉모습이 아니라 그려진 폭을 잰다. */
+.msg .mbody table.tblwide { min-width: max-content; }
+.tblwbtn { font-size: 12px; padding: 1px 9px; margin: 0 0 4px; cursor: pointer;
+    color: var(--accent); background: var(--surface); border: 1px solid var(--border-strong);
+    border-radius: 12px; }
+.tblwbtn:hover { background: var(--hover-bg); border-color: var(--accent); }
+/* 버튼은 .mailhtml 안(표 바로 위)에 꽂히므로 다크 평탄화 대상이 된다 — .sighide
+   와 같은 방식으로 제 색을 되찾는다(특이도 (0,4,0) > 평탄화 (0,3,0)). */
+:root[data-theme='dark'] .mailhtml .tblwbtn { color: var(--accent) !important;
+    background: var(--surface) !important; border-color: var(--border-strong) !important; }
 /* 메일 원본 HTML 은 인라인 font-size(pt)가 상속을 이긴다 — zoom 으로 블록째 비례
    확대(제목·본문 위계 유지). 16px 고정은 이중 확대(상속 확대 × zoom) 방지. */
 .mailhtml { font-size: 16px; zoom: var(--read-zoom, 1); }
@@ -2678,6 +2698,7 @@ _APP_JS = r"""
     hookAitestPolling(el);
     hookMore();
     hookThreadHead();
+    hookWideTables(el);
     chatBottom(el);                               /* 대화록은 최신(맨 아래)으로 */
   }
 
@@ -2702,6 +2723,53 @@ _APP_JS = r"""
       head.classList.toggle("stuck", !entries[0].isIntersecting);
     }, { root: right, threshold: 0 });
     _thObs.observe(sen);
+  }
+
+  /* ---- 넓은 표 '펴기' ------------------------------------------------------
+     표가 본문보다 넓으면 `.mbody` 가 가로로 스크롤한다(CSS). 그래도 브라우저는
+     열을 최소 폭까지 눌러 넣어 한글이 한 자씩 쪼개지는 일이 잦다. 그 표만 원래
+     폭으로 펴는 버튼을 단다.
+     **판정하지 않는다** — 버튼을 보일지만 정한다. 기준은 겉모습(role·cellpadding)
+     이 아니라 실측이다: 지금 그려진 표가 본문 내용 폭보다 넓은가.
+     offsetWidth 가 아니라 rect 폭을 쓰는 이유: .mailhtml 은 zoom 이 걸려 있어
+     두 값의 좌표계가 다르다(rect 는 둘 다 화면 px).
+     중첩 표는 **가장 안쪽**에만 단다 — 조판표 안에 데이터 표가 든 알림 메일에서
+     바깥까지 펴면 글이 한 줄로 늘어난다.
+     기억하지 않는다: 다시 열면 접힌 상태다(지금 이 숫자를 보려는 일회성 동작). */
+  function hookWideTables(el) {
+    var root = el && el.querySelectorAll ? el : document;
+    var bodies = root.querySelectorAll(".msg .mbody");
+    for (var i = 0; i < bodies.length; i++) wideTablesIn(bodies[i]);
+  }
+
+  function wideTablesIn(mb) {
+    var cs = getComputedStyle(mb);
+    var avail = mb.getBoundingClientRect().width
+      - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0);
+    var all = mb.querySelectorAll("table"), cut = [];
+    for (var i = 0; i < all.length; i++)
+      if (all[i].getBoundingClientRect().width > avail + 1) cut.push(all[i]);
+    for (var j = 0; j < cut.length; j++) {
+      var t = cut[j], outer = false;
+      for (var k = 0; k < cut.length; k++)
+        if (cut[k] !== t && t.contains(cut[k])) { outer = true; break; }
+      if (outer) continue;                    /* 바깥 조판표는 건드리지 않는다 */
+      var prev = t.previousElementSibling;
+      if (prev && prev.classList.contains("tblwbtn")) continue;   /* 이미 달렸다 */
+      addWideBtn(t);
+    }
+  }
+
+  function addWideBtn(t) {
+    var b = document.createElement("button");
+    b.type = "button";
+    b.className = "tblwbtn";
+    b.textContent = "⇔ 표 펴기";
+    b.addEventListener("click", function () {
+      var on = t.classList.toggle("tblwide");
+      b.textContent = on ? "⇔ 표 접기" : "⇔ 표 펴기";
+    });
+    t.parentNode.insertBefore(b, t);
   }
 
   /* ---- 선택 검색: 읽다가 고른 말을 그대로 검색으로 ----------------------
@@ -3879,6 +3947,7 @@ _APP_JS = r"""
   hookSyncPolling(right);
   hookMore();
   hookThreadHead();
+  hookWideTables(document);      /* 서버가 그린 첫 화면에도 */
   /* 전체 로드로 /thread/…?focus=N 을 열었을 때(새로고침·직접 URL)도 그 메일로 스크롤 */
   applyHl(new URLSearchParams(location.search).get("hl"));
   focusMsg("right", new URLSearchParams(location.search).get("focus"));
