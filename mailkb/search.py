@@ -26,6 +26,13 @@ _FIELD_KEYS = {"from", "to", "cc", "after", "before", "on",
                "is", "has", "file", "thread"}
 _IS_VALUES = {"unread", "read", "sent", "received", "flagged"}
 
+# `#12345` — 메일 한 건. 우리 출력이 그 번호를 그대로 찍으므로(AI 조사 근거 칩
+# `web._ask_ref`) 사람이 복사해 붙이는 값이다. **추측하지 않는다**: 메일 번호와
+# 스레드 번호는 같은 번호 공간에서 따로 발급돼(store.next_id) 한 수가 양쪽에 다
+# 있는 일이 흔하다(데모 실측 — 스레드 169개 중 168개가 다른 메일의 번호와 겹친다).
+# 그래서 `#N` 은 메일로 고정한다. 스레드 축은 이미 `thread:` 가 있다.
+_MID_RX = re.compile(r"^#(\d{1,15})$")
+
 # `key:"quoted val"` | `key:val` | "quoted phrase" | bare
 _TOKEN_RX = re.compile(r'''
     (?P<key>\w+):"(?P<kqval>[^"]*)"      # from:"강 미래"
@@ -45,6 +52,7 @@ class Query:
     after: str | None = None                        # sent_on >= after (ISO date)
     before: str | None = None                       # sent_on < before  (배타 상한)
     thread: int | None = None
+    mid: int | None = None       # `#12345` — 메일 한 건
     is_flags: set = field(default_factory=set)
     has_attach: bool = False
     files: list = field(default_factory=list)
@@ -54,7 +62,8 @@ class Query:
 
     def has_filters(self) -> bool:
         return bool(self.from_ or self.to or self.cc or self.after or self.before
-                    or self.thread or self.is_flags or self.has_attach or self.files)
+                    or self.thread or self.mid or self.is_flags
+                    or self.has_attach or self.files)
 
 
 # ─────────────────────────────────────────────────────── 날짜 경계
@@ -115,6 +124,10 @@ def parse_query(text: str) -> Query:
             continue
         term = m.group("term")
         if term:
+            mm = _MID_RX.match(term)
+            if mm:
+                q.mid = int(mm.group(1))      # 마지막 것이 이긴다(필터는 하나)
+                continue
             q.terms.append(term)
     return q
 

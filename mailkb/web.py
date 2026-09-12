@@ -6319,7 +6319,8 @@ def render_dossier(store, cfg, addr: str) -> str:
 _SEARCH_HINT = ("<p class='shint'><code>from:</code> <code>to:</code> "
                 "<code>after:2026-06</code> <code>before:</code> "
                 "<code>has:attachment</code> "
-                "<code>is:sent</code> · <code>\"정확한 구\"</code></p>")
+                "<code>is:sent</code> · <code>\"정확한 구\"</code> "
+                "· <code>#12345</code>(메일 번호)</p>")
 
 
 def _period_tokens(period: str, today: str) -> list:
@@ -6419,6 +6420,32 @@ def _search_effective(qs, today: str) -> tuple:
         extra.append("is:received")
     effective = (raw + " " + " ".join(extra)).strip() if extra else raw
     return raw, effective
+
+
+def _mid_note(store, mid: int, rows) -> str:
+    """`#번호` 질의가 무엇으로 풀렸는지 밝힌다 — 추측하지 않고 **알린다**.
+
+    메일 번호와 스레드 번호는 같은 번호 공간에서 따로 발급된다(store.next_id).
+    그래서 한 수가 양쪽에 다 있는 일이 흔하다(데모 실측: 스레드 169개 중 168개가
+    다른 메일의 번호와 겹친다). `#N` 은 메일로 고정하고, 그 수가 스레드로도
+    있으면 그 길을 한 줄로 내놓는다 — 사람이 고른다.
+    """
+    hit = next((r for r in rows if r["id"] == mid), None)
+    parts = []
+    if hit is not None:
+        tid = hit["thread_id"]
+        parts.append(f"메일 <b>#{mid}</b> · 같은 스레드 전체 "
+                     f"<a href='/search?q=thread%3A{tid}'>thread:{tid}</a>")
+    else:
+        parts.append(f"메일 <b>#{mid}</b> 없음")
+    # 그 메일이 속한 스레드가 곧 이 번호이면(첫 메일) 위 줄과 같은 길이다 —
+    # 같은 링크를 두 번 내놓지 않는다(실서버에서 실제로 겹쳤다).
+    same = hit is not None and hit["thread_id"] == mid
+    if not same and store.db.execute(
+            "SELECT 1 FROM threads WHERE id=?", (mid,)).fetchone():
+        parts.append("이 번호는 스레드로도 있습니다 "
+                     f"<a href='/search?q=thread%3A{mid}'>thread:{mid}</a>")
+    return "<p class='shint'>" + " · ".join(parts) + "</p>"
 
 
 def _snip_html(snippet: str) -> str:
@@ -6725,6 +6752,9 @@ def render_search(store, cfg, qs, today: str) -> str:
             out.append("<div class='askrow'>"
                        f"<a class='aibtn' href='/search?ai=1&q={enc}'>"
                        "AI로 다시 찾기</a></div>")
+        _mq = search_mod.parse_query(effective)
+        if _mq.mid is not None:                 # `#번호` — 무엇으로 풀렸는지 밝힌다
+            out.append(_mid_note(store, _mq.mid, rows))
         out.append(f"<p class='dim'>{len(rows)}건</p>")
         out.append(_search_facets(rows, effective))
         # 찾은 말을 스레드까지 들고 간다 — 어느 메일인지는 focus 가, 무엇 때문에

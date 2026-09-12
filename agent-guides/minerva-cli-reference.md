@@ -72,6 +72,11 @@
 | `has:attachment` | 첨부가 있는 메일 | `has:attachment` |
 | `file:` | 첨부 파일명 | `file:schedule.xlsx` |
 | `thread:` | 특정 스레드 | `thread:42` |
+| `#번호` | 메일 한 건(그 번호의 메일) | `#26090736001` |
+
+`#번호`는 **메일** 한 건이다 — 스레드는 `thread:`다. 두 번호는 같은 번호
+공간에서 따로 발급되므로 한 수가 양쪽에 다 있을 수 있다(겹쳐도 `#N`은
+메일로만 해석한다).
 
 `is:`는 `unread`, `read`, `sent`, `received`, `flagged`를 지원한다. 날짜는
 `YYYY`, `YYYY-MM`, `YYYY-MM-DD`를 사용할 수 있다. OR 문법은 없으므로 변경 신호는

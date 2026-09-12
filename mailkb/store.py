@@ -1748,6 +1748,11 @@ class Store:
             conds.append("m.sent_on < ?"); params.append(q.before)
         if q.thread is not None:
             conds.append("m.thread_id = ?"); params.append(q.thread)
+        if q.mid is not None:
+            # `#12345` — 메일 한 건. thread_id 가 아니라 id 다(두 번호는 같은
+            # 공간에서 따로 발급된다 — next_id). 결과 줄의 링크가 그 메일이 있는
+            # 스레드를 focus 로 열어 '관련 메일'까지 이어 준다.
+            conds.append("m.id = ?"); params.append(q.mid)
         fl = q.is_flags
         if "unread" in fl:
             conds.append("m.read_at = ''")

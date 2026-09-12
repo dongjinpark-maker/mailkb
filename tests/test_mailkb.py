@@ -14111,6 +14111,19 @@ class TestSearchParse(unittest.TestCase):
         self.assertEqual(q.thread, 12)
         self.assertEqual(q.files, ["xlsx"])
 
+    def test_mail_number_token(self):
+        # `#12345` = 메일 한 건. 우리 출력이 그 번호를 그대로 찍으므로(AI 조사 근거
+        # 칩) 사람이 복사해 붙인다. 스레드 번호와 같은 번호 공간이라 추측하지 않고
+        # 메일로 **고정**한다 — 스레드는 thread: 가 따로 있다.
+        q = search_mod.parse_query("#26090736001 리포트")
+        self.assertEqual(q.mid, 26090736001)
+        self.assertEqual(q.terms, ["리포트"])       # 번호는 키워드로 새지 않는다
+        self.assertTrue(q.has_filters())
+        # 번호가 아닌 `#` 은 종전대로 키워드다(해시태그·머리표 등)
+        self.assertIsNone(search_mod.parse_query("#").mid)
+        self.assertEqual(search_mod.parse_query("#").terms, ["#"])
+        self.assertIsNone(search_mod.parse_query("#abc").mid)
+
     def test_unknown_key_is_a_term(self):
         q = search_mod.parse_query("http://x.co/1 검토")
         self.assertIn("http://x.co/1", q.terms)
@@ -14194,6 +14207,17 @@ class TestSearchEngine(unittest.TestCase):
         self.assertTrue(all(r["sent_on"] >= "2026-06-01" for r in after))
         self.assertFalse(any(r["message_id"] == "<s3@t>" for r in after))  # 5월 제외
 
+    def test_mail_number_finds_exactly_that_mail(self):
+        row = self.store.db.execute(
+            "SELECT id, thread_id FROM messages ORDER BY id LIMIT 1").fetchone()
+        rows = self.store.search(f"#{row['id']}")
+        self.assertEqual([r["id"] for r in rows], [row["id"]])
+        self.assertEqual(rows[0]["tier"], 0)            # 본문 검색어 없는 필터 질의
+        # 없는 번호는 0건 — 키워드로 새어 엉뚱한 메일이 나오면 안 된다
+        self.assertEqual(self.store.search("#99999999999"), [])
+        # 번호 + 키워드는 교집합이다(그 메일에 그 말이 없으면 0건)
+        self.assertEqual(self.store.search(f"#{row['id']} 없을말리포트"), [])
+
     def test_is_sent_and_has_attachment(self):
         self.assertTrue(all(r["is_sent"] for r in self.store.search("is:sent")))
         att = self.store.search("has:attachment")
@@ -14251,6 +14275,28 @@ class TestSearchWeb(unittest.TestCase):
         self.assertEqual(web._period_tokens("lastmonth", "2026-07-13"),
                          ["after:2026-06", "before:2026-07"])
         self.assertEqual(web._period_tokens("thisyear", "2026-07-13"), ["after:2026"])
+
+    def test_mail_number_search_says_what_it_resolved_to(self):
+        # 번호 하나로 메일을 열 수 있어야 하고, 그 번호가 스레드로도 유효할 수
+        # 있으므로(같은 번호 공간) 화면이 **추측하지 않고 알린다**.
+        row = self.store.db.execute(
+            "SELECT id, thread_id FROM messages ORDER BY id LIMIT 1").fetchone()
+        mid, tid = row["id"], row["thread_id"]
+        page = web.render_search(self.store, self.cfg, {"q": [f"#{mid}"]}, "2026-07-13")
+        self.assertIn(f"메일 <b>#{mid}</b>", page)
+        self.assertIn(f"thread%3A{tid}", page)          # 같은 스레드 전체로 가는 길
+        self.assertIn(f"?focus={mid}", page)            # 결과 줄은 그 메일로 내려간다
+        self.assertIn("<p class='dim'>1건</p>", page)
+        # 그 메일의 스레드가 곧 그 번호면 같은 길을 두 번 말하지 않는다
+        if tid == mid:
+            self.assertNotIn("스레드로도 있습니다", page)
+            self.assertEqual(page.count(f"thread%3A{tid}"), 1)
+        # 없는 번호는 없다고 말한다(조용히 0건으로 두지 않는다)
+        miss = web.render_search(self.store, self.cfg, {"q": ["#99999999999"]},
+                                 "2026-07-13")
+        self.assertIn("메일 <b>#99999999999</b> 없음", miss)
+        # 문법은 화면 도움말에도 있다(세 번째 자리 — 표 둘은 문서가 진다)
+        self.assertIn("#12345", web._SEARCH_HINT)
 
     def test_search_input_promoted_to_header(self):
         # 검색 입력은 헤더 상시 검색창(navsearch)으로 승격 — nav '검색' 링크 없음
