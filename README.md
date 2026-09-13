@@ -1,5 +1,7 @@
 # mailkb — Outlook 메일을 AI 로 읽고, 결정을 기억한다
 
+사용기: [미네르바의 올빼미는 저녁에 난다](https://dongjinpark-maker.github.io/mailkb/story/minerva-story.html)
+
 > **EN** — *mailkb* ("Minerva") is a personal knowledge layer on top of classic Outlook (COM, Windows):
 > it indexes mail into SQLite/FTS5, serves an AI-assisted local web **reader** (read-only — sending
 > stays in Outlook), distills daily decisions into a human-approved long-term ledger, answers questions
