@@ -280,6 +280,7 @@ ask 와 diagnose 는 그 자체가 AI 명령이니 내가 요청할 때만 실�
 |---|---|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | **목적·구조·데이터 모델·파이프라인·기능 상세·설계 결정** |
 | [docs/DEPLOY-WINDOWS.md](docs/DEPLOY-WINDOWS.md) | 회사 PC 배포 상세 |
+| [docs/OPENCODE-WINDOWS.md](docs/OPENCODE-WINDOWS.md) | opencode(WSL) — AI 백엔드로 쓰기 · 저장소에서 바로 쓰기 |
 | [CLAUDE.md](CLAUDE.md) | AI 코딩 에이전트용 작업 규칙·불변식 |
 | [agent-guides/](agent-guides/) | 조사 에이전트용 CLI 계약 |
 | [.claude/skills/mail-research/](.claude/skills/mail-research/) | Claude Code 스킬 — `/mail-research` (위 계약을 그대로 따른다) |
@@ -301,6 +302,9 @@ mailkb 는 사람이 웹으로 쓰는 도구이면서, **에이전트가 CLI 로
 ```
 /mail-research NPX-200 양자화 최종 결정이 뭐였지?
 ```
+
+opencode(WSL)라면 `/mnt/c/<저장소>` 에서 `opencode --agent mailkb` 로 띄우고 같은
+`/mail-research` 를 쓴다 — [docs/OPENCODE-WINDOWS.md §5](docs/OPENCODE-WINDOWS.md).
 
 흐름은 이렇다: 질문 해부 → **이미 분석된 것 확인**(`ask --history`, 있으면 그것이
 못 간 지점부터) → `search --json`·`show`·`thread` 로 확보(AI 0콜) → 반전 신호

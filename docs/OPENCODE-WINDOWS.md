@@ -5,6 +5,8 @@
 환경이다 — 회사 PC의 실제 모양이고, Windows 네이티브 설치라면 §1의 `cmd`만
 `["opencode", "run", "--pure"]`로 줄이면 나머지는 같다.
 
+§5 는 반대 방향 — WSL 셸에서 opencode 로 저장소를 바로 쓰는 경우다.
+
 측정값은 전부 2026-08-30 Windows 11 + WSL2(Ubuntu) + opencode 1.18.25 실기기다.
 
 ---
@@ -138,9 +140,8 @@ claude 백엔드의 `--tools ""`에 해당한다(`review._ai_request`). opencode
 7,764 토큰(약 7배)이고, 그보다 **도구가 열린 채로 메일 본문이 들어간다**. 이 저장소가
 `--tools ""` 와 전용 에이전트로 막아 온 바로 그 축이 조용히 열린다.
 
-지금은 화면에 신호가 없다. 의심되면 `[응답 시험]` 이나 `mailkb diagnose --backend
-internal` 을 돌리고, 그 콜의 stderr 에 위 경고가 있는지 본다. (계측을 붙이는 것은
-§5 참고 — `_ai_run_once` 가 성공 시 stderr 를 버리고 있어 그 계약부터 건드려야 한다.)
+`[응답 시험]` 과 `mailkb diagnose --backend internal` 이 이 경고를 `▲ 설정 안 먹음` 으로
+보여 준다(§4).
 
 ---
 
@@ -235,7 +236,41 @@ ls -la ~/AGENTS.md ~/CLAUDE.md    # 있었다면 지금까지 메일 프롬프�
 
 ---
 
-## 5. 아직 안 한 것
+## 5. WSL 에서 opencode 로 저장소 바로 쓰기
+
+§1~4 와 반대 방향이다 — mailkb 가 opencode 를 부르는 게 아니라, 사람이 WSL 셸에서
+opencode 를 띄워 저장소를 쓴다. 필요한 설정은 저장소 `.opencode/` 에 들어 있다.
+
+```bash
+cd /mnt/c/<저장소>
+opencode --agent mailkb
+```
+
+```
+/mail-research NPX-200 양자화 최종 결정이 뭐였지?
+```
+
+| 파일 | 하는 일 |
+|---|---|
+| `.opencode/agent/mailkb.md` | mailkb 는 Windows 파이썬(PowerShell)으로만 실행 · DB 파일 직접 접근 차단 · 임시 파일은 `temp/` |
+| `.opencode/command/mail-research.md` | `/mail-research` — Claude Code 스킬과 같은 조사 절차 |
+
+**저장소는 Windows 디스크(`/mnt/c/…`)에서 연다.** DB 는 Windows 쪽에 있고 웹 서버가
+늘 열어 두므로 mailkb 는 Windows 파이썬으로만 돌아야 한다. WSL 파이썬이 같이 열면
+`disk I/O error`, 저장소를 WSL 디스크(`/home/…`)에 두면 Windows 파이썬이 `database is locked` 다.
+
+- 데모로 시험하려면 "`--home demo` 로" 라고 말한다. 말하지 않으면 실제 데이터(`data/`)다.
+- `.opencode/` 파일을 고치면 opencode 를 다시 띄워야 반영된다.
+
+| 보이는 것 | 할 일 |
+|---|---|
+| `disk I/O error` · `database is locked` | 저장소가 `/mnt/c/…` 아래인지 본다 |
+| 한글이 `?ㅼ젙` 처럼 깨짐 | PowerShell 결과를 `chcp 65001` + 파일로 받았는지 본다 |
+| `/mail-research` 가 안 보임 | opencode 를 저장소 안에서 띄웠는지 본다 |
+
+---
+
+## 6. 아직 안 한 것
 
 - **점검 콜이 실사용과 다른 길을 탄다** — `[응답 시험]`은 opencode 에만 `on_event`
   를 넘긴다(setup 경고를 받으려고). claude 는 종전 블로킹 그대로다 — 넘기면 점검이
