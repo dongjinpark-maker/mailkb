@@ -1,19 +1,43 @@
-# Windows에서 opencode를 AI 백엔드로 쓰기
+# Windows 에서 WSL 의 opencode 쓰기
 
-`internal` 백엔드(opencode)를 Windows PC에서 실제로 쓰기 위한 설정과, 그걸
-가능하게 하려고 코드에 넣은 것. 전제는 **opencode가 WSL 안에만 설치돼 있는**
-환경이다 — 회사 PC의 실제 모양이고, Windows 네이티브 설치라면 §1의 `cmd`만
-`["opencode", "run", "--pure"]`로 줄이면 나머지는 같다.
+opencode 가 **WSL 안에만 설치돼 있는** Windows PC 에서 opencode 를 쓰는 두 방식과, 그걸
+가능하게 하려고 코드에 넣은 것(부록). 회사 PC의 실제 모양이고, Windows 네이티브 설치라면
+A1의 `cmd`만 `["opencode", "run", "--pure"]`로 줄이면 나머지는 같다.
 
-§5 는 반대 방향 — WSL 셸에서 opencode 로 저장소를 바로 쓰는 경우다.
+```mermaid
+flowchart LR
+  subgraph W[Windows]
+    MK[mailkb<br/>Windows 파이썬]
+    DB[(db.sqlite)]
+    PS[powershell.exe]
+  end
+  subgraph L[WSL]
+    OCA[opencode run<br/>에이전트 minerva]
+    OCB[opencode TUI<br/>에이전트 mailkb]
+  end
+  MK -- "A. wsl.exe 로 AI 호출" --> OCA
+  OCB -- "B. mailkb 실행" --> PS --> MK
+  MK --- DB
+```
+
+| | A. AI 백엔드 | B. opencode TUI |
+|---|---|---|
+| 흐름 | mailkb → opencode | 사람 → opencode → mailkb |
+| 쓰는 곳 | 웹의 분석·회고 | 터미널에서 조사·코딩 |
+| 설정 | `config.toml` 의 `internal` + `/var/tmp/minerva-oc` | 저장소 `.opencode/` (따로 할 것 없음) |
+| 에이전트 | `minerva` — 도구 없음 | `mailkb` — 도구 있음 |
+
+두 방식 모두 DB 는 **Windows 파이썬만** 연다 — 경계를 넘어 열면 잠금이 깨진다(B2).
 
 측정값은 전부 2026-08-30 Windows 11 + WSL2(Ubuntu) + opencode 1.18.25 실기기다.
 
 ---
 
-## 1. 설정 — 이것만 하면 돈다
+## A. mailkb 가 opencode 를 부른다 — AI 백엔드(`internal`)
 
-### `<home>/config.toml`
+### A1. 설정 — 이것만 하면 돈다
+
+#### `<home>/config.toml`
 
 ```toml
 [ai.backends.internal]
@@ -28,14 +52,14 @@ effort_flag = "--variant"      # opencode의 추론 강도: high / max / minimal
 |---|---|
 | `bash -lc` | `wsl -e opencode` 는 `execvpe(opencode) failed` — 로그인 셸이 없으면 `~/.opencode/bin`이 PATH에 없다 |
 | `"$@"` 와 끝의 `"oc"` | 코드가 argv 뒤에 붙이는 플래그(`--format json`·`effort_flag`)가 `$0`·`$1`이 되어 **조용히 사라진다** |
-| `--dir` | opencode가 `AGENTS.md`/`CLAUDE.md`를 읽는다 — **cwd 뿐 아니라 위로 올라가며** 찾는다(§1.1). 저장소에서 띄우면 **코딩 규칙이 메일 분석 프롬프트에 실린다** |
+| `--dir` | opencode가 `AGENTS.md`/`CLAUDE.md`를 읽는다 — **cwd 뿐 아니라 위로 올라가며** 찾는다(A4). 저장소에서 띄우면 **코딩 규칙이 메일 분석 프롬프트에 실린다** |
 | `--agent minerva` | 기본 `build` 에이전트가 콜마다 툴 스키마로 **~7,000 토큰**을 태우고, 메일 본문이 들어가는 프롬프트에 툴이 열려 있다 |
 
 `--format json`은 config에 쓰지 않는다. 코드(`_ai_run_stream_oc`)가 필요할 때만
 붙인다 — 직접 넣으면 진행 이벤트가 없는 블로킹 경로에서 NDJSON이 답으로 나가
 하류 파서가 전부 깨진다.
 
-### `/var/tmp/minerva-oc/.opencode/agent/minerva.md` (WSL 안)
+#### `/var/tmp/minerva-oc/.opencode/agent/minerva.md` (WSL 안)
 
 **손으로 쓰지 않는다** — 저장소가 나르는 것을 이름만 바꿔 복사한다. 내용이 저장소와
 어긋나면 도구 목록이 조용히 낡는다. 저장소 파일이 바뀌어도 **복사본은 따라오지
@@ -105,7 +129,32 @@ claude 백엔드의 `--tools ""`에 해당한다(`review._ai_request`). opencode
 이름은 `opencode mcp list` 로 확인한다 — 거기 아무것도 안 뜨면 **이 파일도 만들지
 않는다.** 없는 이름을 적는 것은 무해하지만, JSON 이 깨지면 콜이 exit 1 로 죽는다.
 
-### 1.1 함정 둘 — 둘 다 조용하다
+### A2. 확인
+
+```bash
+python -m mailkb --home <home> diagnose --backend internal
+```
+
+`● 응답`이면 끝이다. `▲ 무응답`이면 늦는 것이지 고장이 아닐 수 있다 — 상한은
+`review.AITEST_TIMEOUT_OPENCODE`(150초)이고, 그걸 넘으면 WSL에서 `opencode run`을
+직접 돌려 로그인·모델 설정을 본다.
+
+웹은 설정 › **이 PC에서 쓸 수 있는 AI**의 `[응답 시험]`이 같은 일을 한다.
+
+### A3. 안 될 때 — 증상이 셋뿐이다
+
+| 보이는 것 | 뜻 | 할 일 |
+|---|---|---|
+| `Failed to change directory to …` (exit 1) | `--dir` 폴더가 없다 | A1 의 `mkdir -p` |
+| `▲ 설정 안 먹음` · `에이전트 '…' 를 못 찾아 기본값으로 돌았습니다` | 에이전트 파일이 없거나 이름이 다르다 | A1 의 `cp`, 이름은 `minerva.md` |
+| `■ 실패` · `execvpe(opencode) failed` | 로그인 셸을 안 거쳐 PATH 에 없다 | `cmd` 에 `bash -lc` 가 있는지 |
+
+셋 다 **조용하지 않다.** 특히 가운데는 종전에 조용했다 — opencode 가 에이전트를
+못 찾아도 실패하지 않고 기본 `build` 로 떨어져 `● 응답` 으로 보였다(A4).
+`[응답 시험]`과 `diagnose` 가 성공 경로의 stderr 를 보고 `▲ 설정 안 먹음` 으로
+가른다(2026-08-31). 대답이 왔다고 다 된 것이 아니다.
+
+### A4. 함정 둘 — 둘 다 조용하다
 
 **`--dir` 은 `$HOME` 아래에 두면 안 된다.** opencode 는 지시문 파일을 `--dir` 에서만
 찾지 않고 **위로 올라가며** 찾는다. 세 번 재서 확인했다(2026-08-30, 1.18.25 —
@@ -141,11 +190,62 @@ claude 백엔드의 `--tools ""`에 해당한다(`review._ai_request`). opencode
 `--tools ""` 와 전용 에이전트로 막아 온 바로 그 축이 조용히 열린다.
 
 `[응답 시험]` 과 `mailkb diagnose --backend internal` 이 이 경고를 `▲ 설정 안 먹음` 으로
-보여 준다(§4).
+보여 준다(A3).
+
+### A5. 자리를 옮긴 뒤
+
+옛 자리(`~/.minerva-oc`)는 지워도 된다.
+
+```bash
+rm -rf ~/.minerva-oc
+ls -la ~/AGENTS.md ~/CLAUDE.md    # 있었다면 지금까지 메일 프롬프트에 실려 왔다
+```
 
 ---
 
-## 2. 코드에 들어간 것
+## B. 사람이 opencode 를 쓰고, opencode 가 mailkb 를 부른다 — TUI
+
+A 와 반대 방향이다 — mailkb 가 opencode 를 부르는 게 아니라, 사람이 WSL 셸에서
+opencode 를 띄워 저장소를 쓴다. 필요한 설정은 저장소 `.opencode/` 에 들어 있다.
+
+### B1. 실행
+
+```bash
+cd /mnt/c/<저장소>
+opencode --agent mailkb
+```
+
+```
+/mail-research NPX-200 양자화 최종 결정이 뭐였지?
+```
+
+| 파일 | 하는 일 |
+|---|---|
+| `.opencode/agent/mailkb.md` | mailkb 는 Windows 파이썬(PowerShell)으로만 실행 · DB 파일 직접 접근 차단 · 임시 파일은 `temp/` |
+| `.opencode/command/mail-research.md` | `/mail-research` — Claude Code 스킬과 같은 조사 절차 |
+
+### B2. 지킬 것
+
+**저장소는 Windows 디스크(`/mnt/c/…`)에서 연다.** DB 는 Windows 쪽에 있고 웹 서버가
+늘 열어 두므로 mailkb 는 Windows 파이썬으로만 돌아야 한다. WSL 파이썬이 같이 열면
+`disk I/O error`, 저장소를 WSL 디스크(`/home/…`)에 두면 Windows 파이썬이 `database is locked` 다.
+
+- 데모로 시험하려면 "`--home demo` 로" 라고 말한다. 말하지 않으면 실제 데이터(`data/`)다.
+- `.opencode/` 파일을 고치면 opencode 를 다시 띄워야 반영된다.
+
+### B3. 안 될 때
+
+| 보이는 것 | 할 일 |
+|---|---|
+| `disk I/O error` · `database is locked` | 저장소가 `/mnt/c/…` 아래인지 본다 |
+| 한글이 `?ㅼ젙` 처럼 깨짐 | PowerShell 결과를 `chcp 65001` + 파일로 받았는지 본다 |
+| `/mail-research` 가 안 보임 | opencode 를 저장소 안에서 띄웠는지 본다 |
+
+---
+
+## 부록 — 개발자용
+
+### 코드에 들어간 것
 
 | 곳 | 무엇 | 왜 |
 |---|---|---|
@@ -158,7 +258,7 @@ claude 백엔드의 `--tools ""`에 해당한다(`review._ai_request`). opencode
 | `web._job_stream_event` | `ev:call`에서 `phase`·`recv` 리셋 | 콜 단위 리셋을 원래 `model` 이벤트가 했는데 **opencode는 모델 이름을 안 흘린다** |
 | `web._job_live_line` | `phase: tool` → `도구 사용 중` | 메일 분석에 툴이 돌면 그건 메일 본문이 유발했다는 뜻이다. 조용히 넘기지 않는다 |
 
-### 이벤트 대응표
+#### 이벤트 대응표
 
 opencode 1.18.25 `run` 핸들러 기준.
 
@@ -176,16 +276,14 @@ opencode 1.18.25 `run` 핸들러 기준.
 (이 포맷에 모델 이름이 없다). 관측되지 않는 것은 지어내지 않고 `.waitslot:empty`가
 그 슬롯을 접는다.
 
-### 평문 폴백
+#### 평문 폴백
 
-`--format json`이 셸 래퍼에 삼켜지면(§1의 `"$@"` 누락) opencode는 평문을 뱉는다.
+`--format json`이 셸 래퍼에 삼켜지면(A1의 `"$@"` 누락) opencode는 평문을 뱉는다.
 그때 `_ai_run_stream_oc`는 **실패시키지 않고 그대로 답으로 쓴다** — 진행 표시만
 잃는다. 설정 한 줄의 실수가 AI 기능 전체를 죽이면 안 된다. claude 경로가
 2026-07-28에 이 폴백이 없어 분석이 전부 죽었던 그 자리와 같은 판단이다.
 
----
-
-## 3. 실측 숫자
+### 실측 숫자
 
 | | |
 |---|---|
@@ -198,79 +296,7 @@ opencode 1.18.25 `run` 핸들러 기준.
 콜 하나가 60초를 넘는 일이 흔하다는 것이 이 백엔드의 성격이고, 그래서 진행 표시가
 claude보다 **더** 중요하다. 그냥 두면 화면이 몇 분간 죽은 것처럼 보인다.
 
----
-
-## 4. 확인
-
-```bash
-python -m mailkb --home <home> diagnose --backend internal
-```
-
-`● 응답`이면 끝이다. `▲ 무응답`이면 늦는 것이지 고장이 아닐 수 있다 — 상한은
-`review.AITEST_TIMEOUT_OPENCODE`(150초)이고, 그걸 넘으면 WSL에서 `opencode run`을
-직접 돌려 로그인·모델 설정을 본다.
-
-웹은 설정 › **이 PC에서 쓸 수 있는 AI**의 `[응답 시험]`이 같은 일을 한다.
-
-### 안 될 때 — 증상이 셋뿐이다
-
-| 보이는 것 | 뜻 | 할 일 |
-|---|---|---|
-| `Failed to change directory to …` (exit 1) | `--dir` 폴더가 없다 | §1 의 `mkdir -p` |
-| `▲ 설정 안 먹음` · `에이전트 '…' 를 못 찾아 기본값으로 돌았습니다` | 에이전트 파일이 없거나 이름이 다르다 | §1 의 `cp`, 이름은 `minerva.md` |
-| `■ 실패` · `execvpe(opencode) failed` | 로그인 셸을 안 거쳐 PATH 에 없다 | `cmd` 에 `bash -lc` 가 있는지 |
-
-셋 다 **조용하지 않다.** 특히 가운데는 종전에 조용했다 — opencode 가 에이전트를
-못 찾아도 실패하지 않고 기본 `build` 로 떨어져 `● 응답` 으로 보였다(§1.1).
-`[응답 시험]`과 `diagnose` 가 성공 경로의 stderr 를 보고 `▲ 설정 안 먹음` 으로
-가른다(2026-08-31). 대답이 왔다고 다 된 것이 아니다.
-
-### 자리를 옮긴 뒤
-
-옛 자리(`~/.minerva-oc`)는 지워도 된다.
-
-```bash
-rm -rf ~/.minerva-oc
-ls -la ~/AGENTS.md ~/CLAUDE.md    # 있었다면 지금까지 메일 프롬프트에 실려 왔다
-```
-
----
-
-## 5. WSL 에서 opencode 로 저장소 바로 쓰기
-
-§1~4 와 반대 방향이다 — mailkb 가 opencode 를 부르는 게 아니라, 사람이 WSL 셸에서
-opencode 를 띄워 저장소를 쓴다. 필요한 설정은 저장소 `.opencode/` 에 들어 있다.
-
-```bash
-cd /mnt/c/<저장소>
-opencode --agent mailkb
-```
-
-```
-/mail-research NPX-200 양자화 최종 결정이 뭐였지?
-```
-
-| 파일 | 하는 일 |
-|---|---|
-| `.opencode/agent/mailkb.md` | mailkb 는 Windows 파이썬(PowerShell)으로만 실행 · DB 파일 직접 접근 차단 · 임시 파일은 `temp/` |
-| `.opencode/command/mail-research.md` | `/mail-research` — Claude Code 스킬과 같은 조사 절차 |
-
-**저장소는 Windows 디스크(`/mnt/c/…`)에서 연다.** DB 는 Windows 쪽에 있고 웹 서버가
-늘 열어 두므로 mailkb 는 Windows 파이썬으로만 돌아야 한다. WSL 파이썬이 같이 열면
-`disk I/O error`, 저장소를 WSL 디스크(`/home/…`)에 두면 Windows 파이썬이 `database is locked` 다.
-
-- 데모로 시험하려면 "`--home demo` 로" 라고 말한다. 말하지 않으면 실제 데이터(`data/`)다.
-- `.opencode/` 파일을 고치면 opencode 를 다시 띄워야 반영된다.
-
-| 보이는 것 | 할 일 |
-|---|---|
-| `disk I/O error` · `database is locked` | 저장소가 `/mnt/c/…` 아래인지 본다 |
-| 한글이 `?ㅼ젙` 처럼 깨짐 | PowerShell 결과를 `chcp 65001` + 파일로 받았는지 본다 |
-| `/mail-research` 가 안 보임 | opencode 를 저장소 안에서 띄웠는지 본다 |
-
----
-
-## 6. 아직 안 한 것
+### 아직 안 한 것
 
 - **점검 콜이 실사용과 다른 길을 탄다** — `[응답 시험]`은 opencode 에만 `on_event`
   를 넘긴다(setup 경고를 받으려고). claude 는 종전 블로킹 그대로다 — 넘기면 점검이

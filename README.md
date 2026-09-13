@@ -304,7 +304,7 @@ mailkb 는 사람이 웹으로 쓰는 도구이면서, **에이전트가 CLI 로
 ```
 
 opencode(WSL)라면 `/mnt/c/<저장소>` 에서 `opencode --agent mailkb` 로 띄우고 같은
-`/mail-research` 를 쓴다 — [docs/OPENCODE-WINDOWS.md §5](docs/OPENCODE-WINDOWS.md).
+`/mail-research` 를 쓴다 — [docs/OPENCODE-WINDOWS.md](docs/OPENCODE-WINDOWS.md) 의 B.
 
 흐름은 이렇다: 질문 해부 → **이미 분석된 것 확인**(`ask --history`, 있으면 그것이
 못 간 지점부터) → `search --json`·`show`·`thread` 로 확보(AI 0콜) → 반전 신호

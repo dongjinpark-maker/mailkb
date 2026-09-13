@@ -731,7 +731,7 @@ def setup_warning(stderr: str) -> str:
     if not m:
         return ""
     return (f"에이전트 '{m.group(1)}' 를 못 찾아 기본값으로 돌았습니다 — "
-            "도구가 열리고 입력 토큰이 7배입니다 (docs/OPENCODE-WINDOWS.md §1.1)")
+            "도구가 열리고 입력 토큰이 7배입니다 (docs/OPENCODE-WINDOWS.md A4)")
 
 
 def _emit_setup_warning(on_event, stderr: str, cmd: list[str]) -> None:

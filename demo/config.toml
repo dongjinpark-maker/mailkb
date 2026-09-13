@@ -38,7 +38,7 @@ summary = "sonnet"
 
 [ai.backends.internal]
 # WSL 안의 opencode — Windows 에서 wsl.exe 로 부른다. 준비(폴더·에이전트 파일)는
-# docs/OPENCODE-WINDOWS.md §1. 준비 없이 고르면 'Failed to change directory' 로 실패한다.
+# docs/OPENCODE-WINDOWS.md A1. 준비 없이 고르면 'Failed to change directory' 로 실패한다.
 cmd = ["wsl.exe", "-e", "bash", "-lc",
        'exec opencode run --pure --dir /var/tmp/minerva-oc --agent minerva "$@"', "oc"]
 
