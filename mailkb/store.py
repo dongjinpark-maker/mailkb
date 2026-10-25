@@ -326,7 +326,8 @@ CREATE TABLE IF NOT EXISTS knowledge_candidates (
     quote     TEXT DEFAULT '',        -- 검증 통과한 원문 인용
     status    TEXT DEFAULT 'pending', -- pending | saved | dismissed
     path      TEXT DEFAULT '',        -- 저장 후 md 경로
-    created   TEXT DEFAULT ''
+    created   TEXT DEFAULT '',
+    supersedes TEXT DEFAULT ''        -- 이 후보가 대체하는 저장 지식(파일 이름, 확장자 없음)
 );
 CREATE INDEX IF NOT EXISTS idx_knowledge_cand_status
     ON knowledge_candidates(status, date);
@@ -339,7 +340,10 @@ CREATE TABLE IF NOT EXISTS knowledge (
     title     TEXT NOT NULL DEFAULT '',
     threads   TEXT DEFAULT '',        -- ';' 연결 스레드 번호(frontmatter)
     mtime     REAL NOT NULL,
-    content   TEXT NOT NULL DEFAULT ''
+    content   TEXT NOT NULL DEFAULT '',
+    saved     TEXT DEFAULT '',        -- frontmatter saved:(없으면 created:) — mtime 은 편집으로 바뀐다
+    supersedes TEXT DEFAULT '',       -- frontmatter supersedes: 의 파일 이름(확장자 없음)
+    parse_ver INTEGER DEFAULT 0       -- knowledge.PARSE_VER — 오르면 mtime 이 같아도 다시 읽는다
 );
 """
 
@@ -615,6 +619,13 @@ class Store:
             # '최근 표시순'이 필요할 때 없으면 못 만든다.
             ("messages", "flagged", "INTEGER DEFAULT 0"),
             ("messages", "flagged_at", "TEXT"),
+            # 지식의 대체 관계·저장일(2026-10-25). 후보는 사람이 승인한 자산의
+            # 입구이고 색인은 파일의 미러다 — 후보의 유보 이력은 재수집으로 안
+            # 돌아오므로 테이블을 다시 만들 수 없다.
+            ("knowledge_candidates", "supersedes", "TEXT DEFAULT ''"),
+            ("knowledge", "saved", "TEXT DEFAULT ''"),
+            ("knowledge", "supersedes", "TEXT DEFAULT ''"),
+            ("knowledge", "parse_ver", "INTEGER DEFAULT 0"),
         )
         for table, col, decl in specs:
             cols = {r["name"] for r in
@@ -1770,6 +1781,13 @@ class Store:
             conds.append("m.attach_names != ''")
         for f in q.files:
             conds.append("m.attach_names LIKE ?"); params.append(f"%{f}%")
+        # 빼기(-낱말)는 **필터**로 건다 — 모든 tier(구·AND·LIKE·OR)에 똑같이 걸려야
+        # 해서다. FTS5 의 NOT 은 이항 연산자라 질의를 NOT 으로 시작할 수 없고,
+        # trigram 은 2자어를 못 잡는다. LIKE 는 둘 다 문제없다(2026-10-25).
+        for x in getattr(q, "exclude", []) or []:
+            conds.append("NOT (COALESCE(m.subject, '') LIKE ? "
+                         "OR COALESCE(m.new_content, '') LIKE ?)")
+            params += [f"%{x}%", f"%{x}%"]
         return "".join(" AND " + c for c in conds), params
 
     def frequent_people(self, limit: int = 200) -> list[sqlite3.Row]:
@@ -3236,7 +3254,8 @@ class Store:
 
     def add_knowledge_candidate(self, date_iso: str, title: str, body: str,
                                 threads: str, quote: str,
-                                source: str = "daily") -> int | None:
+                                source: str = "daily",
+                                supersedes: str = "") -> int | None:
         """수확이 캐낸 암묵지 후보 적재. 같은 제목이 이미 살아 있으면(pending/
         saved) 중복으로 보고 None — 매일 도는 수확이 같은 지식을 다시 캘 수 있다.
         dismissed 와는 대조하지 않는다: 사람이 버린 것과 같은 제목이라도 새 근거로
@@ -3248,10 +3267,10 @@ class Store:
             return None
         cur = self.db.execute(
             "INSERT INTO knowledge_candidates"
-            "(date, source, title, body, threads, quote, created) "
-            "VALUES (?,?,?,?,?,?,?)",
+            "(date, source, title, body, threads, quote, created, supersedes) "
+            "VALUES (?,?,?,?,?,?,?,?)",
             (date_iso, source, title, body, threads, quote,
-             datetime.now().isoformat(timespec="seconds")))
+             datetime.now().isoformat(timespec="seconds"), supersedes or ""))
         self.db.commit()
         return cur.lastrowid
 
@@ -3276,14 +3295,34 @@ class Store:
         self.db.commit()
 
     def index_knowledge(self, path: str, title: str, threads: str,
-                        mtime: float, content: str) -> None:
+                        mtime: float, content: str, saved: str = "",
+                        supersedes: str = "", parse_ver: int = 0) -> None:
         self.db.execute(
-            "INSERT INTO knowledge(path, title, threads, mtime, content) "
-            "VALUES(?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET "
+            "INSERT INTO knowledge(path, title, threads, mtime, content, "
+            "saved, supersedes, parse_ver) "
+            "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET "
             "title=excluded.title, threads=excluded.threads, "
-            "mtime=excluded.mtime, content=excluded.content",
-            (path, title, threads, mtime, content))
+            "mtime=excluded.mtime, content=excluded.content, "
+            "saved=excluded.saved, supersedes=excluded.supersedes, "
+            "parse_ver=excluded.parse_ver",
+            (path, title, threads, mtime, content, saved, supersedes,
+             parse_ver))
         self.db.commit()
+
+    def count_thread_msgs_after(self, tids, day: str) -> int:
+        """이 스레드들에 day(YYYY-MM-DD) **다음 날부터** 온 메일 수 — 지식이 저장된
+        뒤 근거 스레드가 더 움직였는지 보는 값(2026-10-25).
+
+        날짜로 센다. `id` 차는 개수가 아니고(CLAUDE.md 8) 지식에는 적재 순번
+        기준선이 없다 — 저장일이 우리가 가진 유일한 시점이다."""
+        ids = sorted({int(t) for t in tids})
+        if not ids or not day:
+            return 0
+        marks = ",".join("?" * len(ids))
+        row = self.db.execute(
+            f"SELECT COUNT(*) FROM messages WHERE thread_id IN ({marks}) "
+            "AND substr(sent_on, 1, 10) > ?", ids + [day[:10]]).fetchone()
+        return int(row[0] or 0)
 
     def knowledge_row(self, path: str) -> sqlite3.Row | None:
         return self.db.execute(

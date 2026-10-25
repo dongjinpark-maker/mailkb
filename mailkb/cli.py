@@ -1071,7 +1071,8 @@ def main(argv: list[str] | None = None) -> None:
     sp.set_defaults(fn=cmd_ls)
 
     sp = sub.add_parser("search", help="검색 (연산자 from: after: is: 등 지원)")
-    sp.add_argument("query", help='예: from:강미래 after:2026-06 리포트  ·  "정확한 구"')
+    sp.add_argument("query", help='예: from:강미래 after:2026-06 리포트  ·  "정확한 구"'
+                                  '  ·  after:2w(최근 2주)  ·  -회식(빼기)')
     sp.add_argument("--limit", type=int, default=30)
     sp.add_argument("--json", action="store_true", help="구조화 JSON 출력(도구·skill용)")
     sp.add_argument("--ai", action="store_true",

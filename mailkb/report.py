@@ -888,7 +888,14 @@ REPORT_JS = """
   /* nav 뒤로(←) — 통계는 전폭 페이지(app.js 미로드)라 여기서도 배선.
      tip 조기 return 보다 먼저 등록해야 한다. */
   document.addEventListener('click', function(e){
-    if(e.target.closest && e.target.closest('.navback')) history.back();
+    // 같은 앱 화면에서 왔을 때만 뒤로 간다. 통계를 새 창·북마크로 바로 열었으면
+    // 뒤가 앱 밖이라, 거기로 나가면 창 수명 규약상 서버가 꺼진다(2026-10-25) —
+    // 그때는 홈으로 간다. 앱 쪽 ←(appDepth > 0 일 때만)와 같은 뜻이다.
+    if(e.target.closest && e.target.closest('.navback')){
+      var ref = document.referrer || '';
+      if(history.length > 1 && ref.indexOf(location.origin + '/') === 0) history.back();
+      else location.href = '/';
+    }
   });
   var tip = document.getElementById('tip');
   if(!tip) return;

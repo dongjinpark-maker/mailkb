@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import date
+from pathlib import Path
 
 from . import review
 from .clean import quote_context, smart_truncate
@@ -843,8 +844,100 @@ def _prev_block(parent: dict | None) -> str:
               "찾지 말고, 새로 물은 부분을 채우는 데 집중하라.\n")
 
 
+# 노트·지식 고르기는 질문 낱말이 본문에 글자 그대로 있는지 보는 것이라, 한국어
+# 조사와 붙여 쓰기에 약했다(2026-10-25 실측: "취약점공개일정 어떻게 잡나?" 가
+# '보안 취약점 고객 공개 일정은 …' 지식과 겹침 0 — 안 실렸다). 형태소 분석기는
+# 표준 라이브러리 밖이라 두 가지 결정론 보정만 둔다. 겹침 0 이면 안 싣는 규칙은
+# 그대로다 — 비슷하지만 무관한 문맥은 답을 오히려 흐린다.
+_JOSA = ("에서는", "으로는", "에게는", "까지는", "부터는",
+         "에서", "으로", "에게", "한테", "까지", "부터", "에는", "과는", "와는",
+         "은", "는", "이", "가", "을", "를", "에", "로", "와", "과", "도", "의", "만")
+_HANGUL_ONLY_RX = re.compile(r"[가-힣]+")
+
+
+def _query_tokens(question: str) -> set[str]:
+    """질문을 대조용 낱말로 — 2자 이상, 소문자."""
+    return {t for t in re.split(r"[^0-9A-Za-z가-힣]+", (question or "").lower())
+            if len(t) >= 2}
+
+
+def _token_hits(tok: str, hay: str) -> bool:
+    """낱말 하나가 본문(소문자)에 걸리나.
+
+    ① 글자 그대로 ② 끝의 조사를 떼고("일정은"→"일정", 남는 말이 2자 이상일
+    때만 — "회의"의 '의' 를 떼지 않게) ③ 한글만 4자 이상이면 붙여 쓴 말로 보고
+    2글자 조각의 절반 이상(최소 2개)이 걸리면 맞음("취약점공개일정"→취약·약점·
+    공개·일정). '요'처럼 문장 끝 어미는 떼지 않는다 — "하나요"가 "하나"가 되면
+    아무 본문에나 걸린다."""
+    if tok in hay:
+        return True
+    if len(tok) >= 3:
+        for j in _JOSA:
+            if tok.endswith(j) and len(tok) - len(j) >= 2:
+                if tok[:-len(j)] in hay:
+                    return True
+                break
+    if len(tok) >= 4 and _HANGUL_ONLY_RX.fullmatch(tok):
+        grams = {tok[i:i + 2] for i in range(len(tok) - 1)}
+        hit = sum(1 for g in grams if g in hay)
+        if hit >= 2 and hit * 2 >= len(grams):
+            return True
+    return False
+
+
+def _match_score(toks: set[str], hay: str) -> int:
+    """질문 낱말 중 본문에 걸린 개수 — 노트·지식 선정의 유일한 점수."""
+    return sum(1 for t in toks if _token_hits(t, hay))
+
+
+def _knowledge_age(store: Store, r) -> str:
+    """지식 한 줄 꼬리 — ' (저장 2026-09-03 · 근거 스레드에 그 뒤 새 메일 4통)'.
+
+    모델이 지식의 나이를 모르면 오래된 결론을 지금 것처럼 쓴다. 근거 스레드가
+    그 뒤 더 움직였으면 결론이 바뀌었을 수 있다는 신호를 같이 준다(0통이면 생략).
+    저장일을 모르는 파일(frontmatter 없음)이면 꼬리를 달지 않는다."""
+    saved = (r["saved"] or "") if "saved" in r.keys() else ""
+    if not saved:
+        return ""
+    tids = [t for t in (r["threads"] or "").split(";") if t.strip().isdigit()]
+    n = store.count_thread_msgs_after(tids, saved) if tids else 0
+    return f" (저장 {saved}" + (f" · 근거 스레드에 그 뒤 새 메일 {n}통)" if n else ")")
+
+
+def rules_block(cfg: Config) -> str:
+    """사용자 지침(ai-rules.md) 블록 — 분석·현안 브리핑·프로필이 같은 라벨로 싣는다."""
+    rules = cfg.ai_rules_text()
+    return f"\n[사용자 지침 — 우선 적용]\n{rules}\n" if rules else ""
+
+
+def memory_for_threads(store: Store, cfg: Config, tids, query: str,
+                       deny: frozenset, notes_top: int | None = None) -> str:
+    """현안 브리핑(스레드·인물)에 싣는 문맥 — 내 노트 · 지식 · 사용자 지침.
+
+    종전(~2026-10-24)에는 이 셋이 분석(ask)에만 실려, 사람이 스레드에 적어 둔
+    판단과 ai-rules.md 의 사내 용어가 정작 현안 브리핑과 인물 화면에는 닿지
+    않았다. 같은 블록 함수를 그대로 쓴다 — 라벨·'인용 금지' 계약이 하나여야
+    모델이 같은 것으로 읽는다.
+
+    - 노트: 이 스레드들(tids)의 노트만. 다른 스레드 노트를 낱말로 끌어오지 않는다
+      (브리핑은 질문이 아니라 사안 하나를 본다). notes_top 이면 최근 것부터 그만큼.
+    - 지식: 이 스레드들에서 나온 지식 먼저, 남는 자리는 query(스레드 제목) 낱말 겹침.
+    - 지침: rules_block 그대로.
+
+    AI 호출 0. 색인은 파일을 따라가므로 조회 전에 한 번 맞춘다(엔진과 같은 순서).
+    인용 검증은 메일 본문만 대조하므로 여기 문장을 근거로 달면 검증에서 떨어진다."""
+    from . import knowledge as knowledge_mod
+    from . import notes as notes_mod
+    notes_mod.reindex(cfg, store)
+    knowledge_mod.reindex(cfg, store)
+    allow = {int(t) for t in tids}
+    memory = _notes_block(store, "", deny, allow, allow_top=notes_top)
+    memory += _knowledge_block(store, query, deny, link=allow)
+    return memory + rules_block(cfg)
+
+
 def _notes_block(store: Store, question: str, deny: frozenset,
-                 allow: set | None = None) -> str:
+                 allow: set | None = None, allow_top: int | None = None) -> str:
     """내 노트(vault/notes 색인) 중 관련분 — 문맥 전용 블록('' 이면 생략).
 
     노트는 사람이 스레드에 직접 남긴 판단이라 이 앱에서 가장 비싼 자산이다
@@ -854,24 +947,28 @@ def _notes_block(store: Store, question: str, deny: frozenset,
     노트는 소음이다. 숨긴 스레드 것은 제외(allow 예외는 deny 가 이미 반영).
 
     '인용 금지'의 강제는 코드가 한다 — 노트는 정독 본문이 아니라 노트 문장을
-    인용해도 검증(_quote_ok)에서 떨어진다."""
+    인용해도 검증(_quote_ok)에서 떨어진다.
+
+    allow_top 은 직접 지목 노트의 상한이다(기본 없음). 인물 현안 브리핑처럼
+    지목 스레드가 여럿이면 최근 것부터 이만큼만 싣는다(2026-10-25)."""
     rows = store.notes_all()
     if not rows:
         return ""
     allow = allow or set()
     picked, seen = [], set()
-    for r in rows:
+    for r in rows:                              # mtime 내림차순 — 최근 것부터
         if r["thread_id"] in allow and (r["content"] or "").strip():
+            if allow_top is not None and len(picked) >= allow_top:
+                break
             picked.append(r)
             seen.add(r["thread_id"])
-    toks = {t for t in re.split(r"[^0-9A-Za-z가-힣]+", (question or "").lower())
-            if len(t) >= 2}
+    toks = _query_tokens(question)
     scored = []
     for r in rows:
         if r["thread_id"] in seen or r["thread_id"] in deny:
             continue
         hay = f"{r['content']} {r['norm_subject'] or ''}".lower()
-        n = sum(1 for t in toks if t in hay)
+        n = _match_score(toks, hay)
         if n and (r["content"] or "").strip():
             scored.append((n, r["mtime"], r))
     scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
@@ -887,7 +984,8 @@ def _notes_block(store: Store, question: str, deny: frozenset,
             " — 모든 인용 근거는 정독 본문에서만]\n" + lines + "\n")
 
 
-def _knowledge_block(store: Store, question: str, deny: frozenset) -> str:
+def _knowledge_block(store: Store, question: str, deny: frozenset,
+                     link: set | None = None) -> str:
     """승인된 지식(vault/knowledge 색인) 중 관련분 — 문맥 전용 블록.
 
     지식은 사람이 [지식으로 저장]을 눌러 확정한 조직 노하우라 노트와 같은 급의
@@ -896,27 +994,45 @@ def _knowledge_block(store: Store, question: str, deny: frozenset) -> str:
     참조 스레드가 전부 숨김이면 뺀다(CLAUDE.md 3 — 재료 조립 전에 거른다).
 
     '인용 금지'의 강제는 코드가 한다 — 지식 문장은 정독 본문이 아니라 인용해도
-    검증(_quote_ok)에서 떨어진다. 노트와 같은 계약."""
+    검증(_quote_ok)에서 떨어진다. 노트와 같은 계약.
+
+    link 는 '이 스레드들에서 나온 지식'이다(2026-10-25 — 현안 브리핑). 근거
+    스레드가 겹치면 낱말 겹침과 무관하게 먼저 싣는다: 그 사안에서 사람이 남기기로
+    고른 판단이라 제목 낱말이 안 겹쳐도 관련이 확실하다. 상한은 같은 TOP 이다."""
     rows = store.knowledge_all()
     if not rows:
         return ""
-    toks = {t for t in re.split(r"[^0-9A-Za-z가-힣]+", (question or "").lower())
-            if len(t) >= 2}
-    scored = []
+    from . import knowledge as knowledge_mod
+    # 대체된 지식은 싣지 않는다(2026-10-25) — 뒤집힌 결론이 새 결론과 같은
+    # 무게로 실리면, 새 정보가 같이 있어도 모델이 옛것에 끌린다. 파일은 남아
+    # 지식 탭에서 이력으로 보인다.
+    gone = knowledge_mod.superseded_stems(rows)
+    link = link or set()
+    toks = _query_tokens(question)
+    linked, scored = [], []
     for r in rows:
-        tids = [int(t) for t in (r["threads"] or "").split(";") if t.strip()]
+        if Path(r["path"]).stem in gone:
+            continue
+        tids = [int(t) for t in (r["threads"] or "").split(";")
+                if t.strip().isdigit()]
         if tids and all(t in deny for t in tids):
             continue
+        if not (r["content"] or r["title"]):
+            continue
+        if link and set(tids) & link:
+            linked.append(r)                    # knowledge_all 은 mtime 내림차순
+            continue
         hay = f"{r['title']} {r['content']}".lower()
-        n = sum(1 for t in toks if t in hay)
-        if n and (r["content"] or r["title"]):
+        n = _match_score(toks, hay)
+        if n:
             scored.append((n, r["mtime"], r))
     scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    picked = [r for _, _, r in scored[:ASK_KNOWLEDGE_TOP]]
+    picked = (linked + [r for _, _, r in scored])[:ASK_KNOWLEDGE_TOP]
     if not picked:
         return ""
     lines = "\n".join(
-        f"- {r['title']}\n{(r['content'] or '')[:ASK_KNOWLEDGE_CHARS]}"
+        f"- {r['title']}{_knowledge_age(store, r)}\n"
+        f"{(r['content'] or '')[:ASK_KNOWLEDGE_CHARS]}"
         for r in picked)
     return ("\n[지식 — 사용자가 승인해 저장한 조직 노하우. 문맥 전용, 인용 금지"
             " — 모든 인용 근거는 정독 본문에서만]\n" + lines + "\n")
@@ -1071,8 +1187,7 @@ def ask(store: Store, cfg: Config, question: str, backend: str | None = None,
     knowledge_mod.reindex(cfg, store)
     memory = _notes_block(store, q, deny, allow_tids)
     memory += _knowledge_block(store, q, deny)
-    rules = cfg.ai_rules_text()
-    rules_block = f"\n[사용자 지침 — 우선 적용]\n{rules}\n" if rules else ""
+    rules = rules_block(cfg)
 
     hits: dict[int, dict] = {}
     read: dict[int, dict] = {}
@@ -1100,7 +1215,7 @@ def ask(store: Store, cfg: Config, question: str, backend: str | None = None,
         totals = _thread_totals(store, read)
         step_prompt = _fit(lambda per: STEP.format(
             question=q, today=day, dsl=_DSL, previous=prev,
-            memory=memory, rules=rules_block,
+            memory=memory, rules=rules,
             queries="\n".join(f"- {x}" for x in queries) or "(없음)",
             hits=_fmt_hits(hits),
             read=_fmt_read(read, per, totals),
@@ -1150,7 +1265,7 @@ def ask(store: Store, cfg: Config, question: str, backend: str | None = None,
     totals = _thread_totals(store, read)
     answer_prompt = _fit(lambda per: ANSWER.format(
         question=q, today=day, span=_evidence_span(read), previous=prev,
-        memory=memory, rules=rules_block, guide=guide, hits=_fmt_hits(hits),
+        memory=memory, rules=rules, guide=guide, hits=_fmt_hits(hits),
         read=_fmt_read(read, per, totals)), budget)
     if progress:
         progress(f"답변 작성 중 · 콜 {calls + 1}/{MAX_CALLS} · 송신 "

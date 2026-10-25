@@ -39,13 +39,15 @@ HARVEST = """당신은 업무 메일에서 '축적할 사실'을 수확하는 �
 - #<스레드번호> | <사안 상태 변화: 이전 → 이후> | 인용: "<원문 문장 그대로>"
 ## 암묵지 후보
 - 제목: <재사용 가능한 자기완결 한 문장 — "X 는 Y 로 한다/풀었다" 꼴> | 내용: <2~4문장. 왜 그렇게 하는지, 시도했다 안 된 것이 있으면 그것도> | #<스레드번호>[, #<스레드번호>] | 인용: "<근거가 명시된 원문 문장 그대로>"
+- (기존 지식의 결론을 바꾸는 후보만) 제목: … | 내용: … | #<스레드번호> | 대체: <파일 이름> | 인용: "…"
 
 규칙:
 - '암묵지'는 **검색으로 알 수 있는 일반 지식을 제외**하라 — 이 조직·이 프로젝트 고유의 판단 기준, 제약, 우회로, 합의된 방식만. 확정된 합의("X 로 하기로 했다")도 그 이유가 함께 있으면 암묵지다. 완결된 일만이 아니다: 진행 중이어도 방식이 명시돼 있으면 캐라. 실패한 시도(무엇을 왜 기각했는지)는 그 자체로 지식이다.
 - 인용은 반드시 원문에 있는 문장을 글자 그대로 옮겨라 (요약·의역 금지). 인용할 문장이 없으면 그 항목을 만들지 마라.
 - 없는 스레드 번호를 만들지 마라. 억지로 채우지 마라 — 없으면 "- 없음".
+- [이미 있는 지식]과 같은 내용은 후보로 내지 마라. 오늘 메일이 저장된 지식의 결론을 바꾸면(번복·수정·폐기) 그 후보에 `대체: <파일 이름>` 을 붙여라 — 목록에 있는 파일 이름 그대로, `#` 없이, `인용:` 앞에.
 
-{rules}[직전 델타 — 반복 금지]
+{rules}{known}[직전 델타 — 반복 금지]
 {yesterday}
 
 [스레드]
@@ -86,6 +88,8 @@ _TID_RX = re.compile(r"#(\d+)")
 _QUOTE_RX = re.compile(r"인용\s*[:：]\s*[\"“]?(.*?)[\"”]?\s*$")
 _KN_TITLE_RX = re.compile(r"제목\s*[:：]\s*([^|]+)")
 _KN_BODY_RX = re.compile(r"내용\s*[:：]\s*([^|]+)")
+# 파이프로 시작하는 필드만 — 내용 문장 속 "대체:" 를 관계로 오인하지 않게
+_KN_SUPER_RX = re.compile(r"\|\s*대체\s*[:：]\s*([^|]+)")
 _SEC_RX = re.compile(r"^##\s*(.+?)\s*$", re.M)
 # 어제 데일리 md 에서 델타 절을 떼는 정규식. **모델 출력의 절 이름(`## 오늘 델타`)이
 # 아니라 렌더된 파일의 절 이름**이어야 한다 — 데일리는 `## 오늘 확정·변경 (N건)` 으로
@@ -213,16 +217,21 @@ def parse_harvest(text: str) -> dict:
         _tid, quote = _parse_line_common(ln)
         tm = _KN_TITLE_RX.search(ln)
         bm = _KN_BODY_RX.search(ln)
+        sm = _KN_SUPER_RX.search(ln)
         # 암묵지는 스레드가 여럿일 수 있다 — 줄의 # 전부를 모은다
         tids = [int(m) for m in _TID_RX.findall(ln)]
         if not tm or not tids:
             continue
-        knowledge.append({
+        item = {
             "title": tm.group(1).strip()[:200],
             "body": (bm.group(1).strip() if bm else "")[:1000],
             "thread_ids": tids,
             "quote": quote,
-        })
+        }
+        if sm:
+            # 원시 값 — 실재 여부는 harvest 가 색인과 대조한다
+            item["supersedes"] = sm.group(1).strip()[:200]
+        knowledge.append(item)
 
     return {"delta": delta,
             "person": person, "project": project, "knowledge": knowledge}
@@ -487,12 +496,16 @@ def harvest(store: Store, cfg: Config, det: dict,
     rules = cfg.ai_rules_text()
     rules_block = f"[사용자 지침 — 우선 적용]\n{rules}\n\n" if rules else ""
     period = date_iso if start_day >= date_iso else f"{start_day} ~ {date_iso}"
-    prompt = HARVEST.format(date=period, rules=rules_block,
+    from . import knowledge as knowledge_mod   # 지연 임포트 — knowledge 가 review 를 임포트
+    knowledge_mod.reindex(cfg, store)          # 밖에서 고친 지식까지 보고 판단한다
+    known, known_stems = knowledge_mod.known_block(store)
+    prompt = HARVEST.format(date=period, rules=rules_block, known=known,
                             yesterday=_recent_delta(cfg, date_iso),
                             items=items)
     try:
         raw = review.ai_run(cmd, prompt, timeout=HARVEST_TIMEOUT,
                             retries=HARVEST_RETRIES,
+                            system_prompt=review.MAIL_TASK_SYSTEM,
                             on_event=on_event, cancel=cancel)
     except review.AIError as e:
         review._notify_error(on_error, e)   # 삼키는 자리가 곧 보고 자리
@@ -533,9 +546,14 @@ def harvest(store: Store, cfg: Config, det: dict,
         if not any(checker.ok(t, k["quote"]) for t in k["thread_ids"]):
             dropped += 1
             continue
+        # 대체 대상은 **코드가 대조**한다 — 목록에 실었던 파일 이름이 아니면
+        # 버린다(후보 자체는 살린다). 없는 파일을 가리키는 관계는 화면에서
+        # 사람을 헷갈리게 할 뿐이다.
+        sup = knowledge_mod.stem_of(k.get("supersedes", ""))
         kid = store.add_knowledge_candidate(
             date_iso, k["title"], k["body"],
-            ";".join(str(t) for t in k["thread_ids"]), k["quote"])
+            ";".join(str(t) for t in k["thread_ids"]), k["quote"],
+            supersedes=sup if sup in known_stems else "")
         if kid:                            # None = 중복(살아 있는 같은 제목)
             knowledge_saved.append({**k, "id": kid})
 
@@ -579,6 +597,7 @@ DOSSIER = """당신은 담당자(나)의 동료 한 사람에 대한 **짧은 �
   인용은 '대상 인물 직접 작성 발췌'에 그대로 있는 조각이어야 한다(코드가 원문과
   대조해 틀리면 그 줄을 버린다). 나머지 두 슬롯은 **인용 없이** 서술만 쓴다.
 - 요약·신호·내 회신·기존 카드는 문맥 전용이다. 그 텍스트를 인용 근거로 쓰지 마라.
+- [사용자 지침]이 붙어 있으면 호칭·용어 해석에 따르되, 인용 근거는 발췌에서만 딴다.
 
 ## 한 줄
 - 이 사람이 나에게 어떤 상대인가 — 무엇을 맡은 누구이고 우리 사이에 주로 무엇이
@@ -606,7 +625,7 @@ DOSSIER = """당신은 담당자(나)의 동료 한 사람에 대한 **짧은 �
 
 [기존 카드 — 새 재료로 갱신, 없으면 새로 작성]
 {prev}
-
+{rules}
 위 형식대로 카드만 출력하라:"""
 
 # 슬롯 계약(2026-08-18). 진단(review._DIAG_*)과 같은 모양이다 — **사실 슬롯만
@@ -711,9 +730,16 @@ def _gen_dossier(store: Store, cfg: Config, cmd, addr: str,
     materials = _dossier_materials(store, cfg, addr, name)
     if materials is None:
         return DossierResult("no_material")
-    prompt = DOSSIER.format(prev=(prev_md or "(없음)"), **materials)
+    from . import ask as ask_mod     # 지연 임포트 — ask 가 distill 을 임포트
+    # 지침만 싣는다(2026-10-25). ai-rules.md 의 "'팀장'은 누구" 같은 사내 호칭이
+    # 인물 카드에 가장 필요한데 여기만 빠져 있었다. 노트·지식은 싣지 않는다 —
+    # 카드는 그 사람이 직접 쓴 발췌로만 검증하는 계약이라 다른 문맥이 섞일
+    # 자리가 아니다.
+    prompt = DOSSIER.format(prev=(prev_md or "(없음)"),
+                            rules=ask_mod.rules_block(cfg), **materials)
     try:
-        raw = review.ai_run(cmd, prompt, on_event=on_event, cancel=cancel)
+        raw = review.ai_run(cmd, prompt, system_prompt=review.MAIL_TASK_SYSTEM,
+                            on_event=on_event, cancel=cancel)
     except review.AIError:                # AICancelled 는 상위 타입이 아니라 통과
         return DossierResult("error")
     md = _sanitize_dossier(raw, _PersonQuoteChecker(store, addr))

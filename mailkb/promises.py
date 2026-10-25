@@ -81,6 +81,20 @@ def _sentences(text: str):
             yield s
 
 
+def _first_promise(text: str) -> str | None:
+    """본문에서 확정 어미 약속 문장 하나(가장 앞) — 내 약속·받을 것이 같은 규칙을 쓴다.
+
+    보존 인용(mid-join, PRESERVED_MARK 아래)은 **다른 사람이 쓴 글**이라 뗀다 —
+    안 떼면 남의 확정 어미가 첫 매치가 된다(2026-08-01 실증)."""
+    for s in _sentences(strip_preserved(text or "")):
+        if not (8 <= len(s) <= 120) or not _PROMISE_RX.search(s):
+            continue
+        if _NOT_PROMISE_RX.search(s):
+            continue
+        return s
+    return None
+
+
 def _scan(store, since: str, until: str | None, day: date) -> list[dict]:
     """[since, until] 사이 내 발신에서 약속을 뽑고 이행 정황을 붙인다.
 
@@ -96,30 +110,26 @@ def _scan(store, since: str, until: str | None, day: date) -> list[dict]:
         args.append(until)
     rows = store.db.execute(sql + " ORDER BY sent_on", args).fetchall()
     for r in rows:
-        # 보존 인용(mid-join, PRESERVED_MARK 아래)은 **상대가 쓴 글**이다. 안 떼면
-        # 남의 확정 어미가 첫 매치가 되어 '내 약속'으로 보고된다(2026-08-01 실증).
-        for s in _sentences(strip_preserved(r["new_content"] or "")):
-            if not (8 <= len(s) <= 120) or not _PROMISE_RX.search(s):
-                continue
-            if _NOT_PROMISE_RX.search(s):
-                continue
-            key = store.report_key(r["id"], s)
-            after = store.db.execute(
-                "SELECT is_sent FROM messages WHERE thread_id=? AND id>?",
-                (r["thread_id"], r["id"])).fetchall()
-            sent_day = datetime.fromisoformat(r["sent_on"]).date()
-            m = _WHEN_RX.search(s)
-            out.append({
-                "key": key, "thread_id": r["thread_id"], "message_id": r["id"],
-                "subject": r["subject"] or "", "quote": s,
-                "days": (day - sent_day).days,
-                "due": resolve_when(m.group(0), sent_day) if m else None,
-                "replies_after": sum(1 for a in after if not a["is_sent"]),
-                # 이행 정황 — 그 뒤 내가 그 스레드에 보냈거나, 사용자가 접었거나
-                "followed_up": any(a["is_sent"] for a in after),
-                "marked_done": key in done_keys,
-            })
-            break                          # 메일당 한 건만 (가장 앞 문장)
+        # 보존 인용은 상대가 쓴 글이다 — _first_promise 가 떼고 본다.
+        s = _first_promise(r["new_content"])   # 메일당 한 건만 (가장 앞 문장)
+        if s is None:
+            continue
+        key = store.report_key(r["id"], s)
+        after = store.db.execute(
+            "SELECT is_sent FROM messages WHERE thread_id=? AND id>?",
+            (r["thread_id"], r["id"])).fetchall()
+        sent_day = datetime.fromisoformat(r["sent_on"]).date()
+        m = _WHEN_RX.search(s)
+        out.append({
+            "key": key, "thread_id": r["thread_id"], "message_id": r["id"],
+            "subject": r["subject"] or "", "quote": s,
+            "days": (day - sent_day).days,
+            "due": resolve_when(m.group(0), sent_day) if m else None,
+            "replies_after": sum(1 for a in after if not a["is_sent"]),
+            # 이행 정황 — 그 뒤 내가 그 스레드에 보냈거나, 사용자가 접었거나
+            "followed_up": any(a["is_sent"] for a in after),
+            "marked_done": key in done_keys,
+        })
     out.sort(key=lambda p: (p["due"] or date(9999, 1, 1), -p["days"]))
     return out
 
@@ -154,3 +164,79 @@ def review_period(store, start: str, end: str, today: str | None = None) -> dict
     keys = {p["key"] for p in kept}
     return {"kept": kept, "start": start, "end": end,
             "open": [p for p in items if p["key"] not in keys]}
+
+
+# ------------------------------------------------------------------ 받을 것
+# 상대가 나에게 한 약속(2026-10-25). 내 약속의 거울이다 — 같은 확정 어미 규칙을
+# **나를 To 에 넣은 상대 메일**에 그대로 쓴다. 2026-07-30 에 폐기한 '답 기다리는
+# 내 발신'과 성격이 다르다: 그것은 내 메일이 요청인지를 정규식으로 **추측**했고
+# ("별첨 참고 바랍니다"가 1위), 이것은 상대가 직접 쓴 확정 문장을 **인용**한다.
+
+def _scan_owed(store, since: str, until: str | None, day: date,
+               direct_to: int, is_noise=None) -> list[dict]:
+    """[since, until] 사이 나를 To 에 넣은 수신 메일에서 상대의 확정 약속을 뽑는다.
+
+    - To 가 direct_to 명 이하일 때만 — 단체 메일의 "공유하겠습니다"는 나에게 한
+      약속이 아니다(주간 `_direct_to_me` 와 같은 정의).
+    - 노이즈 발신(시스템 알림 등)과 숨긴 스레드는 뺀다 — 숨김은 "조용히 하라"다.
+    - **해제**: 그 뒤 **같은 사람**이 그 스레드에 다시 보냈으면 뺀다(보냈거나
+      진행을 알렸다는 정황). 내 회신이나 다른 사람의 메일로는 풀리지 않는다 —
+      내가 재촉한 것은 상대가 지킨 것이 아니다. '처리함'으로 접은 것도 뺀다."""
+    me = {a.lower() for a in store.my_addresses}
+    hidden = store.hidden_thread_ids()
+    done_keys = store.report_done_keys("owed")
+    sql = ("SELECT id, thread_id, sent_on, subject, new_content, sender_addr, "
+           "sender_name, to_addrs FROM messages WHERE is_sent=0 AND sent_on >= ?")
+    args = [since]
+    if until:
+        sql += " AND sent_on < date(?, '+1 day')"
+        args.append(until)
+    out = []
+    for r in store.db.execute(sql + " ORDER BY sent_on", args).fetchall():
+        if r["thread_id"] in hidden:
+            continue
+        sender = (r["sender_addr"] or "").lower()
+        if not sender or (is_noise and is_noise(sender)):
+            continue
+        tos = [a.strip().lower() for a in (r["to_addrs"] or "").split(";")
+               if a.strip()]
+        if not (set(tos) & me) or len(tos) > direct_to:
+            continue
+        s = _first_promise(r["new_content"])
+        if s is None:
+            continue
+        key = store.report_key(r["id"], s)
+        after = store.db.execute(
+            "SELECT sender_addr FROM messages WHERE thread_id=? AND id>?",
+            (r["thread_id"], r["id"])).fetchall()
+        sent_day = datetime.fromisoformat(r["sent_on"]).date()
+        m = _WHEN_RX.search(s)
+        out.append({
+            "key": key, "thread_id": r["thread_id"], "message_id": r["id"],
+            "subject": r["subject"] or "", "quote": s,
+            "who": r["sender_name"] or r["sender_addr"] or "",
+            "addr": sender, "sent_on": r["sent_on"],
+            "days": (day - sent_day).days,
+            "due": resolve_when(m.group(0), sent_day) if m else None,
+            "followed_up": any((a["sender_addr"] or "").lower() == sender
+                               for a in after),
+            "marked_done": key in done_keys,
+        })
+    out.sort(key=lambda p: (p["due"] or date(9999, 1, 1), -p["days"]))
+    return out
+
+
+def extract_owed(store, today: str | None = None,
+                 max_days: int = PROMISE_MAX_DAYS, direct_to: int = 4,
+                 is_noise=None) -> list[dict]:
+    """상대가 나에게 한 약속 중 **그 뒤 그 사람에게서 소식이 없는 것**.
+
+    '안 지켰다'고 단정하지 않는다 — 메일 밖이나 다른 스레드로 왔을 수 있다.
+    사실("그 뒤 이 사람이 이 스레드에 보낸 것 없음")만 적고 '처리함'으로 접게 한다.
+    """
+    day = date.fromisoformat(today) if today else date.today()
+    floor = (day - timedelta(days=max_days)).isoformat()
+    return [p for p in _scan_owed(store, floor, day.isoformat(), day,
+                                  direct_to, is_noise)
+            if not p["followed_up"] and not p["marked_done"]]
+

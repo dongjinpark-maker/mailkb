@@ -6,11 +6,13 @@
 지원 연산자 (나머지 토큰은 키워드):
     from: to: cc:            사람/주소 (이름은 공백 무시 매칭, @있으면 주소)
     after: before: on:       날짜 경계 (YYYY | YYYY-MM | YYYY-MM-DD)
+                             after:/before: 는 오늘 기준 상대값도 — 7d · 2w · 3m · 1y
     is:unread|read|sent|received|flagged
     has:attachment
     file:                    첨부 파일명
     thread:N
     "정확한 구"               연속 구(phrase)
+    -낱말  -"구"             빼기 — 제목·본문에 그것이 든 메일 제외
 
 trigram FTS 는 3글자 미만 토큰을 색인하지 못한다(한국어 2자어 '모델·평가·서빙'
 등은 개별 MATCH 0건). 그래서 2자 이하 키워드는 FTS 가 아니라 LIKE 로 라우팅하고,
@@ -33,13 +35,17 @@ _IS_VALUES = {"unread", "read", "sent", "received", "flagged"}
 # 그래서 `#N` 은 메일로 고정한다. 스레드 축은 이미 `thread:` 가 있다.
 _MID_RX = re.compile(r"^#(\d{1,15})$")
 
-# `key:"quoted val"` | `key:val` | "quoted phrase" | bare
+# `key:"quoted val"` | `key:val` | -"빼는 구" | "quoted phrase" | bare
 _TOKEN_RX = re.compile(r'''
     (?P<key>\w+):"(?P<kqval>[^"]*)"      # from:"강 미래"
   | (?P<key2>\w+):(?P<val>\S+)           # from:강미래  after:2026-06
+  | -"(?P<nphrase>[^"]*)"                # -"빼는 구"
   | "(?P<phrase>[^"]*)"                  # "정확한 구"
-  | (?P<term>\S+)                        # 맨 키워드
+  | (?P<term>\S+)                        # 맨 키워드 (-로 시작하면 빼기)
 ''', re.VERBOSE)
+
+# 오늘 기준 상대 날짜 — after:2w = 2주 전부터. 단위는 d·w·m·y 넷(2026-10-25).
+_REL_RX = re.compile(r"(\d{1,3})([dwmy])", re.IGNORECASE)
 
 
 @dataclass
@@ -56,6 +62,7 @@ class Query:
     is_flags: set = field(default_factory=set)
     has_attach: bool = False
     files: list = field(default_factory=list)
+    exclude: list = field(default_factory=list)    # -낱말 · -"구" (제목·본문에 있으면 제외)
 
     def has_text(self) -> bool:
         return bool(self.terms or self.phrases)
@@ -63,7 +70,7 @@ class Query:
     def has_filters(self) -> bool:
         return bool(self.from_ or self.to or self.cc or self.after or self.before
                     or self.thread or self.mid or self.is_flags
-                    or self.has_attach or self.files)
+                    or self.has_attach or self.files or self.exclude)
 
 
 # ─────────────────────────────────────────────────────── 날짜 경계
@@ -101,6 +108,27 @@ def date_ceil(s: str) -> str | None:
     return f"{y + 1}-01-01"
 
 
+def date_relative(s: str, today=None) -> str | None:
+    """'7d'·'2w'·'3m'·'1y' → 오늘에서 그만큼 앞선 날(ISO). 아니면 None.
+
+    달·해는 달력으로 뺀다(3m = 석 달 전 같은 날, 없는 날이면 그달 말일). 날짜
+    필터의 '최근 2주' 같은 말을 사람이 날짜 계산 없이 쓰게 하려는 것이다."""
+    import calendar
+    from datetime import date, timedelta
+    m = _REL_RX.fullmatch((s or "").strip())
+    if not m:
+        return None
+    n, unit = int(m.group(1)), m.group(2).lower()
+    base = today or date.today()
+    if unit in "dw":
+        return (base - timedelta(days=n * (7 if unit == "w" else 1))).isoformat()
+    months = n * (12 if unit == "y" else 1)
+    y, mo = divmod(base.year * 12 + (base.month - 1) - months, 12)
+    mo += 1
+    day = min(base.day, calendar.monthrange(y, mo)[1])
+    return date(y, mo, day).isoformat()
+
+
 # ─────────────────────────────────────────────────────── 파서
 
 def parse_query(text: str) -> Query:
@@ -116,6 +144,12 @@ def parse_query(text: str) -> Query:
             else:
                 q.terms.append(m.group(0))       # 알 수 없는 key:val → 키워드(URL 등)
             continue
+        nph = m.group("nphrase")
+        if nph is not None:
+            nph = nph.strip()
+            if nph:
+                q.exclude.append(nph)
+            continue
         ph = m.group("phrase")
         if ph is not None:
             ph = ph.strip()
@@ -127,6 +161,11 @@ def parse_query(text: str) -> Query:
             mm = _MID_RX.match(term)
             if mm:
                 q.mid = int(mm.group(1))      # 마지막 것이 이긴다(필터는 하나)
+                continue
+            # -낱말 = 빼기. '-' 하나만이거나 '--' 로 시작하면 그냥 낱말로 둔다
+            # (구분선·옵션 표기를 빼기로 오해하지 않게).
+            if len(term) > 1 and term[0] == "-" and term[1] != "-":
+                q.exclude.append(term[1:])
                 continue
             q.terms.append(term)
     return q
@@ -143,11 +182,11 @@ def _apply_field(q: Query, key: str, val: str) -> None:
     elif key == "cc":
         q.cc.append(val)
     elif key == "after":
-        d = date_floor(val)
+        d = date_relative(val) or date_floor(val)
         if d:
             q.after = d if q.after is None else max(q.after, d)
     elif key == "before":
-        d = date_floor(val)
+        d = date_relative(val) or date_floor(val)
         if d:
             q.before = d if q.before is None else min(q.before, d)
     elif key == "on":

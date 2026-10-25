@@ -89,11 +89,19 @@ def _direct_to_me(to_addrs: str, me: set, direct_to: int) -> bool:
     return bool(set(tos) & me) and len(tos) <= direct_to
 
 
-def collect(store: Store, cfg: Config, start: str, end: str) -> list[dict]:
+def collect(store: Store, cfg: Config, start: str, end: str,
+            only_uninvolved: bool = False) -> list[dict]:
     """창 안에서 내가 관여한 스레드 + 관여도 점수(높은 순).
 
     점수 = 지목 5 · 내 발신에 온 답장 4 · 직접 수신 3 · 내 발신 2 · 결정 3 · 기한 2.
     숨김·노이즈는 제외. 종결 여부는 넣지 않는다.
+
+    only_uninvolved=True 는 반대쪽 — **내가 안 낀** 스레드 중 결정·기한이 오간
+    것만(2026-10-25, 일간 머리글 후보 전용). 관여 축 대신 내용 관문을 건다:
+    결정 또는 기한 신호가 있고, 그 신호가 난 메일의 To 가 단체 발송 기준
+    (cfg.broadcast_to) 미만이며, 두 사람 이상이 말을 보탰을 것. 전사 공지의
+    "~까지 제출"과 한 사람의 통보를 거르려는 것이다. 점수는 결정·기한 항만.
+    주간 보고는 '내가 한 일' 보고라 이 모드를 쓰지 않는다(사용자 결정).
     """
     me = set(store.my_addresses)
     hidden = store.hidden_thread_ids()
@@ -137,10 +145,23 @@ def collect(store: Store, cfg: Config, start: str, end: str) -> list[dict]:
                 t["people"][who] = t["people"].get(who, 0) + 1
         t["decision"] += int(r["has_decision"] or 0)
         t["deadline"] += int(r["has_deadline"] or 0)
+        if r["has_decision"] or r["has_deadline"]:
+            n_to = sum(1 for a in (r["to_addrs"] or "").split(";") if a.strip())
+            if n_to < cfg.broadcast_to:
+                t["sig_narrow"] = True          # 단체 발송이 아닌 메일에서 난 신호
 
     out = []
     for t in th.values():
-        if not (t["sent"] or t["named"] or t["direct"]):
+        involved = t["sent"] or t["named"] or t["direct"]
+        if only_uninvolved:
+            if (involved or not (t["decision"] or t["deadline"])
+                    or not t.get("sig_narrow") or len(t["people"]) < 2):
+                continue
+            t["score"] = min(t["decision"], 2) * 3 + min(t["deadline"], 2) * 2
+            t["involved"] = False
+            out.append(t)
+            continue
+        if not involved:
             continue                            # 내가 관여하지 않은 스레드는 제외
         t["score"] = (t["named"] * 5 + t["replies"] * 4 + t["direct"] * 3
                       + t["sent"] * 2 + min(t["decision"], 2) * 3

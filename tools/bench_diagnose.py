@@ -170,11 +170,11 @@ def main() -> int:
                 continue
             lines.append(f"\n## #{tid} {subject} ({n}통 · 원문 출처: {src})\n")
             for label, blob in (("minerva", mine), ("raw", raw)):
-                # 관련 스레드는 **양쪽 모두 뺀다** — 이 비교의 변수는 '재료를
-                # 인용 제거했는가' 하나여야 한다(경쟁자에게는 관련 스레드를
-                # 붙일 수단 자체가 없기도 하다).
+                # 관련 스레드·노트·지식은 **양쪽 모두 뺀다** — 이 비교의 변수는
+                # '재료를 인용 제거했는가' 하나여야 한다(경쟁자에게는 관련
+                # 스레드를 붙일 수단 자체가 없기도 하다).
                 r = _run(cmd, review.THREAD_DIAGNOSE.format(
-                    subject=subject, messages=blob, related=""))
+                    subject=subject, messages=blob, related="", memory=""))
                 rows.append((tid, label, len(blob), r))
                 lines.append(f"### {label} — 재료 {len(blob):,}자 · "
                              f"입력 {r['in']:,}토큰 · 출력 {r['out']:,}토큰 · "

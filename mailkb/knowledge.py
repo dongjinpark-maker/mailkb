@@ -131,7 +131,7 @@ def _thread_material(store: Store, tids: list[int], cap: int = 6000) -> str:
 
 
 def save_candidate(cfg: Config, store: Store, cid: int,
-                   backend: str | None = None) -> Path:
+                   backend: str | None = None, cancel=None) -> Path:
     """후보 → md 파일. **여기가 파일이 생기는 유일한 지점**이다.
 
     보강(AI 1콜)을 저장 시점에 시도하고, 실패하면 수확본 그대로 저장한다 —
@@ -140,6 +140,10 @@ def save_candidate(cfg: Config, store: Store, cid: int,
     보강 실패 여부는 `save_candidate.last_enriched` 에 남는다(호출 직후에만
     유효한 관측값). 종전에는 실패가 완전히 조용해서, 사용자는 "지식으로 저장:
     x.md" 성공 메시지만 보고 본문이 보강본인지 수확본인지 알 길이 없었다.
+
+    cancel(threading.Event)이 서면 `review.AICancelled` 가 그대로 올라간다 —
+    중지는 실패가 아니라 "지금은 저장하지 않겠다"이므로 수확본으로 저장하지
+    않고, 파일도 안 만들고, 후보는 pending 으로 남는다(2026-10-25).
     """
     row = store.knowledge_candidate(cid)
     if row is None or row["status"] != "pending":
@@ -151,7 +155,8 @@ def save_candidate(cfg: Config, store: Store, cid: int,
         cmd = cfg.ai_cmd(backend)
         enriched = review.ai_run(cmd, ENRICH.format(
             title=row["title"], body=body or "(내용 없음)",
-            threads=_thread_material(store, tids)))
+            threads=_thread_material(store, tids)),
+            system_prompt=review.MAIL_TASK_SYSTEM, cancel=cancel)
         enriched = enriched.strip()
         if enriched:
             body = enriched
@@ -167,12 +172,20 @@ def save_candidate(cfg: Config, store: Store, cid: int,
         save_candidate.last_enriched = False   # 백엔드 미설정·실패 → 수확본 유지
 
     path = _unique_path(cfg, row["date"], row["title"])
+    saved = date.today().isoformat()
+    # 대체 관계는 **새 파일에만** 적는다 — 옛 파일은 사람 산출물이라 코드가 고치지
+    # 않는다. 역방향(대체됨)은 색인이 조회 때 계산한다(superseded_stems).
+    # 저장 사이에 대상 파일이 지워졌으면 관계도 버린다(없는 것을 가리키지 않게).
+    sup = (row["supersedes"] or "").strip() if "supersedes" in row.keys() else ""
+    if sup and not (kn_dir(cfg) / f"{sup}.md").is_file():
+        sup = ""
     text = "\n".join([
         "---",
         f"created: {row['date']}",
         f"source: {row['source']}",
         f"threads: [{', '.join(str(t) for t in tids)}]",
-        f"saved: {date.today().isoformat()}",
+        f"saved: {saved}",
+        *([f"supersedes: {sup}.md"] if sup else []),
         "---",
         "",
         f"# {row['title']}",
@@ -185,7 +198,8 @@ def save_candidate(cfg: Config, store: Store, cid: int,
     path.write_text(text, encoding="utf-8")
     store.set_knowledge_status(cid, "saved", str(path))
     store.index_knowledge(str(path), row["title"], row["threads"] or "",
-                          path.stat().st_mtime, body)
+                          path.stat().st_mtime, body, saved=saved,
+                          supersedes=sup, parse_ver=PARSE_VER)
     return path
 
 
@@ -193,6 +207,58 @@ def save_candidate(cfg: Config, store: Store, cid: int,
 
 _TITLE_RX = re.compile(r"(?m)^#\s+(.+)$")
 _FM_THREADS_RX = re.compile(r"(?m)^threads:\s*\[([^\]]*)\]")
+_FM_KEY_RX = re.compile(r"(?m)^(saved|created|supersedes):[ \t]*(.*?)[ \t]*$")
+_DATE_RX = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+# 색인이 frontmatter 에서 읽는 것이 늘면 올린다 — reindex 가 mtime 이 같아도 한 번
+# 다시 읽는다. 1: saved·supersedes(2026-10-25).
+PARSE_VER = 1
+
+
+def stem_of(value: str) -> str:
+    """'x.md'·'x'·경로 → 파일 이름(확장자 없음). 모델·사람이 어떤 꼴로 적어도
+    같은 키가 되게 한다."""
+    v = (value or "").strip().strip("`'\"").strip()
+    return Path(v).stem if v else ""
+
+
+def parse_meta(text: str) -> dict:
+    """frontmatter 의 날짜·대체 관계 — {"saved": YYYY-MM-DD|"", "supersedes": 파일 이름|""}.
+
+    모든 키가 선택적이다. 조사 세션이 vault/knowledge 에 직접 쓴 md 는 frontmatter
+    가 없거나 일부만 있을 수 있다(agent-guides/minerva-researcher.md) — 그래도
+    색인·목록이 깨지면 안 된다. saved 가 없으면 created 를 쓴다."""
+    meta = {"saved": "", "supersedes": ""}
+    if not text.startswith("---"):
+        return meta
+    end = text.find("\n---", 3)
+    if end == -1:
+        return meta
+    found = {k: v for k, v in _FM_KEY_RX.findall(text[:end])}
+    for key in ("saved", "created"):
+        m = _DATE_RX.search(found.get(key, ""))
+        if m:
+            meta["saved"] = m.group(0)
+            break
+    meta["supersedes"] = stem_of(found.get("supersedes", ""))
+    return meta
+
+
+def superseded_stems(rows) -> dict:
+    """{대체된 파일 이름: 대체한 색인 행} — 조회 때 계산한다(저장하지 않는다).
+
+    대상이 실제 색인에 있을 때만 센다. 자기 자신을 가리키는 것은 무시한다.
+    둘 이상이 같은 것을 대체하면 저장일이 늦은 쪽을 남긴다."""
+    stems = {Path(r["path"]).stem for r in rows}
+    out: dict = {}
+    for r in rows:
+        sup = (r["supersedes"] or "") if "supersedes" in r.keys() else ""
+        if not sup or sup not in stems or sup == Path(r["path"]).stem:
+            continue
+        prev = out.get(sup)
+        if prev is None or (r["saved"] or "") > (prev["saved"] or ""):
+            out[sup] = r
+    return out
 
 
 def parse_file(text: str) -> tuple[str, str, str]:
@@ -233,13 +299,65 @@ def reindex(cfg: Config, store: Store) -> int:
             seen.add(str(p))
             mtime = p.stat().st_mtime
             row = store.knowledge_row(str(p))
-            if row and abs(row["mtime"] - mtime) < 1e-6:
+            # 파싱 버전이 같을 때만 건너뛴다 — 색인이 새 frontmatter 키를 읽게
+            # 되면(PARSE_VER) 기존 행을 한 번만 다시 읽는다. 바뀐 행만 쓴다
+            # (읽기 경로에서 조건 없이 쓰지 않는다 — CLAUDE.md 9).
+            if (row and abs(row["mtime"] - mtime) < 1e-6
+                    and (row["parse_ver"] or 0) == PARSE_VER):
                 continue
             try:
-                title, threads, core = parse_file(
-                    p.read_text(encoding="utf-8"))
+                text = p.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 continue                  # 잠긴/깨진 파일은 이번 회차만 건너뛴다
-            store.index_knowledge(str(p), title or p.stem, threads, mtime, core)
+            title, threads, core = parse_file(text)
+            meta = parse_meta(text)
+            store.index_knowledge(str(p), title or p.stem, threads, mtime, core,
+                                  saved=meta["saved"],
+                                  supersedes=meta["supersedes"],
+                                  parse_ver=PARSE_VER)
             changed += 1
     return changed + store.prune_knowledge(seen)
+
+
+# ------------------------------------------------------------------ 수확 재료
+
+KNOWN_TOP = 40               # 수확 프롬프트에 싣는 저장 지식 건수 상한(최근 저장순)
+KNOWN_CHARS = 3_000          # 그 블록 전체 상한(자) — 수확 시간은 입력 크기에 비례한다
+
+
+def known_block(store: Store) -> tuple[str, set]:
+    """수확 프롬프트의 [이미 있는 지식] 블록과, 대체 대상으로 받아 줄 파일 이름 집합.
+
+    왜 있나(2026-10-25): 수확이 기존 지식을 몰라 같은 노하우를 제목만 바꿔 다시
+    캤고(중복 검사는 제목 완전 일치뿐), 결론이 뒤집혀도 옛 지식과 새 후보가 같은
+    무게로 남았다. 목록을 보여 주고 (1) 같은 것은 내지 말고 (2) 결론을 바꾸면
+    `대체: <파일 이름>` 을 달게 한다. 파일 이름은 코드가 이 집합과 대조한다.
+
+    대기 후보는 파일이 없어 대체 대상이 될 수 없다 — 중복 방지용으로 제목만 싣는다.
+    대체된 지식은 목록에서 뺀다(이미 끝난 결론을 또 대체하게 하지 않는다)."""
+    rows = store.knowledge_all()
+    gone = superseded_stems(rows)
+    live = [r for r in rows if Path(r["path"]).stem not in gone]
+    live.sort(key=lambda r: (r["saved"] or "", r["mtime"]), reverse=True)
+    lines, ok, size = [], set(), 0
+    for r in live[:KNOWN_TOP]:
+        stem = Path(r["path"]).stem
+        ln = f"- {stem}: {r['title']}"
+        if size + len(ln) > KNOWN_CHARS:
+            break
+        lines.append(ln)
+        ok.add(stem)
+        size += len(ln) + 1
+    pend = [f"- (대기) {r['title']}"
+            for r in store.knowledge_candidates(status="pending")]
+    for ln in pend:
+        if size + len(ln) > KNOWN_CHARS:
+            break
+        lines.append(ln)
+        size += len(ln) + 1
+    if not lines:
+        return "", ok
+    return ("[이미 있는 지식 — 같은 내용이면 후보로 내지 마라. "
+            "'파일 이름: 제목' 꼴이고 (대기)는 아직 저장 전이다]\n"
+            + "\n".join(lines) + "\n\n"), ok
+

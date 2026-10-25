@@ -3074,32 +3074,41 @@ _APP_JS = r"""
      — 3건을 넣고 몇 분간 아무것도 안 변하면 멈춘 것으로 읽힌다. 다만 inject() 는
      scrollTop 을 0 으로 되돌리므로 3초마다 부르면 안 된다. [data-kn-cards]
      안만 갈아 끼운다(patchJob 의 #{p}-extra 와 같은 방식). id 가 아닌 이유는
-     이 절이 두 패널에 동시에 뜰 수 있어서다(회고=우측 · 지식 탭=좌측). */
+     같은 절이 회고와 지식 탭 두 화면에 뜨기 때문이다(둘 다 좌측). */
   function hookKnPolling(root) {
     var mk = root.querySelector("[data-kn-running]");
     if (!mk) return;
+    /* 마커가 있는 패널이 소유자다 — 회고·지식 탭은 좌측이다(paneFor). 종전에는
+       우측만 봐서 좌측에서 누른 저장이 첫 폴링에서 '화면 전환됨'으로 멈췄다
+       (2026-10-25). 다시 받을 곳은 마커의 data-kn-src(이 화면 자체)다. */
+    var pane = left.contains(mk) ? "left" : "right", host = paneEl(pane);
     var day = mk.getAttribute("data-kn-day") || "";
+    var src = mk.getAttribute("data-kn-src") || "";
     setTimeout(function () {
-      var u = new URL("/knowledge/status", location.origin);
+      var u;
+      if (src) u = new URL(src, location.origin);
+      else {
+        u = new URL("/knowledge/status", location.origin);
+        if (day) u.searchParams.set("date", day);  /* 보고 있는 날짜로 되돌려 받는다 */
+      }
       u.searchParams.set("frag", "1");
-      if (day) u.searchParams.set("date", day);  /* 보고 있는 날짜로 되돌려 받는다 */
       u.searchParams.set("_", Date.now());   /* 메모리 캐시 우회 */
       fetch(u.toString(), { headers: { "X-Requested-With": "fetch" } })
         .then(function (r) { return r.text(); })
         .then(function (html) {
-          if (!right.querySelector("[data-kn-running]")) return; /* 화면 전환됨 */
+          if (!host.querySelector("[data-kn-running]")) return; /* 화면 전환됨 */
           var tmp = document.createElement("div");
           tmp.innerHTML = html;
           if (!tmp.querySelector("[data-kn-running]")) {
-            inject("right", html, null);            /* 완료 → 결과 화면으로 교체 */
+            inject(pane, html, null);               /* 완료 → 결과 화면으로 교체 */
             return;
           }
           var nc = tmp.querySelector("[data-kn-cards]"),
-              oc = right.querySelector("[data-kn-cards]");
+              oc = host.querySelector("[data-kn-cards]");
           if (nc && oc && nc.innerHTML !== oc.innerHTML) oc.innerHTML = nc.innerHTML;
-          hookKnPolling(right);                     /* 다음 폴링 예약 */
+          hookKnPolling(host);                      /* 다음 폴링 예약 */
         })
-        .catch(function () { hookKnPolling(right); });
+        .catch(function () { hookKnPolling(host); });
     }, 3000);
   }
 
@@ -3945,6 +3954,11 @@ _APP_JS = r"""
   hookDossierPolling(left);
   hookAskPolling(right);        /* 조사 대기화면은 우측(대화록) — F5 복원도 우측을 본다 */
   hookSyncPolling(right);
+  /* 지식 저장 중에 새로고침·전체 로드로 들어와도 카드가 이어서 갱신되게(2026-10-25 —
+     이 목록에 없어서 첫 화면의 '저장하는 중'이 영영 멈춰 있었다). 소유 패널은
+     마커 위치로 정하므로 양쪽에 건다. */
+  hookKnPolling(left);
+  hookKnPolling(right);
   hookMore();
   hookThreadHead();
   hookWideTables(document);      /* 서버가 그린 첫 화면에도 */
@@ -6257,6 +6271,23 @@ def render_dossier(store, cfg, addr: str) -> str:
             for x in mine[:6])
         cards.append(("이 사람에게 한 내 약속", f"<ul>{lis}</ul>"))
 
+    # 4. 이 사람이 나에게 한 약속(받을 것, 2026-10-25) — 내 약속의 거울. 그 사람이
+    # 나를 To 에 넣고 쓴 확정 문장이고, 그 뒤 그 사람이 그 스레드에 다시 보내면
+    # 풀린다. 일간 회고는 늦어진 것만 올리지만 여기는 그 사람 것 전부를 보인다 —
+    # 미팅 직전에 "받을 게 뭐였지"를 보는 자리다.
+    theirs = promises.extract_owed(store, direct_to=cfg.direct_to,
+                                   is_noise=cfg.is_noise)
+    theirs = [x for x in theirs if x["addr"] == addr.lower()]
+    if theirs:
+        lis = "".join(
+            f"<li>{esc(x['quote'])} "
+            + (f"<span class='dim'>· {x['days']}일 전</span> " if x["days"] else "")
+            + (f"<span class='warn'>⚠ 기한 {x['due'].isoformat()}</span> "
+               if x.get("due") else "")
+            + f"<a href='/thread/{x['thread_id']}'>#{x['thread_id']}</a></li>"
+            for x in theirs[:6])
+        cards.append(("이 사람이 나에게 한 약속", f"<ul>{lis}</ul>"))
+
     # 5. 최근 변화 (축적된 인물 신호 — distill_signals 첫 소비처)
     sigs = store.person_signals(addr, name)
     if sigs:
@@ -6317,9 +6348,10 @@ def render_dossier(store, cfg, addr: str) -> str:
 
 
 _SEARCH_HINT = ("<p class='shint'><code>from:</code> <code>to:</code> "
-                "<code>after:2026-06</code> <code>before:</code> "
-                "<code>has:attachment</code> "
+                "<code>after:2026-06</code> <code>after:2w</code>(최근 2주) "
+                "<code>before:</code> <code>has:attachment</code> "
                 "<code>is:sent</code> · <code>\"정확한 구\"</code> "
+                "· <code>-낱말</code>(빼기) "
                 "· <code>#12345</code>(메일 번호)</p>")
 
 
@@ -6811,7 +6843,8 @@ def _review_button_forms(day: str | None = None) -> str:
             f"{review.DAILY_ETA}</span></form>")
 
 
-_DONE_KINDS = (("promise", "내 약속"), ("stalled", "오래 멈춘 스레드"),
+_DONE_KINDS = (("promise", "내 약속"), ("owed", "받을 것"),
+               ("stalled", "오래 멈춘 스레드"),
                ("deadline", "기한"), ("shift", "변화"))
 # 접기 목록의 상한. 기본 30 이면 한 종류를 31건 넘게 접었을 때 오래된 것이
 # 화면에서 계속 빠지면서 **되돌릴 방법이 없어진다**(필터는 무제한이었다).
@@ -6907,21 +6940,26 @@ def _kn_claim(cid: int, day: str) -> tuple[str, int]:
             _kn_job["queue"].append(cid)
             return "queued", len(_kn_job["queue"])
         _kn_job.update(_JOB_STREAM)     # 이전 배수의 수신 상태를 지운다
+        now = time.time()
         _kn_job.update(running=True, error="", cancel=threading.Event(),
-                       started=time.time(), cid=cid, day=day,
+                       started=now, item_started=now, cid=cid, day=day,
                        msg="", queue=[], done=[])
     return "start", 0
 
 
-def _kn_save_one(cfg, store, cid: int) -> str:
+def _kn_save_one(cfg, store, cid: int, cancel=None) -> str:
     """후보 하나를 저장하고 사람이 읽을 결과 한 줄을 돌려준다.
 
     보강 실패의 우아한 처리는 save_candidate 안에 있다(수확본으로 저장) —
     여기 오는 예외는 비-AI 오류다. **어떤 예외도 밖으로 내보내지 않는다**:
-    한 건이 실패했다고 뒤에 줄 선 것까지 버리면 안 된다."""
+    한 건이 실패했다고 뒤에 줄 선 것까지 버리면 안 된다.
+
+    중지(cancel)는 실패가 아니다 — 파일을 만들지 않고 후보를 pending 으로 둔다
+    (2026-10-25). 블로킹 백엔드는 진행 중인 콜을 못 끊어 그 한 건은 끝까지 갈 수
+    있다(review.ai_run 은 콜 경계에서 멈춘다) — 그때는 저장됐다고 그대로 말한다."""
     from . import knowledge as knowledge_mod
     try:
-        path = knowledge_mod.save_candidate(cfg, store, cid)
+        path = knowledge_mod.save_candidate(cfg, store, cid, cancel=cancel)
         msg = f"지식으로 저장: {path.name}"
         # 보강이 실패해도 저장은 된다 — 다만 조용히 두지 않는다. 본문이
         # 수확본 그대로라는 사실은 사용자가 알아야 다시 눌러 볼 수 있다.
@@ -6930,6 +6968,8 @@ def _kn_save_one(cfg, store, cid: int) -> str:
         return msg
     except ValueError as e:            # 후보 없음·이미 처리됨(대기 중 유보 포함)
         return str(e)
+    except review.AICancelled:
+        return "중지했습니다 — 저장하지 않았습니다(후보는 그대로 남아 있습니다)"
     except Exception as e:
         return ("지식을 저장하지 못했습니다 — "
                 + (" ".join(str(e).split())[:120] or type(e).__name__))
@@ -6943,18 +6983,30 @@ def _run_kn_job(cfg, cid: int) -> None:
     store = None
     with _kn_lock:
         mine = _kn_job["started"]      # 이 배수의 신분증 — finally 가 남의 배수를
-    try:                               # 끝내지 않게 한다(아래 참조)
+        ev = _kn_job.get("cancel")     # 끝내지 않게 한다(아래 참조)
+    try:
         store = Store(cfg.db_path, cfg.my_addresses, cfg.my_names, noise=cfg)
         while True:
-            msg = _kn_save_one(cfg, store, cid)
+            msg = _kn_save_one(cfg, store, cid, cancel=ev)
             with _kn_lock:
                 _kn_job["done"].append(msg)
                 _kn_job["msg"] = msg
+                # [중지]는 지금 것과 **남은 대기열 전부**를 멈춘다 — 줄 선 것만
+                # 계속 돌면 사용자는 멈춘 줄 알고 화면을 떠난다. 남은 후보는 pending
+                # 그대로라 다시 누르면 된다.
+                if ev is not None and ev.is_set():
+                    left = len(_kn_job["queue"])
+                    _kn_job.update(running=False, queue=[])
+                    if left:
+                        _kn_job["done"].append(
+                            f"중지 — 대기 중이던 {left}건은 저장하지 않았습니다"
+                            "(후보로 남아 있습니다)")
+                    return
                 if not _kn_job["queue"]:
                     _kn_job.update(running=False)
                     return
                 cid = _kn_job["queue"].pop(0)
-                _kn_job.update(cid=cid)
+                _kn_job.update(cid=cid, item_started=time.time())
             # 폴링 라우트가 day 로 화면을 다시 그린다 — DB 조회는 락 밖에서.
             row = store.knowledge_candidate(cid)
             if row is not None:
@@ -7163,6 +7215,23 @@ def _diagnosis_card(diag: list) -> str:
             + "".join(rows) + "</details></div>")
 
 
+def _supersedes_line(store, stem: str) -> str:
+    """후보 카드의 '기존 지식을 대체합니다' 줄 — 저장하면 새 파일에 관계가 남는다.
+
+    대상이 그 사이 지워졌으면 줄을 안 그린다(저장도 관계를 버린다)."""
+    if not stem:
+        return ""
+    row = next((k for k in store.knowledge_all()
+                if Path(k["path"]).stem == stem), None)
+    if row is None:
+        return ""
+    link = f"/records?tab=knowledge&doc={_q(row['path'])}"
+    # 조사를 제목 뒤에 붙이지 않는다 — 제목 끝 글자에 따라 '을/를'이 갈린다.
+    return (f"<div class='snip'>↻ 기존 지식을 대체합니다: <a href='{link}'>"
+            f"「{esc(row['title'])}」</a> — 저장하면 옛 지식은 분석 문맥에서 빠지고 "
+            "목록에 이력으로 남습니다.</div>")
+
+
 def _knowledge_cards(store, day: str, back: str | None = None) -> str:
     """암묵지 후보 카드 — day 지정 시 그날 수확분, ""(빈)이면 전체 pending.
 
@@ -7186,7 +7255,12 @@ def _knowledge_cards(store, day: str, back: str | None = None) -> str:
     # 마커는 이 화면이 폴링·meta refresh 를 걸지 정한다. day 를 함께 실어 폴링이
     # **보고 있는 날짜**를 되돌려 받게 한다 — 배수가 다른 날짜로 넘어가도 화면이
     # 남의 날로 갈아 끼워지지 않는다.
+    # data-kn-src 는 폴링이 다시 받을 **장소**(이 화면 자체)다(2026-10-25). 종전
+    # 폴링은 /knowledge/status(늘 회고 화면)를 우측 패널 기준으로 받아, 좌측에 뜬
+    # 회고·지식 탭에서는 첫 폴링에서 '화면 전환됨'으로 멈췄고, 지식 탭에서는 끝나면
+    # 회고 화면으로 바뀌었다.
     mark = (f" data-kn-running='1' data-kn-day='{esc(day)}'"
+            f" data-kn-src='{esc(back)}'"
             if kj["running"] else "")
     out = ["<div data-kn-cards>",
            f"<h2>🔧 암묵지 후보 ({len(rows)})</h2>" if rows
@@ -7200,13 +7274,20 @@ def _knowledge_cards(store, day: str, back: str | None = None) -> str:
             out.append(f"<p class='dim'>✅ {esc(m)}</p>")
     for r in rows:
         if kj["running"] and kj["cid"] == r["id"]:
-            # 저장 중 — 버튼 대신 대기 카드(마커가 폴링·meta refresh 를 건다)
+            # 저장 중 — 버튼 대신 대기 카드(마커가 폴링·meta refresh 를 건다).
+            # 경과는 서버가 센다 — 3초마다 카드 안을 새로 받으므로 그걸로 충분하다.
+            secs = int(time.time() - (kj.get("item_started") or kj.get("started")
+                                      or time.time()))
             out.append(
                 f"<div class='item waitcard'{mark}>"
                 f"⏳ <b>{esc(r['title'])}</b>"
-                "<div class='snip'>보강해서 저장하는 중 — 참조 스레드 전문을 "
-                "읽는 AI 1콜이라 수십 초 걸릴 수 있습니다. 다른 화면을 봐도 "
-                "됩니다(완료되면 여기 반영).</div></div>")
+                f"<div class='snip'>보강해서 저장하는 중 · {secs}초 경과 — 참조 "
+                "스레드 전문을 읽는 AI 1콜이라 수십 초 걸릴 수 있습니다. 다른 화면을 "
+                "봐도 됩니다(완료되면 여기 반영).</div>"
+                "<div class='actions'>"
+                "<form method='post' action='/knowledge/cancel'>"
+                f"<input type='hidden' name='back' value='{esc(back)}'>"
+                "<button class='aibtn ghost compact'>중지</button></form></div></div>")
             continue
         if kj["running"] and r["id"] in kj["queue"]:
             # 줄 서 있음 — 저장 버튼은 빼고 [유보]만 남긴다. 유보가 곧 대기
@@ -7233,6 +7314,7 @@ def _knowledge_cards(store, day: str, back: str | None = None) -> str:
         out.append(
             f"<div class='item'>🔧 <b>{esc(r['title'])}</b>{date_lbl}"
             f"<div class='snip'>{esc(r['body'])}</div>{quote}"
+            f"{_supersedes_line(store, r['supersedes'] or '')}"
             "<div class='actions'>"
             f"<form method='post' action='/knowledge/{r['id']}/save'>"
             f"<input type='hidden' name='back' value='{esc(back)}'>"
@@ -8569,18 +8651,37 @@ def render_knowledge_page(store, cfg, qs) -> str:
     if not rows:
         out.append("<p class='empty'>아직 없습니다 — AI 회고가 캐낸 후보를 "
                    "[지식으로 저장]하면 여기 쌓입니다.</p>")
+    gone = knowledge_mod.superseded_stems(rows)
+    by_stem = {Path(r["path"]).stem: r for r in rows}
+
+    def doc_link(r):
+        return f"/records?tab=knowledge&doc={_q(r['path'])}"
+
     for r in rows:
         tids = [t for t in (r["threads"] or "").split(";") if t]
         refs = " ".join(f"<a href='/thread/{t}'>#{t}</a>" for t in tids)
-        day = datetime.fromtimestamp(r["mtime"]).strftime("%Y-%m-%d")
+        # 저장일이 기준이다 — mtime 은 외부 편집기로 고치면 바뀐다(2026-10-25).
+        # frontmatter 가 없는 파일만 mtime 으로 물러선다.
+        day = (r["saved"] or
+               datetime.fromtimestamp(r["mtime"]).strftime("%Y-%m-%d"))
         snip = smart_truncate(" ".join((r["content"] or "").split()), 110)
-        link = f"/records?tab=knowledge&doc={_q(r['path'])}"
+        stem = Path(r["path"]).stem
+        rel = ""
+        if stem in gone:
+            nr = gone[stem]
+            rel = (f"<div class='snip'>↻ 대체됨 → <a href='{doc_link(nr)}'>"
+                   f"「{esc(nr['title'])}」</a> — 분석 문맥에 싣지 않습니다</div>")
+        elif (r["supersedes"] or "") in by_stem and r["supersedes"] != stem:
+            old = by_stem[r["supersedes"]]
+            rel = (f"<div class='snip'>↻ 대체: <a href='{doc_link(old)}'>"
+                   f"「{esc(old['title'])}」</a></div>")
         out.append(
-            f"<div class='item'>📄 <a href='{link}'>{esc(r['title'])}</a> "
+            f"<div class='item{' dim' if stem in gone else ''}'>📄 "
+            f"<a href='{doc_link(r)}'>{esc(r['title'])}</a> "
             f"<span class='day'>{esc(day)}</span>"
             + (f" <span class='who'>· {refs}</span>" if refs else "")
             + (f"<div class='snip'>{esc(snip)}</div>" if snip else "")
-            + "</div>")
+            + rel + "</div>")
     return "\n".join(out)
 
 
@@ -8599,7 +8700,15 @@ def _render_knowledge_doc(store, cfg, path_str: str) -> str:
         end = text.find("\n---", 3)
         if end != -1:
             body = text[end + 4:]
-    out = [back, f"<h1>📄 {esc(title or p.stem)}</h1>",
+    gone = knowledge_mod.superseded_stems(store.knowledge_all())
+    note = ""
+    if p.stem in gone:
+        nr = gone[p.stem]
+        note = (f"<p class='dim'>↻ 이 지식은 「<a href='/records?tab=knowledge&doc="
+                f"{_q(nr['path'])}'>{esc(nr['title'])}</a>」"
+                f"({esc(nr['saved'] or '')})로 대체됐습니다 — 분석 문맥에 싣지 "
+                "않습니다. 관계를 끊으려면 새 파일의 supersedes: 줄을 지우세요.</p>")
+    out = [back, f"<h1>📄 {esc(title or p.stem)}</h1>", note,
            "<div class='actions'>"
            "<form method='post' action='/knowledge/open'>"
            f"<input type='hidden' name='path' value='{esc(str(p))}'>"
@@ -8753,6 +8862,35 @@ def _report_back(raw: str) -> str:
     return out + (f"&date={day}" if re.fullmatch(r"\d{4}-\d{2}-\d{2}", day) else "")
 
 
+def _status_place(path: str, qs: dict) -> str | None:
+    """끝난 잡의 상태 주소 → 그 잡의 장소. 진행 중이거나 해당 없으면 None.
+
+    진행 중에는 상태 화면이 곧 대기 카드라 그대로 둔다. 장소: 회고 → 그 날짜의
+    일간 회고, 주간 → 기억 › 주간 보고, 동기화 → 메일함. 분석(/ask/status)은 완료
+    때 app.js 가 이미 /ask?id= 로 주소를 바꾸므로 대상이 아니다. msg 는 실어 보낸다
+    (JS 꺼짐에서 '시작되지 않았다' 같은 안내가 사라지지 않게)."""
+    if path == "/review/status":
+        with _review_lock:
+            if _review_job["running"]:
+                return None
+            d = _review_job.get("date") or ""
+        place = f"/records?tab=daily&date={_q(d)}" if d else "/records?tab=daily"
+    elif path == "/weekly/status":
+        with _weekly_lock:
+            if _weekly_job["running"]:
+                return None
+        place = "/records?tab=weekly"
+    elif path == "/sync/status":
+        with _sync_lock:
+            if _sync_job["running"]:
+                return None
+        place = "/mail"
+    else:
+        return None
+    msg = (qs.get("msg") or [""])[0]
+    return place + ("&" if "?" in place else "?") + "msg=" + _q(msg) if msg else place
+
+
 def perform_action(store, cfg, path: str, form: dict) -> str:
     """상태 변경 동작 실행 → 리다이렉트할 위치(?msg= 포함) 반환. 소켓 무관(테스트 대상).
 
@@ -8830,6 +8968,18 @@ def perform_action(store, cfg, path: str, form: dict) -> str:
             return back + sep + "msg=" + _q(f"외부 편집기로 열기: {target.name}")
         return back + sep + "msg=" + _q(
             f"편집기 자동 열기 실패, 직접 여세요: {target}")
+
+    if len(parts) == 2 and parts[0] == "knowledge" and parts[1] == "cancel":
+        # 지식 저장 중지 — Event 만 세운다. 워커가 지금 것과 남은 대기열을 멈추고,
+        # 후보는 pending 그대로 남는다(_run_kn_job). 화면은 폴링이 갈아 끼운다.
+        back = (form.get("back") or ["/records?tab=knowledge"])[0]
+        sep = "&" if "?" in back else "?"
+        with _kn_lock:
+            ev = _kn_job.get("cancel") if _kn_job["running"] else None
+        if ev is None:
+            return back + sep + "msg=" + _q("진행 중인 지식 저장이 없습니다")
+        ev.set()
+        return back + sep + "msg=" + _q("중지 요청 — 지금 콜이 끝나는 대로 멈춥니다")
 
     if len(parts) == 3 and parts[0] == "knowledge":
         # 암묵지 후보 — 저장을 눌러야 md 가 생긴다(승인 전에는 파일이 없다).
@@ -9219,6 +9369,17 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         frag = (qs.get("frag") or [""])[0] == "1"
+        if not frag:
+            # 끝난 잡의 상태 주소를 전체 페이지로 열면(새로고침·뒤로가기·JS 꺼짐의
+            # meta refresh) 그 잡의 **장소**로 보낸다(2026-10-25). 상태 주소는
+            # 폴링용이라, 끝난 뒤 다시 열면 지난 완료 문구만 덩그러니 남았다.
+            place = _status_place(path, qs)
+            if place:
+                self.send_response(303)
+                self.send_header("Location", place)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
         today = date.today().isoformat()
         store = Store(self.cfg.db_path, self.cfg.my_addresses, self.cfg.my_names, noise=self.cfg)
         try:
