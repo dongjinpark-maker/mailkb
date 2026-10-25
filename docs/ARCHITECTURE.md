@@ -338,7 +338,14 @@ HTTP 클라이언트도 없다. 인증·프록시·모델 관리는 `opencode`/`
 - `encoding="utf-8", errors="replace"` — cp949면 이모지에서 죽는다
 - claude 는 역할을 `--system-prompt` 로 분리 전달하고 `--tools ""`·
   `--no-session-persistence` 로 도구·세션 지속을 끄며, `--setting-sources
-  user` 로 저장소 CLAUDE.md 주입(콜당 약 4k 토큰)을 차단한다. **setting-sources
+  user` 로 저장소 CLAUDE.md 주입(콜당 약 4k 토큰)을 차단한다.
+  **`--strict-mcp-config` 로 MCP 서버를 0개로 둔다**(2026-10-25) — `--tools ""`
+  는 내장 도구만 끄고 사용자 범위 MCP(claude.ai 커넥터·로컬 서버)의 도구
+  스키마는 매 호출에 그대로 실렸다. 집 PC 실측: "OK" 한 마디에 입력
+  356,645토큰·5.9초 → 3,540토큰·1.3초. `--mcp-config` 없이 주면 서버가 하나도
+  뜨지 않는다. 회사 PC 는 MCP 구성에 따라 효과가 다르고, 새 CLI 버전에서는
+  `mailkb diagnose` 로 한 번 확인한다(모르는 플래그 하나가 전 호출을 죽인
+  2026-07-28 과 같은 부류). **setting-sources
   값은 반드시 `user`** — `""`(전부 제외)는 user 설정(`~/.claude/settings.json`)의
   env 까지 건너뛰는데, 그 env 가 모델 라우팅(별칭 해석·Bedrock 경유)을
   정의하는 환경에서는 `--model` 별칭이 다른 모델을 찾다 전 모델이 실패한다

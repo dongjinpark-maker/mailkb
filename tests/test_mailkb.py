@@ -14635,8 +14635,18 @@ class TestWindowsCompat(unittest.TestCase):
             self.assertEqual(out[out.index("--tools") + 1], "")
             self.assertIn("--no-session-persistence", out)
             self.assertEqual(out[out.index("--setting-sources") + 1], "user")
+            # MCP 서버 0개(2026-10-25) — 사용자 범위 MCP 도구 스키마가 매 호출에
+            # 실려 한 줄 질문이 35만 토큰이었다. 값 없는 플래그 하나다.
+            self.assertEqual(out.count("--strict-mcp-config"), 1)
+            self.assertNotIn("--mcp-config", out)
             for held in ("--json-schema", "--effort"):
                 self.assertNotIn(held, out, held)
+        # 이미 있으면 겹쳐 붙이지 않는다 · 비-claude 백엔드엔 붙지 않는다
+        out, _ = review._ai_request(["claude", "-p", "--strict-mcp-config"],
+                                    "x", None, None, None)
+        self.assertEqual(out.count("--strict-mcp-config"), 1)
+        out, _ = review._ai_request(["opencode", "run"], "x", "역할", None, None)
+        self.assertNotIn("--strict-mcp-config", out)
 
     def test_ai_request_effort_flag_opt_in(self):
         # 선언한 백엔드에만 [플래그, 값]이 붙는다 — 비-claude 도 선언이 곧

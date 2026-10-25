@@ -1446,6 +1446,12 @@ def _ai_request(cmd: list[str], prompt: str, system_prompt: str | None,
         out.append("--no-session-persistence")
     if "--setting-sources" not in out:
         out += ["--setting-sources", "user"]   # "" 금지 — docstring 참조
+    # MCP 서버를 0개로 — --tools "" 는 내장 도구만 끄고, 사용자 범위 MCP(claude.ai
+    # 커넥터·로컬 서버)의 도구 스키마는 매 호출에 그대로 실린다. 2026-10-25 집 PC
+    # 실측: "OK" 한 마디에 입력 356,645토큰·5.9초 → 이 플래그로 3,540토큰·1.3초.
+    # --mcp-config 없이 주면 서버가 하나도 안 뜬다. 인자 하나라 .cmd 셔틀에도 안전.
+    if "--strict-mcp-config" not in out:
+        out.append("--strict-mcp-config")
     return out, prompt
 
 
