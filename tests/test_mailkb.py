@@ -19829,5 +19829,546 @@ class TestFakeCorpusColors(unittest.TestCase):
             self.assertIn("--dk:", out, f"보정 누락: {r.subject[:40]}")
 
 
+
+class TestWiki(unittest.TestCase):
+    """주제 위키의 손발(`mailkb wiki …`) — 찾기·대조·수치. AI 호출 0, DB 는 읽기만.
+
+    세션(/mail-wiki)이 읽고 쓰는 동안 '주제에 속한 메일 찾기'와 '쓴 인용 대조'를
+    코드가 맡는다. 여기 테스트가 그 계약의 사양서다 — 계약 문서
+    (agent-guides/minerva-wiki.md)의 예시 줄이 `wiki.LINE_RX` 로 읽히는지도 함께 본다.
+    예시는 전부 가상 값(프로젝트 알파)."""
+
+    def setUp(self):
+        from mailkb import wiki
+        self.wiki = wiki
+        self.tmp = tempfile.TemporaryDirectory()
+        home = Path(self.tmp.name)
+        self.cfg = Config(home=home, my_addresses=[ME], ignore_senders=["noreply"])
+        self.store = Store(home / "t.sqlite", [ME], noise=self.cfg)
+        R = _rec
+        self.store.ingest([
+            # A — 제목에 별칭: 확정
+            R("a1", "park@corp.example", [ME], "알파 출시 일정", "2026-01-09T09:00:00",
+              body="1월 말 출시가 가능한지 확인 부탁드립니다."),
+            R("a2", "lee@corp.example", [ME], "RE: 알파 출시 일정", "2026-01-10T09:00:00",
+              body="2월 둘째 주로 미루는 것을 제안합니다.", reply_to="a1"),
+            R("a3", "choi@corp.example", [ME], "RE: 알파 출시 일정", "2026-01-12T18:30:00",
+              body="출시는 2월 둘째 주로 확정합니다.", reply_to="a1"),
+            # B — 제목엔 없지만 본문 절반 이상: 확정
+            R("b1", "park@corp.example", [ME], "부하 시험 결과", "2026-01-11T10:00:00",
+              body="알파 부하 시험에서 초당 1,200건까지 오류가 없었습니다."),
+            R("b2", ME, ["park@corp.example"], "RE: 부하 시험 결과", "2026-01-11T11:00:00",
+              body="알파 건 확인했습니다. 게이트웨이 이관 전 수치인지요?", reply_to="b1"),
+            # C — 이름 없음, 고유 낱말 2개: 낱말 후보
+            R("c1", "kang@corp.example", [ME], "클러스터 증설 문의", "2026-01-11T14:00:00",
+              body="게이트웨이 용량이 모자랍니다. 서명키 배포 서버도 같이 봐 주세요."),
+            # D — 무관
+            R("d1", "kang@corp.example", [ME], "주간 식단 안내", "2026-01-11T15:00:00",
+              body="이번 주 식단입니다."),
+            # E — 3통 중 1통에만 스침: 별칭 후보
+            R("e1", "kang@corp.example", [ME], "장비 반납", "2026-01-08T09:00:00",
+              body="장비 반납 일정 공유드립니다."),
+            R("e2", "lee@corp.example", [ME], "RE: 장비 반납", "2026-01-08T10:00:00",
+              body="알파 쪽 장비는 다음 주에 반납하겠습니다.", reply_to="e1"),
+            R("e3", "kang@corp.example", [ME], "RE: 장비 반납", "2026-01-08T11:00:00",
+              body="네 알겠습니다.", reply_to="e1"),
+            # G — 한 통짜리, 본문에만: 후보(자동 확정하지 않는다)
+            R("g1", "lee@corp.example", [ME], "분기 회고", "2026-01-07T09:00:00",
+              body="지난 분기에는 알파 외에 세 건을 진행했습니다."),
+            # F — 제목에 별칭이지만 사용자가 숨김: 재료에서 빠진다
+            R("f1", "choi@corp.example", [ME], "알파 비공개 건", "2026-01-06T09:00:00",
+              body="알파 관련 민감한 내용입니다."),
+            # 자동 알림 — 건수만 센다. 붙여 쓴 표기(alpha1)의 출처이기도 하다
+            R("n1", "noreply-ci@corp.example", [ME], "[ci] alpha1 nightly #12",
+              "2026-01-10T03:00:00", body="알파 빌드 성공"),
+            # H — 아무것도 안 걸리는 스레드(사용자가 직접 넣는 경우용)
+            R("h1", "park@corp.example", [ME], "회의실 예약", "2026-01-12T09:00:00",
+              body="3층 회의실 잡았습니다."),
+        ])
+        self.store.hide_thread(self.tid("f1"), True)
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    # ── 도우미 ──
+    def mid(self, key):
+        return self.store.db.execute(
+            "SELECT id FROM messages WHERE message_id=?", (f"<{key}@t>",)).fetchone()["id"]
+
+    def tid(self, key):
+        return self.store.db.execute(
+            "SELECT thread_id FROM messages WHERE message_id=?", (f"<{key}@t>",)).fetchone()[0]
+
+    def page(self, **over):
+        """계약대로 쓴 페이지 한 장 — 조각을 바꿔 가며 check 를 시험한다."""
+        A, B = self.tid("a1"), self.tid("b1")
+        p = {
+            "threads": [A, B], "candidates": [], "excluded": [], "through": "2026-01-12T18:30",
+            "terms": "[게이트웨이, 서명키]",
+            "state": [f"- 결정: 출시일은 2월 둘째 주다. [메일 #{self.mid('a3')}]",
+                      f"- 사실: 부하 시험에서 초당 1,200건까지 오류가 없었다. [메일 #{self.mid('b1')}]"],
+            "open": [f"- 대기: 게이트웨이 이관 전 수치인지 — 01-11 질문, 답 없음. [메일 #{self.mid('b2')}]"],
+            "lines": [
+                f'- 01-09 **논의** 1월 말 출시가 가능한지 물음 — park [메일 #{self.mid("a1")}] "1월 말 출시가 가능한지 확인 부탁드립니다."',
+                f'- 01-10 **논의** 2월 둘째 주로 미루자는 제안 — lee [메일 #{self.mid("a2")}] "2월 둘째 주로 미루는 것을 제안합니다." → 01-12 결정 [메일 #{self.mid("a3")}]',
+                f'- 01-11 **사실** 초당 1,200건까지 오류 없음 — park [메일 #{self.mid("b1")}] "초당 1,200건까지 오류가 없었습니다."',
+                f'- 01-11 **논의** 게이트웨이 이관 전 수치인지 물음 — me [메일 #{self.mid("b2")}] "게이트웨이 이관 전 수치인지요?"',
+                f'- 01-12 **결정** 출시일 2월 둘째 주 — choi [메일 #{self.mid("a3")}] "출시는 2월 둘째 주로 확정합니다."',
+            ],
+        }
+        p.update(over)
+        rows = "\n".join(f"| {t} | 제목 | 1 | 01-12 | 한 줄 |" for t in p["threads"])
+        cand = ""
+        if p["candidates"]:
+            cand = ("\n## 확인할 스레드\n| 스레드 | 제목 | 왜 후보인가 |\n|---|---|---|\n"
+                    + "\n".join(f"| {t} | 제목 | 이유 |" for t in p["candidates"]) + "\n")
+        text = (
+            "---\ntopic: 알파\naliases: [ALPHA-1]\n"
+            f"terms: {p['terms']}\n"
+            f"threads: [{', '.join(map(str, p['threads']))}]\n"
+            f"candidates: [{', '.join(map(str, p['candidates']))}]\n"
+            f"excluded: [{', '.join(map(str, p['excluded']))}]\n"
+            "created: 2026-01-12\nupdated: 2026-01-12\n"
+            f"through: {p['through']}\nrating:\n---\n# 알파\n\n> 기준\n\n"
+            "## 현재 상태\n" + "\n".join(p["state"]) + "\n\n"
+            "## 열린 것\n" + "\n".join(p["open"]) + "\n\n"
+            "## 경위\n" + "\n".join(p["lines"]) + "\n\n"
+            "## 기술\n- 게이트웨이 (페이지 없음)\n\n## 사람\n- choi — 결정\n\n"
+            "## 스레드\n| 스레드 | 제목 | 메일 | 마지막 | 한 줄 |\n|---|---|---|---|---|\n"
+            + rows + "\n" + cand)
+        w = self.wiki.wiki_dir(self.cfg)
+        w.mkdir(parents=True, exist_ok=True)
+        path = w / "알파.md"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def check(self, path, today="2026-01-13"):
+        return self.wiki.check(self.store, self.cfg, path, date.fromisoformat(today))
+
+    # ── scan: 주제에 속한 메일 찾기 ──
+    def test_scan_topic_splits_confirmed_and_candidates(self):
+        out = self.wiki.scan_topic(self.store, self.cfg, "알파", ["ALPHA-1"])
+        conf = {r["thread"]: r for r in out["confirmed_threads"]}
+        cand = {r["thread"]: r for r in out["candidates"]}
+        self.assertEqual(set(conf), {self.tid("a1"), self.tid("b1")})
+        self.assertEqual(conf[self.tid("a1")]["why"], "제목에 별칭")
+        self.assertIn("2통 중 2통", conf[self.tid("b1")]["why"])
+        # 스치기만 한 것과 한 통짜리는 자동 확정하지 않는다 — 사용자가 판정한다
+        self.assertEqual(set(cand), {self.tid("e1"), self.tid("g1")})
+        self.assertIn("3통 중 1통", cand[self.tid("e1")]["why"])
+        self.assertEqual(out["through"], "2026-01-12T18:30")
+        self.assertEqual(out["page_file"], "알파.md")
+        self.assertEqual(out["batch"], {"delivered": 5, "remaining": 0, "limit": self.wiki.SCAN_LIMIT})
+
+    def test_scan_excludes_noise_hidden_and_unrelated(self):
+        out = self.wiki.scan_topic(self.store, self.cfg, "알파", [])
+        seen = ({r["thread"] for r in out["confirmed_threads"]}
+                | {r["thread"] for r in out["candidates"]})
+        self.assertNotIn(self.tid("f1"), seen, "숨긴 스레드가 재료에 실렸다(불변식 3)")
+        self.assertNotIn(self.tid("n1"), seen, "자동 알림이 재료에 실렸다")
+        self.assertNotIn(self.tid("d1"), seen)
+        self.assertEqual(out["noise_excluded"], 1)       # 세기만 한다
+        blob = json.dumps(out, ensure_ascii=False)
+        self.assertNotIn("민감한 내용", blob)
+        self.assertNotIn("빌드 성공", blob)
+
+    def test_scan_finds_joined_spelling_variant(self):
+        # 'ALPHA-1' 을 등록했는데 CI 는 'alpha1' 이라 쓴다 — 변형을 알려 준다
+        out = self.wiki.scan_topic(self.store, self.cfg, "알파", ["ALPHA-1"])
+        self.assertEqual(out["alias_variants_found"], ["ALPHA1"])
+        self.assertEqual(out["noise_excluded"], 1)       # 변형으로 또 걸려도 한 번만 센다
+
+    def test_scan_topic_refuses_an_existing_page(self):
+        self.page()
+        out = self.wiki.scan_topic(self.store, self.cfg, "알파", [])
+        self.assertIn("이미 있는 주제", out["error"])
+
+    def test_message_payload_keeps_preserved_quote_out_of_body(self):
+        # 보존 인용(mid-join)은 남이 주고받은 글이다 — 본문과 갈라 '인용 금지'로 준다
+        self.store.db.execute(
+            "UPDATE messages SET new_content=? WHERE id=?",
+            ("참조 추가드립니다.\n" + PRESERVED_MARK + "\n보낸 사람: 타인\n알파 서명키는 폐기했습니다.",
+             self.mid("a3")))
+        out = self.wiki.scan_topic(self.store, self.cfg, "알파", [])
+        m = [x for r in out["confirmed_threads"] for x in r["messages_all"]
+             if x["id"] == self.mid("a3")][0]
+        self.assertEqual(m["body"], "참조 추가드립니다.")
+        self.assertIn("서명키는 폐기했습니다", m["earlier_context_not_citable"])
+
+    def test_batch_cuts_oldest_first_and_keeps_same_minute_together(self):
+        out = self.wiki.scan_topic(self.store, self.cfg, "알파", [], limit=2)
+        self.assertEqual(out["through"], "2026-01-10T09:00")
+        self.assertEqual(out["batch"]["delivered"], 2)
+        self.assertEqual(out["batch"]["remaining"], 3)
+        # through 는 분 단위다 — 같은 분의 메일을 가르면 뒤쪽이 다음 scan 에서 조용히 빠진다
+        self.assertEqual(self.wiki._cut(["2026-01-01T09:00"] * 3 + ["2026-01-02T09:00"], 1),
+                         ("2026-01-01T09:00", 1))
+
+    def test_scan_page_delivers_only_mail_after_through(self):
+        path = self.page(candidates=[self.tid("e1"), self.tid("g1"), self.tid("c1")])
+        out = self.wiki.scan_page(self.store, self.cfg, path, today=date(2026, 1, 13))
+        self.assertTrue(out["nothing_new"])
+        self.assertEqual(out["new_messages"], [])
+        self.store.ingest([_rec("a4", "park@corp.example", [ME], "RE: 알파 출시 일정",
+                                "2026-01-14T09:00:00", body="2월 9일로 공지하겠습니다.",
+                                reply_to="a1")])
+        out = self.wiki.scan_page(self.store, self.cfg, path, today=date(2026, 1, 15))
+        self.assertFalse(out["nothing_new"])
+        self.assertEqual([m["id"] for m in out["new_messages"]], [self.mid("a4")])
+        self.assertEqual(out["through_after_update"], "2026-01-14T09:00")
+        self.assertEqual({r["thread"] for r in out["threads_table"]},
+                         {self.tid("a1"), self.tid("b1")})
+
+    def test_scan_page_brings_new_thread_whole_and_term_candidates(self):
+        # 새로 걸린 확정 스레드는 through 이전 메일도 처음 보는 것이라 통째로 준다
+        path = self.page(threads=[self.tid("a1")], state=[
+            f"- 결정: 출시일은 2월 둘째 주다. [메일 #{self.mid('a3')}]"], open=[],
+            lines=[f'- 01-12 **결정** 출시일 2월 둘째 주 — choi [메일 #{self.mid("a3")}] '
+                   '"출시는 2월 둘째 주로 확정합니다."'])
+        out = self.wiki.scan_page(self.store, self.cfg, path, today=date(2026, 1, 13))
+        new = {r["thread"]: r for r in out["new_confirmed_threads"]}
+        self.assertEqual(set(new), {self.tid("b1")})
+        self.assertEqual(len(new[self.tid("b1")]["messages_all"]), 2)
+        cand = {r["thread"]: r["why"] for r in out["candidates"]}
+        self.assertIn("고유 낱말 2개 겹침", cand[self.tid("c1")])     # 이름 없는 스레드
+        self.assertIn(self.tid("e1"), cand)
+        self.assertEqual(out["terms_hits_outside"]["서명키"], 1)
+
+    def test_excluded_thread_never_comes_back(self):
+        path = self.page(excluded=[self.tid("e1"), self.tid("c1")])
+        out = self.wiki.scan_page(self.store, self.cfg, path, today=date(2026, 1, 13))
+        seen = {r["thread"] for r in out["candidates"]}
+        self.assertNotIn(self.tid("e1"), seen)
+        self.assertNotIn(self.tid("c1"), seen)
+
+    def test_too_common_term_is_dropped_not_flooded(self):
+        # 바깥 스레드 여러 곳에 걸리는 낱말은 고유하지 않다 — 안 버리면 후보가 쏟아진다
+        self.store.ingest([_rec(f"z{i}", "kang@corp.example", [ME], f"잡담 {i}",
+                                f"2026-01-05T{9 + i:02d}:00:00", body="일정 조율 부탁드립니다.")
+                           for i in range(10)])
+        path = self.page(terms="[일정, 게이트웨이]")
+        out = self.wiki.scan_page(self.store, self.cfg, path, today=date(2026, 1, 13))
+        self.assertEqual(out["terms_too_common_ignored"], ["일정"])
+        self.assertFalse([r for r in out["candidates"] if "잡담" in r["subject"]])
+
+    def test_passed_deadline_is_reported_even_without_new_mail(self):
+        # 가끔 돌리는 도구다 — 새 메일이 없어도 지난 기한은 다시 판정해야 한다
+        line = f"- 기한: 01-15 각 파트 일정 회신. [메일 #{self.mid('a3')}]"
+        path = self.page(open=[line], candidates=[self.tid("e1"), self.tid("g1"), self.tid("c1")])
+        out = self.wiki.scan_page(self.store, self.cfg, path, today=date(2026, 1, 14))
+        self.assertTrue(out["nothing_new"])
+        out = self.wiki.scan_page(self.store, self.cfg, path, today=date(2026, 1, 20))
+        self.assertEqual(out["deadlines_passed_unmarked"], [line])
+        self.assertFalse(out["nothing_new"])
+        self.assertTrue(self.check(path, "2026-01-20")["warnings"])
+        path = self.page(open=[line.replace("각 파트", "지남 — 각 파트")],
+                         candidates=[self.tid("e1"), self.tid("g1"), self.tid("c1")])
+        out = self.wiki.scan_page(self.store, self.cfg, path, today=date(2026, 1, 20))
+        self.assertEqual(out["deadlines_passed_unmarked"], [])
+        # 1월에 보는 12월 기한은 작년 것이다
+        self.assertTrue(self.wiki._deadline_passed("- 기한: 12-20 무엇", date(2027, 1, 5)))
+        self.assertFalse(self.wiki._deadline_passed("- 기한: 01-20 무엇", date(2027, 1, 5)))
+
+    def test_hidden_member_thread_is_flagged_and_fails_check(self):
+        path = self.page()
+        self.store.hide_thread(self.tid("b1"), True)
+        out = self.wiki.scan_page(self.store, self.cfg, path, today=date(2026, 1, 13))
+        self.assertEqual(out["threads_hidden_by_user"], [self.tid("b1")])
+        self.assertFalse(out["nothing_new"])
+        self.assertTrue(any("숨긴 스레드" in e for e in self.check(path)["errors"]))
+
+    def test_scan_thread_for_add_and_drop(self):
+        path = self.page()
+        out = self.wiki.scan_thread(self.store, self.cfg, path, self.tid("h1"))
+        self.assertEqual(out["now_in_page"], "없음")
+        self.assertEqual([m["body"] for m in out["messages"]], ["3층 회의실 잡았습니다."])
+        self.assertEqual(len(out["threads_table_if_added"]), 3)
+        hid = self.wiki.scan_thread(self.store, self.cfg, path, self.tid("f1"))
+        self.assertEqual(hid["messages"], [])
+        self.assertIn("숨겼다", hid["error"])
+
+    # ── check: 쓴 페이지 대조 ──
+    def test_check_passes_and_keeps_a_snapshot(self):
+        path = self.page()
+        res = self.check(path)
+        self.assertTrue(res["ok"], res["errors"])
+        self.assertEqual(res["marks"], {"결정": 1, "변경": 0, "사실": 1, "논의": 3})
+        self.assertIsNone(res["previous_lines_kept"])
+        self.assertTrue((path.parent / ".history" / path.name).exists())
+        self.assertEqual(self.check(path)["previous_lines_kept"], 5)
+
+    def test_check_rejects_a_quote_that_is_not_in_that_mail(self):
+        ok = self.page()
+        self.assertTrue(self.check(ok)["ok"])
+        lines = ok.read_text(encoding="utf-8")
+        ok.write_text(lines.replace("초당 1,200건까지 오류가 없었습니다.\"",
+                                    "초당 1,500건까지 오류가 없었습니다.\""), encoding="utf-8")
+        res = self.check(ok)
+        self.assertFalse(res["ok"])
+        self.assertTrue(any("인용 원문에 없음" in e for e in res["errors"]))
+        # 다른 메일에 있는 문장을 이 메일의 인용으로 달아도 안 된다 — 번호가 닻이다
+        path = self.page(lines=[
+            f'- 01-09 **논의** 물음 — park [메일 #{self.mid("a1")}] "출시는 2월 둘째 주로 확정합니다."'],
+            state=["- 결정: 아직 확정된 것이 없다."], open=[])
+        (path.parent / ".history" / path.name).unlink()
+        self.assertTrue(any("인용 원문에 없음" in e for e in self.check(path)["errors"]))
+
+    def test_check_rejects_quote_taken_from_preserved_block(self):
+        self.store.db.execute(
+            "UPDATE messages SET new_content=? WHERE id=?",
+            ("출시는 2월 둘째 주로 확정합니다.\n" + PRESERVED_MARK + "\n알파 서명키는 폐기했습니다.",
+             self.mid("a3")))
+        path = self.page(lines=[
+            f'- 01-12 **사실** 서명키 폐기 — choi [메일 #{self.mid("a3")}] "알파 서명키는 폐기했습니다."'],
+            state=["- 결정: 아직 확정된 것이 없다."], open=[])
+        errs = self.check(path)["errors"]
+        self.assertTrue(any("보존된 이전 대화 안에만" in e for e in errs), errs)
+
+    def test_check_requires_state_lines_to_rest_on_decision_or_fact(self):
+        # 제안(논의) 메일을 근거로 '결정'을 올리면 걸린다 — 중간 논의가 최종으로 둔갑하지 않게
+        path = self.page(state=[f"- 결정: 2월 둘째 주로 미룬다. [메일 #{self.mid('a2')}]"])
+        errs = self.check(path)["errors"]
+        self.assertTrue(any("현재 상태 '결정' 줄의 근거" in e for e in errs), errs)
+        path = self.page(state=[f"- 사실: 수치는 이관 전이다. [메일 #{self.mid('b2')}]"])
+        self.assertTrue(any("현재 상태 '사실' 줄의 근거" in e for e in self.check(path)["errors"]))
+        path = self.page(state=["- 결정: 아직 확정된 것이 없다."])
+        self.assertTrue(self.check(path)["ok"])
+
+    def test_check_catches_date_table_and_format_slips(self):
+        good = self.page()
+        text = good.read_text(encoding="utf-8")
+        for broken, want in (
+                (text.replace("- 01-09 **논의**", "- 01-08 **논의**"), "발신일"),
+                (text.replace("- 01-09 **논의**", "- 01-09 **제안**"), "경위 줄 형식"),
+                (text.replace(f"| {self.tid('b1')} | 제목", "| 999 | 제목"), "스레드 표"),
+                (text.replace("through: 2026-01-12T18:30", "through: 2026-02-01T00:00"), "through"),
+                (text.replace(f"[메일 #{self.mid('a1')}]", "[메일 #12345]"), "없는 메일"),
+                (text.replace("## 사람\n- choi — 결정\n\n", ""), "절 없음"),
+        ):
+            good.write_text(broken, encoding="utf-8")
+            errs = self.check(good)["errors"]
+            self.assertTrue(any(want in e for e in errs), (want, errs))
+
+    def test_old_lines_are_append_only_except_tails(self):
+        path = self.page()
+        self.assertTrue(self.check(path)["ok"])
+        text = path.read_text(encoding="utf-8")
+        # 꼬리 더하기는 허용
+        q = f'"1월 말 출시가 가능한지 확인 부탁드립니다."'
+        path.write_text(text.replace(q, q + f" → 01-12 해소 [메일 #{self.mid('a3')}]"),
+                        encoding="utf-8")
+        res = self.check(path)
+        self.assertTrue(res["ok"], res["errors"])
+        self.assertEqual(res["previous_lines_kept"], 5)
+        # 요지를 고치거나 줄을 지우면 걸린다
+        path.write_text(text.replace("1월 말 출시가 가능한지 물음", "1월 출시 문의"), encoding="utf-8")
+        self.assertTrue(any("이전 경위 줄" in e for e in self.check(path)["errors"]))
+        path.write_text(text.replace(text[text.index("- 01-11 **논의**"):text.index("- 01-12 **결정**")], ""),
+                        encoding="utf-8")
+        self.assertTrue(any("이전 경위 줄" in e for e in self.check(path)["errors"]))
+
+    def test_arrow_inside_a_quote_is_not_a_tail(self):
+        # 원문에 "1% → 10%" 같은 화살표가 있어도 꼬리로 읽지 않는다
+        line = '- 01-12 **사실** 단계 배포 — choi [메일 #7] "1% → 10% → 100% 순서로 배포합니다." → 01-13 해소 [메일 #8]'
+        parts = self.wiki._line_parts(line)
+        self.assertEqual(parts[5], "1% → 10% → 100% 순서로 배포합니다.")
+        self.assertEqual(self.wiki._tails(line), [" → 01-13 해소 [메일 #8]"])
+        self.assertEqual(self.wiki._tails(line.rsplit(" → 01-13", 1)[0]), [])
+        self.assertTrue(self.wiki._line_parts(line + self.wiki.DROP_TAIL))
+
+    def test_through_behind_latest_is_a_warning_not_an_error(self):
+        # 묶음으로 나눠 반영하는 중이면 through 가 마지막 메일보다 이르다 — 정상이다
+        path = self.page(through="2026-01-11T11:00", state=["- 결정: 아직 확정된 것이 없다."],
+                         lines=[f'- 01-11 **사실** 오류 없음 — park [메일 #{self.mid("b1")}] '
+                                '"초당 1,200건까지 오류가 없었습니다."'], open=[])
+        res = self.check(path)
+        self.assertTrue(res["ok"], res["errors"])
+        self.assertTrue(any("반영 안 된 메일" in w for w in res["warnings"]))
+
+    # ── status · report · leak ──
+    def test_status_says_what_piled_up(self):
+        self.assertIn("주제 페이지가 없다", self.wiki.status_text(self.wiki.status(self.store, self.cfg)))
+        self.page(candidates=[self.tid("e1")])
+        self.store.ingest([_rec("a4", "park@corp.example", [ME], "RE: 알파 출시 일정",
+                                "2026-01-14T09:00:00", body="공지하겠습니다.", reply_to="a1")])
+        row = self.wiki.status(self.store, self.cfg, date(2026, 1, 20))[0]
+        self.assertEqual((row["new_messages"], row["candidates_waiting"], row["days_since"]),
+                         (1, 1, 8))
+        self.assertEqual(row["new_candidates"], 2)          # g1(한 통짜리) · c1(낱말)
+        self.assertEqual(row["todo"], "update")
+        self.assertIn("새 메일 1", self.wiki.status_text([row]))
+
+    def test_report_carries_numbers_only(self):
+        self.page(threads=[self.tid("a1"), self.tid("b1"), self.tid("h1")],
+                  candidates=[self.tid("e1")], excluded=[self.tid("g1")])
+        self.check(self.wiki.wiki_dir(self.cfg) / "알파.md")
+        text = self.wiki.report(self.store, self.cfg, date(2026, 1, 13))
+        self.assertIn("[주제 T1]", text)
+        self.assertIn("소속 스레드 3 = 별칭으로 자동 확정 2", text)
+        self.assertIn("scan 이 못 올려 직접 넣음 1", text)
+        # 놓친 스레드는 생김새를 수로 낸다 — 내용을 안 봐도 찾기 규칙을 고칠 수 있게
+        self.assertRegex(text, r"직접 넣은 스레드 1: 메일 1통 · 고유 낱말 겹침 0개 .* 겹침 \d+명")
+        self.assertIn("경위 5줄 (결정 1 · 변경 0 · 사실 1 · 논의 3)", text)
+        self.assertIn("꼬리 1", text)
+        self.assertIn("check 1회 · 실패 0회", text)
+        for secret in ("알파", "ALPHA", "게이트웨이", "서명키", "park", "choi", "corp.example",
+                       "출시", "회의실", str(self.tid("a1")), str(self.mid("a3"))):
+            self.assertNotIn(secret, text, f"수치 보고에 회사 내용이 샜다: {secret}")
+        self.assertTrue(self.wiki.leak(self.store, self.cfg, text)["ok"])
+
+    def test_report_appends_session_notes_and_counts_models(self):
+        self.page()
+        w = self.wiki.wiki_dir(self.cfg)
+        (w / "notes.md").write_text("- 2026-01-13 update: 부분 답변의 꼬리 기준이 없어 대기로 둠.\n",
+                                    encoding="utf-8")
+        (w / "log.md").write_text(
+            "- 2026-01-12 new 알파: 읽은 메일 5 · 경위 +5 · 새 페이지 · 모델 claude-sonnet\n"
+            "- 2026-01-13 update 알파: 읽은 메일 0 · 경위 +0 · 변경 없음 · 모델 claude-sonnet\n",
+            encoding="utf-8")
+        text = self.wiki.report(self.store, self.cfg, date(2026, 1, 13))
+        self.assertIn("[작업] new 1 · update 1 · 변경 없음 1 · 모델: claude-sonnet(2)", text)
+        self.assertIn("[작업 메모 1건", text)
+        self.assertIn("부분 답변의 꼬리 기준", text)
+
+    def test_leak_catches_company_content(self):
+        self.page()
+        bad = ("T1 은 잘 됐다. choi 가 choi@corp.example 로 보낸 메일에서 "
+               "\"출시는 2월 둘째 주로 확정합니다.\" 를 결정으로 봤다. 게이트웨이 스레드 26011209001.")
+        res = self.wiki.leak(self.store, self.cfg, bad)
+        self.assertFalse(res["ok"])
+        kinds = {f["kind"] for f in res["found"]}
+        self.assertEqual(kinds, {"메일 주소", "도메인", "사람 이름", "주제어·별칭·낱말",
+                                 "메일 원문과 12자 이상 겹침", "긴 숫자(메일·스레드 번호일 수 있음)"})
+        self.assertTrue(any("출시는 2월 둘째 주로 확정합니다" in f["what"] for f in res["found"]))
+        clean = "T1 은 소속 스레드 3개 중 1개를 scan 이 못 올렸다. 부분 답변의 꼬리 기준이 없다."
+        self.assertTrue(self.wiki.leak(self.store, self.cfg, clean)["ok"])
+
+    # ── 불변식 ──
+    def test_no_command_writes_to_the_database(self):
+        # 읽기 경로에서 쓰지 않는다(불변식 9). 파일은 .history/ 에만 쓴다.
+        path = self.page()
+        before = self.store.db.total_changes
+        self.wiki.scan_topic(self.store, self.cfg, "다른 주제", [])
+        self.wiki.scan_page(self.store, self.cfg, path)
+        self.wiki.scan_thread(self.store, self.cfg, path, self.tid("h1"))
+        self.check(path)
+        self.wiki.status(self.store, self.cfg)
+        self.wiki.report(self.store, self.cfg)
+        self.wiki.leak(self.store, self.cfg, "아무 글")
+        self.assertEqual(self.store.db.total_changes, before)
+        w = self.wiki.wiki_dir(self.cfg)
+        self.assertEqual({p.name for p in w.iterdir()}, {"알파.md", ".history"})
+        ops = [json.loads(l) for l in (w / ".history" / "ops.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([o["cmd"] for o in ops], ["scan-topic", "scan-page", "scan-thread", "check"])
+        self.assertNotIn("알파 출시", json.dumps(ops, ensure_ascii=False))      # 건수만 남긴다
+
+    def test_page_is_found_by_topic_file_or_path(self):
+        path = self.page()
+        for ref in ("알파", "알파.md", str(path)):
+            self.assertEqual(self.wiki.resolve_page(self.cfg, ref), path)
+        with self.assertRaises(SystemExit):
+            self.wiki.resolve_page(self.cfg, "없는 주제")
+        self.assertEqual(self.wiki.slug("Project Alpha/2"), "project-alpha2")
+
+    def test_cli_wires_every_subcommand_and_exit_codes(self):
+        from mailkb import cli
+        home = self.tmp.name
+        self.store.close()
+        (Path(home) / "db.sqlite").write_bytes((Path(home) / "t.sqlite").read_bytes())
+        (Path(home) / "config.toml").write_text(
+            f'my_addresses = ["{ME}"]\nignore_senders = ["noreply"]\n', encoding="utf-8")
+        self.store = Store(Path(home) / "t.sqlite", [ME], noise=self.cfg)
+        path = self.page()
+
+        def run(*argv):
+            buf = io.StringIO()
+            code = 0
+            with contextlib.redirect_stdout(buf):
+                try:
+                    cli.main(["--home", home, "wiki", *argv])
+                except SystemExit as e:
+                    code = e.code or 0
+            return code, buf.getvalue()
+        code, out = run("status")
+        self.assertEqual(code, 0)
+        self.assertIn("알파", out)
+        self.assertEqual(json.loads(run("status", "--json")[1])[0]["topic"], "알파")
+        code, out = run("scan", "--page", "알파", "--today", "2026-01-13")
+        self.assertEqual(code, 0)
+        self.assertIn("threads_table", json.loads(out))
+        self.assertEqual(run("scan", "--topic", "알파")[0], 2)            # 이미 있는 주제
+        self.assertEqual(json.loads(run("scan", "--page", "알파", "--thread",
+                                        str(self.tid("h1")))[1])["now_in_page"], "없음")
+        self.assertEqual(run("check", "알파", "--today", "2026-01-13")[0], 0)
+        path.write_text(path.read_text(encoding="utf-8").replace("1,200건까지 오류가 없었습니다.\"",
+                                                                 "9,999건까지 오류가 없었습니다.\""),
+                        encoding="utf-8")
+        self.assertEqual(run("check", "알파")[0], 1)                      # 실패는 종료 코드로
+        self.assertIn("[주제 T1]", run("report")[1])
+        f = Path(home) / "out.txt"
+        f.write_text("﻿부분 답변의 꼬리 기준이 없다.", encoding="utf-8")   # PowerShell 의 BOM
+        self.assertEqual(run("leak", str(f))[0], 0)
+        f.write_text("choi@corp.example", encoding="utf-8")
+        self.assertEqual(run("leak", str(f))[0], 1)
+
+    # ── 문서와 코드가 같은 말을 하는가 ──
+    def test_contract_examples_parse_and_skill_points_at_contract(self):
+        root = Path(__file__).resolve().parent.parent
+        guide = (root / "agent-guides" / "minerva-wiki.md").read_text(encoding="utf-8")
+        # 계약의 예시 경위 줄이 코드의 형식과 어긋나면 세션이 쓴 줄이 전부 형식 오류가 된다
+        examples = [l for l in guide.splitlines() if re.match(r"- \d\d-\d\d \*\*", l)]
+        self.assertGreaterEqual(len(examples), 4)
+        for l in examples:
+            self.assertTrue(self.wiki._line_parts(l), f"계약 예시가 LINE_RX 와 어긋난다: {l}")
+        for mark in self.wiki.MARKS:
+            self.assertIn(f"`{mark}` —", guide)
+        self.assertIn("<결정|변경|해소>", guide)
+        self.assertIn(self.wiki.DROP_TAIL.strip(), guide)
+        self.assertIn(f"공백을 빼고 {self.wiki.QUOTE_MIN}~{self.wiki.QUOTE_MAX}자", guide)
+        self.assertIn(f"기본 {self.wiki.SCAN_LIMIT}", guide)
+        for cmd in ("wiki status", "wiki scan --topic", "wiki scan --page", "wiki check",
+                    "wiki report", "wiki leak"):
+            self.assertIn(cmd, guide)
+        # 계약이 말하는 scan 출력 키가 실제로 나온다
+        path = self.page()
+        keys = set(self.wiki.scan_page(self.store, self.cfg, path))
+        for k in re.findall(r"`([a-z_]+)`", guide):
+            if k in ("nothing_new", "new_messages", "new_confirmed_threads", "candidates",
+                     "candidates_no_longer_matching", "deadlines_passed_unmarked",
+                     "terms_too_common_ignored", "terms_hits_outside", "threads_table",
+                     "threads_hidden_by_user", "noise_excluded", "through_after_update"):
+                self.assertIn(k, keys)
+        skill = (root / ".claude" / "skills" / "mail-wiki" / "SKILL.md").read_text(encoding="utf-8")
+        head = skill.split("---")[1]
+        for key in ("name: mail-wiki", "description:"):
+            self.assertIn(key, head)
+        for g in ("agent-guides/minerva-wiki.md", "agent-guides/minerva-cli-reference.md"):
+            self.assertIn(g, skill)
+            self.assertTrue((root / g).exists())
+        # opencode command 는 스킬의 복사본이다 — 작업 표가 갈라지면 한쪽에서만 되는 작업이 생긴다
+        oc = (root / ".opencode" / "command" / "mail-wiki.md").read_text(encoding="utf-8")
+        rows = [l for l in skill.splitlines() if l.startswith("| ") and "`" in l]
+        self.assertGreaterEqual(len(rows), 6)
+        for l in rows:
+            self.assertIn(l, oc)
+        self.assertIn("agent-guides/minerva-wiki.md", oc)
+
+    def test_gate_lists_name_the_wiki_commands(self):
+        # AI 관문 목록은 세 곳이 같은 사실을 말해야 한다(CLAUDE.md 불변식 2)
+        root = Path(__file__).resolve().parent.parent
+        self.assertIn("wiki scan · wiki check · wiki status · wiki report · wiki leak",
+                      (root / "CLAUDE.md").read_text(encoding="utf-8"))
+        arch = (root / "docs" / "ARCHITECTURE.md").read_text(encoding="utf-8")
+        ref = (root / "agent-guides" / "minerva-cli-reference.md").read_text(encoding="utf-8")
+        for name in ("wiki scan", "wiki check", "wiki status", "wiki report", "wiki leak"):
+            self.assertIn(name, arch)
+            self.assertIn(name, ref)
+        # 이 모듈은 AI 를 부르지 않는다 — 부르게 되면 위 목록이 거짓이 된다
+        src = inspect.getsource(self.wiki)
+        for banned in ("ai_run", "subprocess", "urlopen", "socket"):
+            self.assertNotIn(banned, src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -158,6 +158,39 @@ JSON·메시지 수 제한 옵션은 아직 없다.
 - `noise [--limit]`: 발신자별 수신량·차단 후보 — 이 명령 자체는 아무것도 안 바꾼다
 - `stats`: 메시지·스레드·인물 수, DB 크기, FTS 상태
 
+### `wiki`: 주제 위키의 찾기·대조 (AI 호출 0)
+
+`/mail-wiki` 가 쓰는 명령이다. 절차와 페이지 규약은 [minerva-wiki.md](minerva-wiki.md)에
+있고, 여기는 명령 형태만 적는다. `<주제>` 는 주제 이름·파일 이름·파일 경로 어느 것이든 된다.
+
+```bash
+<PYTHON> -m mailkb wiki status [--json]
+<PYTHON> -m mailkb wiki scan --topic '프로젝트 알파' --alias '알파,ALPHA-1'
+<PYTHON> -m mailkb wiki scan --page '프로젝트 알파' [--limit 40]
+<PYTHON> -m mailkb wiki scan --page '프로젝트 알파' --thread 42
+<PYTHON> -m mailkb wiki check '프로젝트 알파'
+<PYTHON> -m mailkb wiki report
+<PYTHON> -m mailkb wiki leak <글 파일>
+```
+
+| 명령 | 출력 | 종료 코드 |
+|---|---|---|
+| `wiki status` | 주제마다 새 메일·새 확정 스레드·새 후보·판정 대기 후보·표시 안 된 지난 기한 | 0 |
+| `wiki scan --topic` | JSON — `confirmed_threads[].messages_all`(메일 본문), `candidates`, `alias_variants_found`, `noise_excluded`, `through`, `batch` | 이미 있는 주제면 2 |
+| `wiki scan --page` | JSON — `nothing_new`, `new_messages`, `new_confirmed_threads`, `candidates`, `deadlines_passed_unmarked`, `terms_hits_outside`, `threads_table`, `through_after_update`, `batch` | 0 |
+| `wiki scan --page --thread` | JSON — 그 스레드의 `messages`, `now_in_page`, `threads_table_if_added` | 0 |
+| `wiki check` | JSON — `ok`, `errors`, `warnings`, `marks`, `previous_lines_kept` | 실패면 1 |
+| `wiki report` | 평문 — 주제는 T1·T2 로만 나오는 수치 + 작업 메모 원문 | 0 |
+| `wiki leak` | JSON — `ok`, `found[].kind`/`what` | 걸리면 1 |
+
+- 메일 한 통은 `id`·`date`·`sender`·`body`(보존 인용을 뗀 신규 작성분) 이고, 있으면
+  `attachments_unread`(읽지 못한 첨부 이름)·`earlier_context_not_citable`(보존된 이전
+  대화 — 이해용, 인용 금지)·`body_truncated` 가 붙는다.
+- 자동 알림 발신자·숨긴 스레드·Outlook 에서 사라진 메일은 재료에 실리지 않는다.
+- `scan`·`check` 는 `<HOME>/vault/wiki/.history/` 에 실행 기록 한 줄(시각·명령·건수)을
+  남기고, `check` 는 통과한 판의 사본을 거기 둔다. DB 에는 쓰지 않는다.
+- `scan`·`check`·`status`·`report` 는 `--today YYYY-MM-DD` 로 기한 판정의 기준일을 바꿀 수 있다(시험용).
+
 ## AI 를 부르는 명령 — 플래그가 없어도 부른다
 
 **다섯이다**: `ask <질문>` · `ask --person` (각 최대 12콜) · `thread-diag` ·
@@ -230,7 +263,8 @@ AI 산출은 넣지 않는다). 두 명령 모두 그 스레드의 내 노트·�
 
 ## 현재 한계
 
-- `search --json`만 안정적인 구조화 출력을 제공한다. `show`, `thread` 등은 평문이다.
+- 구조화 출력(JSON)은 `search --json` 과 `wiki scan`·`check`·`leak`·`status --json` 뿐이다.
+  `show`, `thread` 등은 평문이다.
 - CLI 조회 명령도 현재 DB 연결 자체는 엄격한 SQLite read-only 모드가 아니다 —
   위 분류를 권한 보장이 아닌 에이전트 행동 제한으로 취급한다.
 - 결정 기록과 인물 dossier를 전용 JSON으로 조회하는 명령은 아직 없다.

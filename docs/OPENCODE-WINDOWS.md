@@ -223,6 +223,7 @@ opencode --agent mailkb
 |---|---|
 | `.opencode/agent/mailkb.md` | mailkb 는 Windows 파이썬(PowerShell)으로만 실행 · DB 파일 직접 접근 차단 · 임시 파일은 `temp/` |
 | `.opencode/command/mail-research.md` | `/mail-research` — Claude Code 스킬과 같은 조사 절차 |
+| `.opencode/command/mail-wiki.md` | `/mail-wiki` — 등록한 주제의 위키 페이지를 만들고 갱신(계약: `agent-guides/minerva-wiki.md`) |
 
 ### B2. 지킬 것
 

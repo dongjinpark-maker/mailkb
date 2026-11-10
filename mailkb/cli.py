@@ -478,6 +478,55 @@ def _pick_threads(store, cfg, n: int) -> list[int]:
     return [r[-1] for r in rows[:max(1, n)]]
 
 
+def cmd_wiki(args) -> None:
+    """주제 위키의 손발 — `/mail-wiki` 세션이 부른다. 전부 AI 호출 0, DB 는 읽기만.
+
+    찾기·세기·대조는 여기(코드)가, 읽고 쓰는 것은 세션이 한다. 계약은
+    agent-guides/minerva-wiki.md.
+    """
+    import json
+    from datetime import date
+    from pathlib import Path
+    from . import wiki
+    cfg = config_mod.load(args.home)
+    store = _store(cfg)
+    today = date.fromisoformat(args.today) if getattr(args, "today", None) else None
+
+    def dump(obj) -> None:
+        print(json.dumps(obj, ensure_ascii=False, indent=1))
+
+    if args.wiki_cmd == "scan":
+        if args.topic:
+            aliases = [a.strip() for a in (args.alias or "").split(",") if a.strip()]
+            out = wiki.scan_topic(store, cfg, args.topic, aliases, args.limit, today)
+        elif args.page and args.thread:
+            out = wiki.scan_thread(store, cfg, wiki.resolve_page(cfg, args.page),
+                                   args.thread, today)
+        elif args.page:
+            out = wiki.scan_page(store, cfg, wiki.resolve_page(cfg, args.page),
+                                 args.limit, today)
+        else:
+            raise SystemExit("scan 은 --topic <주제> 또는 --page <주제|파일> 이 필요하다")
+        dump(out)
+        if out.get("error"):
+            raise SystemExit(2)
+    elif args.wiki_cmd == "check":
+        out = wiki.check(store, cfg, wiki.resolve_page(cfg, args.page), today)
+        dump(out)
+        if not out["ok"]:
+            raise SystemExit(1)
+    elif args.wiki_cmd == "status":
+        rows = wiki.status(store, cfg, today)
+        dump(rows) if args.json else print(wiki.status_text(rows))
+    elif args.wiki_cmd == "report":
+        print(wiki.report(store, cfg, today))
+    elif args.wiki_cmd == "leak":
+        out = wiki.leak(store, cfg, Path(args.file).read_text(encoding="utf-8-sig"))
+        dump(out)
+        if not out["ok"]:
+            raise SystemExit(1)
+
+
 def cmd_thread_diag(args) -> None:
     """스레드 현안 브리핑 — 웹 [현안 브리핑] 버튼과 같은 산출을 터미널로.
 
@@ -1133,6 +1182,27 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("--backend", help="AI 백엔드 이름 (기본: config)")
     sp.add_argument("--date", help="YYYY-MM-DD 기준 종료일 (기본: 오늘)")
     sp.set_defaults(fn=cmd_weekly)
+
+    sp = sub.add_parser("wiki", help="주제 위키 — 찾기·대조·수치 (AI 호출 0, /mail-wiki 가 쓴다)")
+    wsub = sp.add_subparsers(dest="wiki_cmd", required=True)
+    w = wsub.add_parser("scan", help="주제에 속한 메일 찾기 · 반영 안 된 새 메일 묶음")
+    w.add_argument("--topic", help="새 주제 이름 (페이지가 아직 없을 때)")
+    w.add_argument("--alias", help="별칭, 쉼표로 여러 개")
+    w.add_argument("--page", help="주제 이름 또는 페이지 파일 (갱신)")
+    w.add_argument("--thread", type=int, help="--page 와 함께: 이 스레드의 메일만 (add/drop)")
+    w.add_argument("--limit", type=int, default=40, help="한 묶음에 줄 메일 수 (기본 40)")
+    w.add_argument("--today", help="YYYY-MM-DD — 기한 판정의 기준일 (기본: 오늘)")
+    w = wsub.add_parser("check", help="쓴 페이지를 원문과 대조 (인용·날짜·근거·이전 줄 보존)")
+    w.add_argument("page", help="주제 이름 또는 페이지 파일")
+    w.add_argument("--today", help="YYYY-MM-DD")
+    w = wsub.add_parser("status", help="주제마다 새 메일·후보·지난 기한 한 줄")
+    w.add_argument("--json", action="store_true")
+    w.add_argument("--today", help="YYYY-MM-DD")
+    w = wsub.add_parser("report", help="회사 내용 없는 수치 보고 (feedback 의 재료)")
+    w.add_argument("--today", help="YYYY-MM-DD")
+    w = wsub.add_parser("leak", help="밖으로 보낼 글에 회사 내용이 섞였는지 대조 (전송하지 않는다)")
+    w.add_argument("file", help="검사할 글 파일")
+    sp.set_defaults(fn=cmd_wiki)
 
     sp = sub.add_parser("hide", help="스레드 숨김 (목록·추적·AI 프롬프트 제외, 새 메일 오면 자동 해제)")
     sp.add_argument("thread_id", type=int)

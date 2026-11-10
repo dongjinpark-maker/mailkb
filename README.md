@@ -21,6 +21,8 @@
   지식(md)이 된다. 주간 보고는 내가 관여한 사안을 토픽별로 묶는다
 - **심화** — `/mail-research`(Claude Code 스킬): 재료는 mailkb 가 확보하고 분석은
   세션이 직접 한다. 앱의 답이 모자랄 때 쓰고, 처음부터 써도 된다
+- **주제 위키** — `/mail-wiki`: 등록한 과제·사안만 골라 '지금 정해진 것 · 열린 것 ·
+  경위'를 한 장으로 편찬하고, 가끔 불러 새 메일을 얹는다
 
 이 셋을 떠받치는 원칙은 세 가지다.
 
@@ -286,7 +288,31 @@ ask 와 diagnose 는 그 자체가 AI 명령이니 내가 요청할 때만 실�
 | [CLAUDE.md](CLAUDE.md) | AI 코딩 에이전트용 작업 규칙·불변식 |
 | [agent-guides/](agent-guides/) | 조사 에이전트용 CLI 계약 |
 | [.claude/skills/mail-research/](.claude/skills/mail-research/) | Claude Code 스킬 — `/mail-research` (위 계약을 그대로 따른다) |
+| [.claude/skills/mail-wiki/](.claude/skills/mail-wiki/) | Claude Code 스킬 — `/mail-wiki` (계약: `agent-guides/minerva-wiki.md`) |
 | [docs/REVERTED-quote-diff.md](docs/REVERTED-quote-diff.md) | 되돌린 실험 하나의 기록 — 다시 시도할 때의 함정 목록 |
+
+## 오래 끄는 사안을 한 장으로 — `/mail-wiki`
+
+과제 하나가 스레드 여러 개에 흩어져 몇 주씩 이어질 때, **등록한 주제에 대해서만**
+페이지 한 장을 만들어 둔다(`<home>/vault/wiki/<주제>.md`). 페이지는 *지금 정해진 것*
+(결정·확인된 사실만) · *열린 것*(미정·대기·기한) · *경위*(날짜순, 줄마다 원문 인용)로
+나뉜다. 중간에 오간 제안은 지우지 않고 경위에 남기고, 나중에 결정되면 그 줄 끝에
+`→ 11-07 결정` 꼬리가 붙는다.
+
+```
+/mail-wiki new NPX-200              새 주제 — 이름과 별칭만 준다(사람은 등록하지 않는다)
+/mail-wiki                          주제마다 새 메일·후보가 얼마나 쌓였는지
+/mail-wiki update NPX-200           지난번 뒤에 온 메일만 읽어 갱신 — 매일이 아니라 가끔
+/mail-wiki add NPX-200 <스레드>     이름이 안 나와 빠진 스레드를 직접 넣기 (drop 은 빼기)
+/mail-wiki feedback                 회사 내용 없는 자가 평가 글 — 이 기능을 고치는 쪽에 보낼 것
+```
+
+주제에 속한 메일을 찾고(자동 알림·숨긴 스레드 제외) 쓴 인용을 원문과 대조하는 일은
+코드(`mailkb wiki scan`·`check`, AI 호출 0)가 하고, 읽고 쓰는 일만 세션이 한다.
+**찾지 못하는 것이 있다** — 주제 이름을 안 쓴 관련 스레드는 대개 후보로도 못 올린다.
+`add` 로 넣어야 한다. `feedback` 이 만든 글은 `mailkb wiki leak` 이 이름·주소·주제어·
+원문 겹침을 대조하지만 뜻만 옮긴 문장은 못 잡으니 **보내기 전에 직접 읽는다**(코드는
+아무것도 전송하지 않는다).
 
 ## AI 에이전트에게 조사를 맡기려면 — `/mail-research`
 
