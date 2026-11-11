@@ -481,8 +481,8 @@ def _pick_threads(store, cfg, n: int) -> list[int]:
 def cmd_wiki(args) -> None:
     """주제 위키의 손발 — `/mail-wiki` 세션이 부른다. 전부 AI 호출 0, DB 는 읽기만.
 
-    찾기·세기·대조는 여기(코드)가, 읽고 쓰는 것은 세션이 한다. 계약은
-    agent-guides/minerva-wiki.md.
+    찾기·세기·대조는 여기(코드)가, 읽고 쓰는 것은 세션이 한다. 코드가 페이지를 고치는
+    것은 동결 표시(freeze/unfreeze)뿐이다. 계약은 agent-guides/minerva-wiki.md.
     """
     import json
     from datetime import date
@@ -525,6 +525,12 @@ def cmd_wiki(args) -> None:
         dump(out)
         if not out["ok"]:
             raise SystemExit(1)
+    elif args.wiki_cmd in ("freeze", "unfreeze"):
+        out = wiki.freeze(store, cfg, wiki.resolve_page(cfg, args.page), today,
+                          undo=args.wiki_cmd == "unfreeze")
+        dump(out)
+        if not out["ok"]:
+            raise SystemExit(2)
 
 
 def cmd_thread_diag(args) -> None:
@@ -1202,6 +1208,12 @@ def main(argv: list[str] | None = None) -> None:
     w.add_argument("--today", help="YYYY-MM-DD")
     w = wsub.add_parser("leak", help="밖으로 보낼 글에 회사 내용이 섞였는지 대조 (전송하지 않는다)")
     w.add_argument("file", help="검사할 글 파일")
+    w = wsub.add_parser("freeze", help="주제 동결 — 이 뒤 메일은 반영하지 않는다 (scan·update 대상에서 빠진다)")
+    w.add_argument("page", help="주제 이름 또는 페이지 파일")
+    w.add_argument("--today", help="YYYY-MM-DD")
+    w = wsub.add_parser("unfreeze", help="주제 동결 해제 — 그 사이 도착한 메일은 update 로 반영한다")
+    w.add_argument("page", help="주제 이름 또는 페이지 파일")
+    w.add_argument("--today", help="YYYY-MM-DD")
     sp.set_defaults(fn=cmd_wiki)
 
     sp = sub.add_parser("hide", help="스레드 숨김 (목록·추적·AI 프롬프트 제외, 새 메일 오면 자동 해제)")

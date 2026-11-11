@@ -12,16 +12,27 @@
   status  주제마다 얼마나 쌓였는지 한 줄씩
   report  회사 내용 없는 수치 보고 — 밖에서 이 기능을 고치는 사람에게 보낼 재료
   leak    밖으로 보낼 글에 회사 내용이 섞였는지 대조
+  freeze  주제를 동결/해제한다 — 끝난 과제가 갱신 대상에서 빠지게
 
-전부 AI 호출 0, DB 는 읽기만 한다. 파일을 쓰는 것은 `<vault>/wiki/.history/` 뿐이다
-(check 가 통과한 판의 사본, 실행 기록 한 줄 — 둘 다 메일 내용이 아니다).
+전부 AI 호출 0, DB 는 읽기만 한다. 파일을 쓰는 것은 두 곳뿐이다 —
+`<vault>/wiki/.history/`(check 가 통과한 판의 사본, 실행 기록 한 줄 — 둘 다 메일 내용이
+아니다)와, freeze 가 고치는 동결 표시(머리말 `frozen:` 한 줄 · 머리 줄 · index · log).
+페이지의 본문은 코드가 쓰지 않는다 — 그건 세션의 일이다.
+
+'새 메일'의 기준은 **도착 순서**다(머리말 `seq:` = 반영한 마지막 `ingest_seq`).
+2026-11-10 판은 발신 시각(`through`)으로 갈랐는데, 수집 범위를 넓혀 옛 메일이 뒤늦게
+들어오면 그 메일이 영영 '이미 반영됨'으로 빠졌다(재현: 01-12 까지 반영한 페이지에
+01-10 발신 메일이 들어와도 새 메일 0). 그래서 지키는 약속은 하나다 —
+**페이지는 소속 스레드의 메일 중 `ingest_seq <= seq` 인 것을 전부, 그것만 반영한다.**
+scan 의 묶음도, add 가 주는 메일도, check 의 대조도 이 한 줄에서 나온다. `through` 는
+읽는 사람에게 보여 주는 기준 시각으로만 남는다.
 
 불변식과의 관계(CLAUDE.md):
   · 숨긴 스레드는 재료에서 뺀다 — scan 이 `store.hidden_thread_ids()` 로 거른다(3).
   · 인용 검증은 코드가 한다 — check 가 그 자리다(7). 보존 인용(mid-join)은 근거에서
     뺀다: 남이 주고받은 글이라 그대로 대조하면 A 의 문장을 B 의 말로 올리게 된다
     (distill._QuoteChecker 와 같은 이유).
-  · id 는 카운터가 아니다 — '새 메일'은 발신 시각(`through`)으로 가른다(8).
+  · id 는 카운터가 아니다 — '새 메일'은 `ingest_seq` 로 가른다(8).
   · 읽기 경로에서 DB 에 쓰지 않는다(9).
 """
 
@@ -30,15 +41,20 @@ from __future__ import annotations
 import collections
 import json
 import re
+import secrets
 import shutil
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 
 from .clean import strip_preserved, take_preserved
 from .config import Config
 from .store import Store
 
-WIKI_VER = 1               # report 머리 줄에 싣는 도구 판 — 형식·판정 규칙을 바꾸면 올린다
+WIKI_VER = 2               # report 머리 줄에 싣는 도구 판 — 형식·판정 규칙을 바꾸면 올린다
+# 페이지 형식 판(머리말 `format:`). 경위 줄 문법은 실험 중에만 세 번 바뀌었다 — 판 번호가
+# 없으면 문법을 고치는 날 옛 페이지가 통째로 '형식 오류'가 된다. 판을 올릴 때는 옛 판의
+# 문법을 GRAMMAR 에 **남겨 둔다**: check 는 페이지가 적어 둔 판의 문법으로 읽는다.
+FORMAT = 1
 MARKS = ("결정", "변경", "사실", "논의")
 TAILS = ("결정", "변경", "해소")
 DROP_TAIL = " → 제외됨(주제 밖)"
@@ -54,6 +70,7 @@ LEAK_WINDOW = 12           # 원문과 이만큼 이어서 겹치면 반출 의�
 # 뒤집힘 신호 — 후보 스레드에 이 말이 새로 나왔으면 이유에 함께 싣는다(읽을지는 사용자 몫)
 SIGNALS = ("변경", "취소", "보류", "연기", "확정", "최종", "철회")
 RATINGS = ("쓸만함", "보통", "아님")
+FREEZE_MARK = "> **동결**"   # freeze 가 머리 줄에 넣고 unfreeze 가 빼는 줄의 머리
 _FILES_NOT_PAGES = ("index.md", "log.md", "notes.md")
 _TITLES = ("책임", "수석", "선임", "주임", "팀장", "사원", "대리", "과장", "차장", "부장",
            "님", "프로", "연구원", "매니저", "파트장", "그룹장")
@@ -141,6 +158,39 @@ class Page:
     def through(self) -> str:
         return self.meta.get("through", "")[:16]
 
+    @property
+    def seq(self) -> int | None:
+        """반영한 마지막 도착 번호 — 없거나 숫자가 아니면 None."""
+        raw = self.meta.get("seq", "").strip()
+        return int(raw) if raw.isdigit() else None
+
+    @property
+    def frozen(self) -> str:
+        """동결한 날짜(YYYY-MM-DD). 빈 문자열이면 동결되지 않은 주제."""
+        return self.meta.get("frozen", "").strip()
+
+    @property
+    def code(self) -> str:
+        return self.meta.get("code", "").strip()
+
+    def problem(self) -> str | None:
+        """이 도구가 읽을 수 없는 페이지면 그 까닭 — scan·status 가 먼저 묻는다."""
+        raw = self.meta.get("format", "").strip()
+        if not raw:
+            return ("머리말에 format 없음 — 형식 판이 붙기 전의 페이지다. 계약의 지금 형식"
+                    f"(format: {FORMAT}, 날짜 YYYY-MM-DD, seq, code)으로 다시 만든다")
+        if not raw.isdigit() or int(raw) not in GRAMMAR:
+            return (f"이 도구가 모르는 형식 판 {raw} (아는 판: "
+                    f"{', '.join(map(str, sorted(GRAMMAR)))}) — mailkb 를 최신으로 올린다")
+        if self.seq is None:
+            return "머리말에 seq 없음(반영한 마지막 도착 번호) — scan 출력의 seq 를 적는다"
+        return None
+
+    @property
+    def fmt(self) -> int:
+        raw = self.meta.get("format", "").strip()
+        return int(raw) if raw.isdigit() and int(raw) in GRAMMAR else FORMAT
+
 
 def parse_page(path: Path) -> Page:
     return Page(path)
@@ -149,15 +199,19 @@ def parse_page(path: Path) -> Page:
 # ── 경위 줄 ────────────────────────────────────────────────────────────────
 # 인용은 끝에서부터 잡는다(탐욕) — 원문에 따옴표나 '→'(예: "1% → 10%")가 들어 있어도
 # 꼬리로 읽히지 않게. 꼬리는 닫는 따옴표 **뒤에** 정해진 꼴로만 온다.
-_TAIL = r"(?: → \d\d-\d\d (?:%s) \[메일 #\d+\]|%s)" % ("|".join(TAILS), re.escape(DROP_TAIL))
+# 날짜는 연도까지 적는다 — 한 해를 넘기는 과제에서 `01-09` 는 어느 해인지 알 수 없다.
+_DAY = r"\d{4}-\d\d-\d\d"
+_TAIL = r"(?: → %s (?:%s) \[메일 #\d+\]|%s)" % (_DAY, "|".join(TAILS), re.escape(DROP_TAIL))
 LINE_RX = re.compile(
-    r'^- (\d\d-\d\d) \*\*(%s)\*\* (.+?) — (.+?) \[메일 #(\d+)\] "(.+)"(%s*)$'
-    % ("|".join(MARKS), _TAIL))
+    r'^- (%s) \*\*(%s)\*\* (.+?) — (.+?) \[메일 #(\d+)\] "(.+)"(%s*)$'
+    % (_DAY, "|".join(MARKS), _TAIL))
 _TAIL_RX = re.compile(_TAIL)
+_TAIL_PARTS = re.compile(r" → (%s) (?:%s) \[메일 #(\d+)\]" % (_DAY, "|".join(TAILS)))
+GRAMMAR = {1: LINE_RX}     # 형식 판 → 경위 줄 문법 (FORMAT 주석 참고)
 
 
-def _line_parts(line: str):
-    m = LINE_RX.match(line)
+def _line_parts(line: str, fmt: int = FORMAT):
+    m = GRAMMAR[fmt].match(line)
     return m.groups() if m else None
 
 
@@ -172,7 +226,7 @@ class _Mail:
     """DB 조회 한 곳 — 재료에서 뺄 것(자동 알림·숨김·사라진 메일)을 여기서 거른다."""
 
     _COLS = ("id, thread_id, subject, sender_name, sender_addr, to_addrs, cc_addrs, "
-             "sent_on, new_content, attach_names")
+             "sent_on, new_content, attach_names, ingest_seq")
 
     def __init__(self, store: Store, cfg: Config):
         self.store, self.cfg = store, cfg
@@ -203,9 +257,14 @@ class _Mail:
         한글은 대소문자가 없으니 그걸로 충분하다."""
         pat = "%" + needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
         return self.store.db.execute(
-            "SELECT id, thread_id, subject, sender_addr, new_content FROM messages "
+            "SELECT id, thread_id, subject, sender_addr, new_content, ingest_seq FROM messages "
             "WHERE gone_at IS NULL AND (subject LIKE ? ESCAPE '\\' "
             "OR new_content LIKE ? ESCAPE '\\')", (pat, pat)).fetchall()
+
+    def max_seq(self) -> int:
+        """지금까지 도착한 마지막 번호 — 남은 묶음이 없을 때 페이지의 seq 가 여기까지 오른다."""
+        return self.store.db.execute(
+            "SELECT COALESCE(MAX(ingest_seq), 0) FROM messages").fetchone()[0]
 
     def human_thread_count(self) -> int:
         seen = set()
@@ -335,35 +394,48 @@ def _term_scan(mail: _Mail, terms: list[str], skip: set[int]) -> tuple[list[dict
     return sorted(rows, key=lambda r: r["last"]), common, outside
 
 
-def _signals(mail: _Mail, tid: int, after: str) -> list[str]:
+def _signals(mail: _Mail, tid: int, after: int) -> list[str]:
     body = " ".join(strip_preserved(m["new_content"] or "") for m in mail.msgs(tid)
-                    if m["sent_on"][:16] > after)
+                    if m["ingest_seq"] > after)
     return [s for s in SIGNALS if s in body]
 
 
-def _cut(dates: list[str], limit: int) -> tuple[str, int]:
-    """오래된 것부터 limit 통에서 끊는다. 같은 분(分)에 온 메일은 한 묶음에 넣는다 —
-    through 가 분 단위라, 갈라 놓으면 뒤쪽이 다음 scan 에서 '이미 반영됨'으로 빠진다."""
-    dates = sorted(dates)
-    if len(dates) <= limit:
-        return (dates[-1] if dates else ""), 0
-    edge = dates[limit - 1]
-    kept = sum(1 for d in dates if d <= edge)
-    return edge, len(dates) - kept
+def _cut(seqs: list[int], limit: int) -> tuple[int, int]:
+    """먼저 도착한 것부터 limit 통에서 끊는다. 반환 (묶음의 마지막 도착 번호, 남은 통 수).
+    묶음은 항상 도착 순서의 앞토막이다 — 그래야 '여기까지 반영했다'를 수 하나로 적는다."""
+    seqs = sorted(seqs)
+    if len(seqs) <= limit:
+        return (seqs[-1] if seqs else 0), 0
+    return seqs[limit - 1], len(seqs) - limit
 
 
 def _deadline_passed(line: str, today: date) -> bool:
-    """`- 기한: MM-DD …` 줄의 날짜가 지났는데 '지남' 이 없는가."""
-    m = re.match(r"- 기한:\s*(\d\d)-(\d\d)\b", line)
+    """`- 기한: YYYY-MM-DD …` 줄의 날짜가 지났는데 '지남' 이 없는가."""
+    m = re.match(r"- 기한:\s*(\d{4})-(\d\d)-(\d\d)\b", line)
     if not m or "지남" in line:
         return False
     try:
-        d = date(today.year, int(m.group(1)), int(m.group(2)))
+        return date(int(m.group(1)), int(m.group(2)), int(m.group(3))) < today
     except ValueError:
         return False
-    if d - today > timedelta(days=183):        # 1월에 보는 12월 기한은 작년 것
-        d = d.replace(year=today.year - 1)
-    return d < today
+
+
+def _new_code(cfg: Config) -> str:
+    """주제의 고정 코드 — 자가 평가 글에서 주제를 가리키는 이름이다. 파일 순번(T1, T2)을
+    쓰면 주제를 하나 더하거나 이름을 바꿀 때 번호가 밀려, 지난번 글의 T2 와 이번 글의
+    T2 가 다른 주제가 된다. 뜻 없는 무작위 값이라 밖으로 나가도 회사 내용이 아니다."""
+    used = {parse_page(p).code for p in page_paths(cfg)}
+    while True:
+        c = secrets.token_hex(2)
+        if c not in used:
+            return c
+
+
+def _frozen_reply(page: "Page", today: date) -> dict:
+    return {"today": today.isoformat(), "topic": page.topic, "page_file": page.path.name,
+            "frozen": page.frozen,
+            "error": f"동결된 주제다({page.frozen}) — 메일을 주지 않는다. 다시 갱신하려면 "
+                     "`wiki unfreeze <주제>` 를 먼저 돌린다"}
 
 
 def _log_op(cfg: Config, rec: dict) -> None:
@@ -383,7 +455,7 @@ def _log_op(cfg: Config, rec: dict) -> None:
 
 def scan_topic(store: Store, cfg: Config, topic: str, aliases: list[str],
                limit: int = SCAN_LIMIT, today: date | None = None) -> dict:
-    """새 주제의 재료 — 확정 스레드의 메일(오래된 것부터 limit 통)과 후보."""
+    """새 주제의 재료 — 확정 스레드의 메일(먼저 도착한 것부터 limit 통)과 후보."""
     today = today or date.today()
     path = wiki_dir(cfg) / f"{slug(topic)}.md"
     if path.exists():
@@ -393,20 +465,24 @@ def scan_topic(store: Store, cfg: Config, topic: str, aliases: list[str],
     found = [v for v in _variants(names) if mail.like(v)]
     rows, noise = _alias_scan(mail, names + found)
     conf = [r for r in rows if r["verdict"] == "확정"]
-    edge, remaining = _cut([m["sent_on"][:16] for r in conf for m in mail.msgs(r["thread"])], limit)
+    edge, remaining = _cut([m["ingest_seq"] for r in conf for m in mail.msgs(r["thread"])], limit)
     delivered = []
-    n = 0
+    n, through = 0, ""
     for r in conf:
-        ms = [mail.out(m) for m in mail.msgs(r["thread"]) if m["sent_on"][:16] <= edge]
-        if ms:
-            delivered.append({**r, "messages_all": ms})
-            n += len(ms)
+        got = [m for m in mail.msgs(r["thread"]) if m["ingest_seq"] <= edge]
+        if got:
+            delivered.append({**r, "messages_all": [mail.out(m) for m in got]})
+            n += len(got)
+            through = max([through] + [m["sent_on"][:16] for m in got])
     out = {
         "today": today.isoformat(), "topic": topic, "page_file": path.name,
+        "format": FORMAT, "code": _new_code(cfg),
         "aliases_given": names[1:], "alias_variants_found": found,
         "confirmed_threads": delivered,
         "candidates": [r for r in rows if r["verdict"] == "후보"],
-        "noise_excluded": noise, "through": edge,
+        "noise_excluded": noise, "through": through,
+        # 남은 묶음이 없으면 지금까지 도착한 것 전부를 본 셈이다
+        "seq": edge if remaining else mail.max_seq(),
         "batch": {"delivered": n, "remaining": remaining, "limit": limit},
     }
     if remaining:
@@ -418,12 +494,16 @@ def scan_topic(store: Store, cfg: Config, topic: str, aliases: list[str],
 
 def scan_page(store: Store, cfg: Config, path: Path, limit: int = SCAN_LIMIT,
               today: date | None = None) -> dict:
-    """갱신 재료 — `through` 뒤에 온 메일, 새로 걸린 스레드, 후보, 지난 기한."""
+    """갱신 재료 — `seq` 뒤에 도착한 메일, 새로 걸린 스레드, 후보, 지난 기한."""
     today = today or date.today()
     page = parse_page(path)
+    if page.problem():
+        return {"topic": page.topic, "page_file": page.path.name, "error": page.problem()}
+    if page.frozen:
+        return _frozen_reply(page, today)
     mail = _Mail(store, cfg)
     threads, cands, excl = page.ids("threads"), page.ids("candidates"), page.ids("excluded")
-    through = page.through
+    through, seq = page.through, page.seq
     hidden_now = [t for t in threads if t in mail.hidden]
     live = [t for t in threads if t not in mail.hidden]
 
@@ -431,28 +511,37 @@ def scan_page(store: Store, cfg: Config, path: Path, limit: int = SCAN_LIMIT,
     new_conf = [r for r in rows if r["verdict"] == "확정"]
     alias_c = [r for r in rows if r["verdict"] == "후보"]
 
-    # 한 묶음의 끝 — 소속 스레드의 새 메일과 새 확정 스레드의 through 뒤 메일을 한 줄로 세운다
-    pool = [m["sent_on"][:16] for t in live for m in mail.msgs(t) if m["sent_on"][:16] > through]
-    pool += [m["sent_on"][:16] for r in new_conf for m in mail.msgs(r["thread"])
-             if m["sent_on"][:16] > through]
+    # 한 묶음의 끝 — 소속 스레드와 새 확정 스레드의, seq 뒤에 도착한 메일을 한 줄로 세운다
+    pool = [m["ingest_seq"] for t in live for m in mail.msgs(t) if m["ingest_seq"] > seq]
+    pool += [m["ingest_seq"] for r in new_conf for m in mail.msgs(r["thread"])
+             if m["ingest_seq"] > seq]
     edge, remaining = _cut(pool, limit)
-    edge = edge or through
-    new_msgs = sorted(
-        ({"thread": t, **mail.out(m)} for t in live for m in mail.msgs(t)
-         if through < m["sent_on"][:16] <= edge), key=lambda m: m["date"])
+    edge = edge or seq
+    new_msgs, got_dates = [], []
+    for t in live:
+        for m in mail.msgs(t):
+            if seq < m["ingest_seq"] <= edge:
+                d = {"thread": t, **mail.out(m)}
+                # 발신은 기준 시각보다 앞인데 이제야 들어온 메일(수집 범위를 넓혔을 때)
+                if through and m["sent_on"][:16] < through:
+                    d["arrived_late"] = True
+                new_msgs.append(d)
+                got_dates.append(m["sent_on"][:16])
+    new_msgs.sort(key=lambda m: m["date"])
     conf_out = []
     for r in new_conf:
-        # 새로 걸린 스레드는 through 이전 메일도 처음 보는 것이라 함께 준다(끝은 같은 edge)
-        ms = [mail.out(m) for m in mail.msgs(r["thread"]) if m["sent_on"][:16] <= edge]
-        if ms:
-            conf_out.append({**r, "messages_all": ms})
+        # 새로 걸린 스레드는 seq 이전 메일도 처음 보는 것이라 함께 준다(끝은 같은 edge)
+        got = [m for m in mail.msgs(r["thread"]) if m["ingest_seq"] <= edge]
+        if got:
+            conf_out.append({**r, "messages_all": [mail.out(m) for m in got]})
+            got_dates += [m["sent_on"][:16] for m in got]
 
     skip = set(threads) | set(excl) | {r["thread"] for r in rows}
     term_c, common, outside = _term_scan(mail, page.list("terms"), skip)
     all_c = alias_c + term_c
     for r in all_c:
         r["already_candidate"] = r["thread"] in cands
-        sg = _signals(mail, r["thread"], through)
+        sg = _signals(mail, r["thread"], seq)
         if sg:
             r["change_signals"] = sg
     gone = [mail.row(c) for c in cands
@@ -461,9 +550,10 @@ def scan_page(store: Store, cfg: Config, path: Path, limit: int = SCAN_LIMIT,
     overdue = [l for l in page.bullets("열린 것") if _deadline_passed(l, today)]
     delivered = len(new_msgs) + sum(len(r["messages_all"]) for r in conf_out)
     fresh_c = [r for r in all_c if not r["already_candidate"]]
+    late = sum(1 for m in new_msgs if m.get("arrived_late"))
     out = {
         "today": today.isoformat(), "topic": page.topic, "page_file": page.path.name,
-        "through": through,
+        "through": through, "seq": seq,
         "nothing_new": not (delivered or conf_out or fresh_c or overdue or hidden_now),
         "new_messages": new_msgs,
         "new_confirmed_threads": conf_out,
@@ -475,23 +565,33 @@ def scan_page(store: Store, cfg: Config, path: Path, limit: int = SCAN_LIMIT,
         "threads_table": [mail.row(t) for t in live],
         "threads_hidden_by_user": hidden_now,
         "noise_excluded": noise,
-        "through_after_update": edge,
+        "through_after_update": max([through] + got_dates),
+        "seq_after_update": edge if remaining else mail.max_seq(),
         "batch": {"delivered": delivered, "remaining": remaining, "limit": limit},
     }
     if remaining:
         out["batch"]["note"] = "이 묶음을 반영하고 check 를 통과시킨 뒤 scan 을 다시 돌려 다음 묶음을 받는다"
     _log_op(cfg, {"cmd": "scan-page", "page": page.path.stem, "delivered": delivered,
-                  "remaining": remaining})
+                  "remaining": remaining, "late": late})
     return out
 
 
 def scan_thread(store: Store, cfg: Config, path: Path, tid: int,
                 today: date | None = None) -> dict:
-    """한 스레드의 메일 — add(넣기)와 drop(빼기)이 쓴다."""
+    """한 스레드의 메일 — add(넣기)와 drop(빼기)이 쓴다.
+
+    본문은 **`seq` 까지 도착한 메일만** 준다. 그 뒤에 도착한 메일까지 여기서 주면 seq 를
+    올릴 수도(다른 소속 스레드의 새 메일이 빠진다) 그대로 둘 수도(다음 update 가 같은
+    메일을 또 준다) 없다. 그래서 뒤 것은 건수만 알리고 다음 update 가 가져오게 한다."""
     today = today or date.today()
     page = parse_page(path)
+    if page.problem():
+        return {"topic": page.topic, "page_file": page.path.name, "error": page.problem()}
+    if page.frozen:
+        return _frozen_reply(page, today)
     mail = _Mail(store, cfg)
     ms = mail.msgs(tid)
+    old = [m for m in ms if m["ingest_seq"] <= page.seq]
     where = ("threads" if tid in page.ids("threads") else
              "candidates" if tid in page.ids("candidates") else
              "excluded" if tid in page.ids("excluded") else "없음")
@@ -502,10 +602,15 @@ def scan_thread(store: Store, cfg: Config, path: Path, tid: int,
     out = {
         "today": today.isoformat(), "topic": page.topic, "thread": mail.row(tid),
         "now_in_page": where, "hidden": tid in mail.hidden,
-        "messages": [] if tid in mail.hidden else [mail.out(m) for m in ms],
+        "messages": [] if tid in mail.hidden else [mail.out(m) for m in old],
+        "message_ids": [m["id"] for m in ms],
+        "held_for_update": len(ms) - len(old),
         "threads_table_if_added": table, "noise_excluded": noise,
-        "through": page.through,
+        "through": page.through, "seq": page.seq,
     }
+    if len(ms) > len(old):
+        out["held_note"] = (f"이 스레드의 메일 {len(ms) - len(old)}통은 마지막 갱신 뒤에 도착했다 — "
+                            "여기서 주지 않는다. threads 에 넣은 뒤 update 를 돌리면 온다")
     if not ms:
         out["error"] = f"스레드 #{tid} 에 사람이 쓴 메일이 없다(없는 번호이거나 자동 알림뿐)"
     if tid in mail.hidden:
@@ -520,7 +625,8 @@ def scan_thread(store: Store, cfg: Config, path: Path, tid: int,
 _CATEGORY = (
     ("인용", "인용 불일치"), ("현재 상태", "근거 표시"), ("열린 것", "근거 표시"),
     ("이전 경위", "이전 줄 변경"), ("경위 줄 형식", "형식"), ("머리말에", "형식"),
-    ("절 없음", "형식"), ("through", "머리말·표 불일치"), ("표 ≠", "머리말·표 불일치"),
+    ("형식 판", "형식"), ("절 없음", "형식"), ("머리말 code", "형식"), ("머리말 frozen", "형식"),
+    ("through", "머리말·표 불일치"), ("표 ≠", "머리말·표 불일치"), ("seq", "머리말·표 불일치"),
     ("발신일", "날짜 불일치"), ("없는 메일", "없는 번호"), ("꼬리의", "없는 번호"),
     ("스레드가 threads", "소속 밖 메일"), ("숨긴", "숨긴 스레드"),
 )
@@ -538,18 +644,42 @@ def check(store: Store, cfg: Config, path: Path, today: date | None = None) -> d
     '이전 경위 줄이 그대로인가'를 볼 수 있게 한다.
 
     보증하는 것: 쓴 것이 원문에 있다 · 옛 기록을 건드리지 않았다 · 현재 상태가 결정·사실
-    줄에 기대고 있다. 보증하지 **않는** 것: 요지가 인용과 맞는가, 표시가 옳은가, 빠뜨린
-    메일이 없는가 — 그건 읽는 사람의 몫이라 계약 문서에 그렇게 적어 둔다.
+    줄에 기대고 있다 · seq 가 쓴 메일을 덮는다. 보증하지 **않는** 것: 요지가 인용과
+    맞는가, 표시가 옳은가, 빠뜨린 메일이 없는가 — 그건 읽는 사람의 몫이라 계약 문서에
+    그렇게 적어 둔다.
     """
     today = today or date.today()
     page = parse_page(path)
     mail = _Mail(store, cfg)
     errs: list[str] = []
     warns: list[str] = []
-    for k in ("topic", "aliases", "terms", "threads", "candidates", "excluded",
-              "created", "updated", "through"):
+    for k in ("format", "code", "topic", "aliases", "terms", "threads", "candidates", "excluded",
+              "created", "updated", "through", "seq"):
         if k not in page.meta:
             errs.append(f"머리말에 {k} 없음")
+    raw_fmt = page.meta.get("format", "").strip()
+    if raw_fmt and (not raw_fmt.isdigit() or int(raw_fmt) not in GRAMMAR):
+        # 문법을 모르는 판은 대조할 수 없다 — 옛 문법으로 읽어 '전부 형식 오류'라 하지 않는다
+        res = {"ok": False, "errors": [page.problem()], "warnings": [], "lines": 0,
+               "marks": {k: 0 for k in MARKS}, "previous_lines_kept": None}
+        _log_op(cfg, {"cmd": "check", "page": page.path.stem, "ok": False, "categories": ["형식"]})
+        return res
+    fmt = page.fmt
+    if "code" in page.meta:
+        if not re.fullmatch(r"[a-z0-9]{4,8}", page.code):
+            errs.append(f"머리말 code 가 영소문자·숫자 4~8자가 아님: {page.code[:20]}")
+        elif any(parse_page(p).code == page.code for p in page_paths(cfg)
+                 if p.resolve() != page.path.resolve()):
+            errs.append(f"머리말 code {page.code} 를 다른 주제도 쓴다 — scan --topic 이 준 값을 쓴다")
+    if page.frozen and not re.fullmatch(_DAY, page.frozen):
+        errs.append(f"머리말 frozen 은 날짜(YYYY-MM-DD)이거나 비어 있어야 한다: {page.frozen[:20]}")
+    seq = page.seq
+    top = mail.max_seq()
+    if "seq" in page.meta and seq is None:
+        errs.append("머리말에 seq 가 숫자가 아님")
+    elif seq is not None and seq > top:
+        errs.append(f"seq {seq} 가 DB 의 마지막 도착 번호 {top} 보다 크다 — scan 이 준 값을 쓴다"
+                    "(DB 를 새로 만들었다면 번호가 달라졌으니 페이지를 다시 만든다)")
     for s in ("현재 상태", "열린 것", "경위", "기술", "사람", "스레드"):
         if s not in page.secs:
             errs.append(f"절 없음: {s}")
@@ -561,7 +691,7 @@ def check(store: Store, cfg: Config, path: Path, today: date | None = None) -> d
     marks_of: dict[int, set] = collections.defaultdict(set)
     count = collections.Counter()
     for l in lines:
-        parts = _line_parts(l)
+        parts = _line_parts(l, fmt)
         if not parts:
             errs.append(f"경위 줄 형식: {l[:90]}")
             continue
@@ -570,15 +700,19 @@ def check(store: Store, cfg: Config, path: Path, today: date | None = None) -> d
         marks_of[mid].add(mark)
         count[mark] += 1
         row = store.db.execute(
-            "SELECT thread_id, sent_on, new_content FROM messages WHERE id=?", (mid,)).fetchone()
+            "SELECT thread_id, sent_on, new_content, ingest_seq FROM messages WHERE id=?",
+            (mid,)).fetchone()
         if not row:
             errs.append(f"없는 메일 #{mid}: {l[:60]}")
             continue
         dropped = DROP_TAIL in tail
         if row["thread_id"] not in threads and not dropped:
             errs.append(f"메일 #{mid} 의 스레드가 threads 에 없음: {l[:60]}")
-        if row["sent_on"][5:10] != day:
-            errs.append(f"메일 #{mid} 발신일 {row['sent_on'][5:10]} ≠ 줄 머리 {day}")
+        if row["sent_on"][:10] != day:
+            errs.append(f"메일 #{mid} 발신일 {row['sent_on'][:10]} ≠ 줄 머리 {day}")
+        if seq is not None and row["ingest_seq"] > seq and not dropped:
+            errs.append(f"메일 #{mid} 는 seq {seq} 뒤에 도착했다 — seq 를 scan 의 "
+                        "seq_after_update 로 올린다(안 올리면 다음 scan 이 이 메일을 또 준다)")
         q = _norm(quote)
         bare = len(re.sub(r"\s", "", q))
         own = _norm(strip_preserved(row["new_content"] or ""))
@@ -588,9 +722,13 @@ def check(store: Store, cfg: Config, path: Path, today: date | None = None) -> d
             where = ("보존된 이전 대화 안에만 있음(근거로 못 쓴다)"
                      if q in _norm(row["new_content"] or "") else "원문에 없음")
             errs.append(f"인용 {where} #{mid}: {quote[:50]}")
-        for tmid in re.findall(r"\[메일 #(\d+)\]", tail):
-            if not store.db.execute("SELECT 1 FROM messages WHERE id=?", (int(tmid),)).fetchone():
+        for tday, tmid in _TAIL_PARTS.findall(tail):
+            trow = store.db.execute("SELECT sent_on FROM messages WHERE id=?",
+                                    (int(tmid),)).fetchone()
+            if not trow:
                 errs.append(f"꼬리의 메일 #{tmid} 없음")
+            elif trow["sent_on"][:10] != tday:
+                errs.append(f"꼬리의 메일 #{tmid} 발신일 {trow['sent_on'][:10]} ≠ 꼬리 날짜 {tday}")
 
     for l in page.bullets("현재 상태"):
         if "아직 확정된 것이 없다" in l:
@@ -617,13 +755,19 @@ def check(store: Store, cfg: Config, path: Path, today: date | None = None) -> d
         errs.append("스레드 표 ≠ 머리말 threads")
     if table("확인할 스레드") != set(page.ids("candidates")):
         errs.append("확인할 스레드 표 ≠ 머리말 candidates")
-    latest = max([m["sent_on"][:16] for t in threads for m in mail.msgs(t)] + [""])
+    # through 는 읽는 사람에게 보이는 기준 시각이다. 뺀 스레드의 메일이 마지막이었을 수
+    # 있으니 excluded 까지 넣어 본다(안 넣으면 drop 직후에 헛오류가 난다).
+    latest = max([m["sent_on"][:16] for t in threads | set(page.ids("excluded"))
+                  for m in mail.msgs(t)] + [""])
     if page.through > latest:
-        errs.append(f"through {page.through} 가 소속 스레드의 마지막 메일 {latest} 보다 늦다")
-    elif page.through < latest:
-        # 묶음으로 나눠 반영하는 중이면 정상이다 — 오류가 아니라 알림
-        n = sum(1 for t in threads for m in mail.msgs(t) if m["sent_on"][:16] > page.through)
-        warns.append(f"through 뒤에 반영 안 된 메일 {n}통 — scan 으로 다음 묶음을 받는다")
+        errs.append(f"through {page.through} 가 읽은 스레드의 마지막 메일 {latest} 보다 늦다")
+    if seq is not None:
+        n = sum(1 for t in threads - mail.hidden for m in mail.msgs(t) if m["ingest_seq"] > seq)
+        if n and page.frozen:
+            warns.append(f"동결된 주제 — 기준 뒤에 도착한 메일 {n}통은 반영하지 않는다")
+        elif n:
+            # 묶음으로 나눠 반영하는 중이면 정상이다 — 오류가 아니라 알림
+            warns.append(f"seq 뒤에 도착해 반영 안 된 메일 {n}통 — scan 으로 다음 묶음을 받는다")
 
     hist = page.path.parent / ".history" / page.path.name
     kept = None
@@ -653,6 +797,24 @@ def check(store: Store, cfg: Config, path: Path, today: date | None = None) -> d
 
 # ── status ────────────────────────────────────────────────────────────────
 
+def _since(mail: _Mail, page: Page) -> tuple[int, int]:
+    """기준(seq) 뒤에 도착한 관련 메일 — (소속 스레드의 것, 다른 스레드에서 이름이 걸린 것).
+    동결된 주제가 '끝난 줄 알았는데 다시 열렸다'를 조용히 놓치지 않게 하는 수 하나다."""
+    seq = page.seq or 0
+    threads, excl = set(page.ids("threads")), set(page.ids("excluded"))
+    member = sum(1 for t in threads - mail.hidden for m in mail.msgs(t) if m["ingest_seq"] > seq)
+    low = [n.lower() for n in page.names]
+    seen = set()
+    for n in low:
+        for r in mail.like(n):
+            if (r["ingest_seq"] > seq and r["thread_id"] not in threads | excl | mail.hidden
+                    and mail.human(r)
+                    and any(a in ((r["subject"] or "") + " "
+                                  + strip_preserved(r["new_content"] or "")).lower() for a in low)):
+                seen.add(r["id"])
+    return member, len(seen)
+
+
 def status(store: Store, cfg: Config, today: date | None = None) -> list[dict]:
     """주제마다 한 줄 — 돌릴지 말지 정하는 재료(AI 를 부르기 전에 본다)."""
     today = today or date.today()
@@ -663,8 +825,26 @@ def status(store: Store, cfg: Config, today: date | None = None) -> list[dict]:
         threads, cands, excl = page.ids("threads"), page.ids("candidates"), page.ids("excluded")
         live = [t for t in threads if t not in mail.hidden]
         through = page.through
-        pending = sum(1 for t in live for m in mail.msgs(t) if m["sent_on"][:16] > through)
-        have = sum(1 for t in live for m in mail.msgs(t) if m["sent_on"][:16] <= through)
+        try:
+            age = (today - date.fromisoformat(through[:10])).days
+        except ValueError:
+            age = None
+        row = {"topic": page.topic, "file": path.name, "through": through, "days_since": age,
+               "frozen": page.frozen, "new_messages": 0, "new_confirmed_threads": 0,
+               "new_candidates": 0, "candidates_waiting": len(cands),
+               "deadlines_passed_unmarked": 0, "threads": len(live)}
+        if page.problem():
+            out.append({**row, "todo": "읽을 수 없는 페이지", "problem": page.problem()})
+            continue
+        seq = page.seq
+        if page.frozen:
+            # 동결 — 후보 찾기도 갱신 권유도 하지 않는다. 수 하나만 낸다.
+            member, named = _since(mail, page)
+            out.append({**row, "todo": "동결", "new_messages": member + named,
+                        "related_since": {"member_threads": member, "named_elsewhere": named}})
+            continue
+        pending = sum(1 for t in live for m in mail.msgs(t) if m["ingest_seq"] > seq)
+        have = sum(1 for t in live for m in mail.msgs(t) if m["ingest_seq"] <= seq)
         rows, _ = _alias_scan(mail, page.names, skip=set(threads) | set(excl))
         new_conf = [r for r in rows if r["verdict"] == "확정"]
         skip = set(threads) | set(excl) | {r["thread"] for r in rows}
@@ -673,18 +853,12 @@ def status(store: Store, cfg: Config, today: date | None = None) -> list[dict]:
         fresh += [r for r in term_c if r["thread"] not in cands]
         pending += sum(sum(1 for m in mail.msgs(r["thread"])) for r in new_conf)
         overdue = sum(1 for l in page.bullets("열린 것") if _deadline_passed(l, today))
-        try:
-            age = (today - date.fromisoformat(through[:10])).days
-        except ValueError:
-            age = None
         todo = ("새 메일이 반영된 것보다 많다 — 묶음 여러 번" if pending > max(have, SCAN_LIMIT)
                 else "update" if pending or new_conf or fresh or overdue
                 else "판정할 후보 있음" if cands else "최신")
-        out.append({"topic": page.topic, "file": path.name, "through": through,
-                    "days_since": age, "new_messages": pending,
-                    "new_confirmed_threads": len(new_conf), "new_candidates": len(fresh),
-                    "candidates_waiting": len(cands), "deadlines_passed_unmarked": overdue,
-                    "threads": len(live), "todo": todo})
+        out.append({**row, "new_messages": pending, "new_confirmed_threads": len(new_conf),
+                    "new_candidates": len(fresh), "deadlines_passed_unmarked": overdue,
+                    "todo": todo})
     return out
 
 
@@ -693,15 +867,112 @@ def status_text(rows: list[dict]) -> str:
         return "주제 페이지가 없다 — `/mail-wiki new <주제>` 로 만든다."
     out = []
     for r in rows:
-        out.append(
-            f"{r['topic']}  [{r['todo']}]\n"
-            f"    기준 {r['through'].replace('T', ' ')}"
-            + (f" ({r['days_since']}일 전)" if r["days_since"] is not None else "")
-            + f" · 스레드 {r['threads']}\n"
-            f"    새 메일 {r['new_messages']} · 새 확정 스레드 {r['new_confirmed_threads']}"
-            f" · 새 후보 {r['new_candidates']} · 판정 대기 후보 {r['candidates_waiting']}"
-            f" · 표시 안 된 지난 기한 {r['deadlines_passed_unmarked']}")
+        head = (f"    기준 {r['through'].replace('T', ' ')}"
+                + (f" ({r['days_since']}일 전)" if r["days_since"] is not None else "")
+                + f" · 스레드 {r['threads']}")
+        if r.get("problem"):
+            out.append(f"{r['topic']}  [{r['todo']}]\n    {r['problem']}")
+        elif r["frozen"]:
+            rel = r["related_since"]
+            out.append(
+                f"{r['topic']}  [동결 {r['frozen']}]\n{head}\n"
+                f"    기준 뒤에 온 관련 메일 {r['new_messages']}"
+                f" (소속 스레드 {rel['member_threads']} · 다른 스레드에서 이름이 걸린 것 "
+                f"{rel['named_elsewhere']})"
+                + (" — 반영하려면 unfreeze 뒤 update" if r["new_messages"] else ""))
+        else:
+            out.append(
+                f"{r['topic']}  [{r['todo']}]\n{head}\n"
+                f"    새 메일 {r['new_messages']} · 새 확정 스레드 {r['new_confirmed_threads']}"
+                f" · 새 후보 {r['new_candidates']} · 판정 대기 후보 {r['candidates_waiting']}"
+                f" · 표시 안 된 지난 기한 {r['deadlines_passed_unmarked']}")
     return "\n".join(out)
+
+
+# ── freeze ────────────────────────────────────────────────────────────────
+
+def _read_raw(p: Path) -> str:
+    with open(p, encoding="utf-8", newline="") as f:      # 줄바꿈(CRLF)을 그대로 둔다
+        return f.read()
+
+
+def _write_raw(p: Path, text: str) -> None:
+    with open(p, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+
+
+def freeze(store: Store, cfg: Config, path: Path, today: date | None = None,
+           undo: bool = False) -> dict:
+    """주제를 동결한다(undo 면 푼다) — 끝난 과제가 갱신 대상에서 빠지게.
+
+    끝난 과제의 이름은 그 뒤 메일에도 계속 나온다. 그대로 두면 status 에 새 메일·후보가
+    쌓이고 `update all` 이 매번 그 주제까지 돈다(세션 한 번 = 토큰). 동결하면 scan 이
+    메일을 주지 않고 status 는 수 하나만 낸다. 풀면 seq 뒤에 쌓인 메일이 그대로 재료다.
+
+    고치는 것은 동결 표시뿐이다 — 머리말 `frozen:` 한 줄, 머리 줄의 동결 줄, index.md 의
+    그 주제 줄 끝, log.md 한 줄. 판단이 없는 일이라 세션(AI)을 거치지 않는다."""
+    today = today or date.today()
+    page = parse_page(path)
+    base = {"topic": page.topic, "page_file": page.path.name}
+    if page.problem():
+        return {**base, "ok": False, "error": page.problem()}
+    if bool(page.frozen) != undo:
+        return {**base, "ok": True, "frozen": page.frozen, "changed": False,
+                "note": "동결된 주제가 아니다" if undo else f"이미 동결된 주제다({page.frozen})"}
+    text = _read_raw(page.path)
+    nl = "\r\n" if "\r\n" in text else "\n"
+    m = re.match(r"(---\r?\n)(.*?)(\r?\n---)", text, re.S)
+    if not m:
+        return {**base, "ok": False, "error": "머리말(--- … ---)을 찾지 못했다"}
+    front = m.group(2)
+    line = "frozen:" if undo else f"frozen: {today.isoformat()}"
+    if re.search(r"(?m)^frozen:", front):
+        front = re.sub(r"(?m)^frozen:[^\r\n]*", line, front, count=1)
+    else:
+        front += nl + line
+    body = text[m.end(2):]
+    body = re.sub(r"(?m)^%s[^\r\n]*\r?\n" % re.escape(FREEZE_MARK), "", body)
+    if not undo:
+        mark = (f"{FREEZE_MARK} {today.isoformat()} — 이 뒤에 도착한 메일은 반영하지 않는다"
+                f"(다시 갱신하려면 unfreeze).{nl}")
+        at = re.search(r"(?m)^(?:> |## )", body)        # 머리 줄 맨 위, 없으면 첫 절 앞
+        pos = at.start() if at else len(body)
+        if at and body[pos:pos + 3] == "## ":
+            mark += nl
+        body = body[:pos] + mark + body[pos:]
+    _write_raw(page.path, m.group(1) + front + body)
+
+    w = page.path.parent
+    idx = w / "index.md"
+    if idx.exists():
+        key = f"- [[{page.path.stem}]]"
+        rows = _read_raw(idx).splitlines(keepends=True)
+        for i, row in enumerate(rows):
+            if row.startswith(key):
+                bare = row.rstrip("\r\n")
+                end = row[len(bare):]
+                bare = bare[:-len(" · 동결")] if bare.endswith(" · 동결") else bare
+                rows[i] = bare + ("" if undo else " · 동결") + end
+        _write_raw(idx, "".join(rows))
+    logp = w / "log.md"
+    old = _read_raw(logp) if logp.exists() else ""
+    if old and not old.endswith("\n"):
+        old += nl
+    what = "동결을 풀었다" if undo else "동결 — 이 뒤에 도착한 메일은 반영하지 않는다"
+    _write_raw(logp, old + f"- {today.isoformat()} {'unfreeze' if undo else 'freeze'} "
+                           f"{page.topic}: {what}{nl}")
+    _log_op(cfg, {"cmd": "unfreeze" if undo else "freeze", "page": page.path.stem})
+    member, named = _since(_Mail(store, cfg), page)
+    out = {**base, "ok": True, "changed": True,
+           "frozen": "" if undo else today.isoformat(),
+           "related_since": {"member_threads": member, "named_elsewhere": named}}
+    out["note"] = ((f"풀었다 — 기준 뒤에 도착한 메일이 있으면 update 로 반영한다"
+                    f"(소속 스레드 {member}통)") if undo else
+                   "동결했다 — scan 은 메일을 주지 않고 update all 은 건너뛴다. "
+                   + (f"기준 뒤에 도착했지만 반영 안 된 메일이 소속 스레드에 {member}통 있다"
+                      "(반영하고 동결하려면 unfreeze → update → freeze)" if member else
+                      "반영 안 된 메일은 없다"))
+    return out
 
 
 # ── report ────────────────────────────────────────────────────────────────
@@ -733,7 +1004,9 @@ def _words(s: str) -> set[str]:
 
 
 def report(store: Store, cfg: Config, today: date | None = None) -> str:
-    """회사 내용 없는 수치 보고. 주제는 T1, T2 로만 나오고 제목·이름·낱말·번호는 없다.
+    """회사 내용 없는 수치 보고. 주제는 고정 코드(T-3fa9)로만 나오고 제목·이름·낱말·
+    번호는 없다. 코드는 주제를 더하거나 이름을 바꿔도 그대로라, 지난 글과 이번 글의
+    같은 코드는 같은 주제다.
 
     이 기능을 고치는 사람은 회사 밖에 있어 메일을 볼 수 없다. 그래서 '무엇이 안
     되는가'를 **세어서** 내보낸다 — 특히 scan 이 못 올려 사용자가 직접 넣은 스레드는
@@ -751,11 +1024,11 @@ def report(store: Store, cfg: Config, today: date | None = None) -> str:
            f"생성 {today.isoformat()} · 도구 판 {WIKI_VER}",
            f"[규모] 메일 {n_msg} · 사람이 쓴 스레드 {mail.human_thread_count()}"
            f" · 자동 알림 {round(100 * n_noise / max(n_msg, 1))}% · 숨긴 스레드 {len(mail.hidden)}"
-           f" · 주제 {len(pages)}"]
-    stems = {}
+           f" · 주제 {len(pages)}(동결 {sum(1 for p in pages if parse_page(p).frozen)})"]
     for i, path in enumerate(pages, 1):
         page = parse_page(path)
-        stems[path.stem] = f"T{i}"
+        tag = f"T-{page.code}" if re.fullmatch(r"[a-z0-9]{4,8}", page.code) else f"T-?{i}"
+        seq = page.seq if page.seq is not None else 0
         threads, cands, excl = page.ids("threads"), page.ids("candidates"), page.ids("excluded")
         live = [t for t in threads if t not in mail.hidden]
         rows, noise = _alias_scan(mail, page.names)
@@ -766,8 +1039,8 @@ def report(store: Store, cfg: Config, today: date | None = None) -> str:
         term_c = {r["thread"] for r in term_rows}
         manual = [t for t in live if t not in auto | alias_c | term_c]
         kyung = page.bullets("경위")
-        marks = collections.Counter(p[1] for p in map(_line_parts, kyung) if p)
-        bad = sum(1 for l in kyung if not _line_parts(l))
+        marks = collections.Counter(p[1] for p in (_line_parts(l, page.fmt) for l in kyung) if p)
+        bad = sum(1 for l in kyung if not _line_parts(l, page.fmt))
         tails = sum(len(_tails(l)) for l in kyung)
         cur, opn = page.bullets("현재 상태"), page.bullets("열린 것")
         kinds = collections.Counter(
@@ -775,17 +1048,26 @@ def report(store: Store, cfg: Config, today: date | None = None) -> str:
             for l in opn)
         through = page.through
         n_in = sum(len(mail.msgs(t)) for t in live)
-        pending = sum(1 for t in live for m in mail.msgs(t) if m["sent_on"][:16] > through)
+        pending = sum(1 for t in live for m in mail.msgs(t) if m["ingest_seq"] > seq)
         try:
             age = (today - date.fromisoformat(through[:10])).days
         except ValueError:
             age = "?"
+        state = ""
+        if page.problem():
+            state = " · 읽을 수 없는 형식"
+        elif page.frozen:
+            try:
+                state = f" · 동결됨({(today - date.fromisoformat(page.frozen)).days}일 전)"
+            except ValueError:
+                state = " · 동결됨"
         rating = page.meta.get("rating", "").strip()
         rating = rating if rating in RATINGS else ("없음" if not rating else "기타")
         dead = sum(1 for t in terms if outside.get(t, 0) == 0)
         out += [
             "",
-            f"[주제 T{i}] 별칭 {len(page.names) - 1} · 고유 낱말 {len(terms)}"
+            f"[주제 {tag}] 형식 판 {page.meta.get('format', '').strip() or '없음'}{state}"
+            f" · 별칭 {len(page.names) - 1} · 고유 낱말 {len(terms)}"
             f"(바깥에서 한 번도 안 걸림 {dead} · 너무 흔해 버림 {len(common)})"
             f" · 페이지 {round(path.stat().st_size / 1024, 1)}KB · 사용자 평가 {rating}",
             f"  소속 스레드 {len(live)} = 별칭으로 자동 확정 {len(set(live) & auto)}"
@@ -806,7 +1088,7 @@ def report(store: Store, cfg: Config, today: date | None = None) -> str:
             + (" · ".join(f"{k} {v}" for k, v in kinds.items()) or "없음")
             + f") · 지남 표시 {sum('지남' in l for l in opn)}"
             f" · 표시 안 된 지난 기한 {sum(_deadline_passed(l, today) for l in opn)}",
-            f"  반영 기준 뒤 경과 {age}일 · 아직 반영 안 된 새 메일 {pending}통",
+            f"  반영 기준 뒤 경과 {age}일 · 기준 뒤에 도착해 아직 반영 안 된 메일 {pending}통",
         ]
         # 놓친 스레드의 생김새 — 내용 없이 수만. 찾기 규칙을 고칠 유일한 단서다.
         others_title = set()
@@ -842,7 +1124,7 @@ def report(store: Store, cfg: Config, today: date | None = None) -> str:
     if logp.exists():
         text = logp.read_text(encoding="utf-8")
         ops = collections.Counter(m.group(1) for m in re.finditer(
-            r"^- \d{4}-\d\d-\d\d (new|update|add|drop|feedback)\b", text, re.M))
+            r"^- \d{4}-\d\d-\d\d (new|update|add|drop|feedback|freeze|unfreeze)\b", text, re.M))
         models = collections.Counter(
             m.group(1).strip() for m in re.finditer(r"· 모델 ([A-Za-z0-9 ._:\-/]{1,40})\s*$", text, re.M))
         out += ["", "[작업] " + (" · ".join(f"{k} {v}" for k, v in ops.items()) or "없음")
@@ -882,7 +1164,8 @@ def report(store: Store, cfg: Config, today: date | None = None) -> str:
         out += [
             f"[묶음] scan {len(scans)}회 · 메일을 준 scan {len(big)}회"
             + (f" · 묶음당 평균 {round(sum(big) / len(big), 1)}통 · 최대 {max(big)}통" if big else "")
-            + f" · 남은 것이 있던 scan {sum(1 for r in scans if r.get('remaining'))}회",
+            + f" · 남은 것이 있던 scan {sum(1 for r in scans if r.get('remaining'))}회"
+            + f" · 뒤늦게 들어온 옛 메일 {sum(r.get('late', 0) for r in scans)}통",
             f"[검증] check {len(checks)}회 · 실패 {sum(not r.get('ok') for r in checks)}회"
             f" · 통과까지 간 작업 {groups}건 중 첫 시도 통과 {first_ok}건 · 실패 유형: "
             + (" · ".join(f"{k} {v}" for k, v in cat.items()) or "없음"),
@@ -942,8 +1225,21 @@ def leak(store: Store, cfg: Config, text: str, window: int = LEAK_WINDOW) -> dic
             add("사람 이름", n)
     for path in page_paths(cfg):
         page = parse_page(path)
-        for s in page.names + page.list("terms"):
+        for s in page.names:
             if len(s) >= 2 and s.lower() in low:
+                add("주제어·별칭·낱말", s)
+        for s in page.list("terms"):
+            # 영문 낱말은 낱말 경계로 본다 — 고유 낱말 'STA' 가 이 도구의 명령 이름
+            # 'status' 에 걸려 멀쩡한 글이 막혔다(2026-11-11 실험). 주제 이름·별칭은
+            # 그대로 부분 일치다: 그쪽은 놓치는 것이 더 나쁘다.
+            w = s.lower()
+            if len(w) < 2:
+                continue
+            if re.fullmatch(r"[a-z0-9][a-z0-9_.\-]*", w):
+                hit = re.search(r"(?<![a-z0-9])%s(?![a-z0-9])" % re.escape(w), low)
+            else:
+                hit = w in low
+            if hit:
                 add("주제어·별칭·낱말", s)
 
     # 원문 겹침 — 글의 window 자 조각을 집합으로 두고 메일을 한 번 훑는다. 반대로(글

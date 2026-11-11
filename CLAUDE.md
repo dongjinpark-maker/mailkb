@@ -30,7 +30,7 @@ AI 코딩 에이전트가 먼저 읽는 문서. 무엇을 만들고 있는지는
    호출 0      init · sync · ls · search · show · thread · review · weekly
                note · audit · noise · stats · block · unblock · hide · open
                attach · serve · doctor · ask --history · ask --show · ask --context
-               wiki scan · wiki check · wiki status · wiki report · wiki leak
+               wiki scan · wiki check · wiki status · wiki report · wiki leak · wiki freeze · wiki unfreeze
    플래그로    search --ai · review --ai · weekly --ai
    플래그 없이 ask <질문> · ask --person · thread-diag · person-diag · diagnose
    ```
@@ -255,5 +255,5 @@ Windows 실기기 확인이 필요한 변경은 그렇다고 말하고 넘긴다
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 목적·모듈 지도·데이터 모델·파이프라인·기능 상세·설계 결정 |
 | [docs/OPENCODE-WINDOWS.md](docs/OPENCODE-WINDOWS.md) | `internal`(opencode) 백엔드를 Windows에서 쓰기 — WSL 호출 형태의 함정과 진행 표시 · WSL 에서 opencode 로 저장소 바로 쓰기(`.opencode/`) |
 | [agent-guides/](agent-guides/) | 조사 에이전트용 CLI 계약 — 어떤 명령이 읽기 전용이고 어떤 것이 AI를 부르는지 |
-| [.claude/skills/mail-wiki/](.claude/skills/mail-wiki/) | 주제 위키 스킬(`/mail-wiki`) — 계약은 `agent-guides/minerva-wiki.md`, 손발은 `mailkb/wiki.py`. 페이지 형식·표시·꼬리를 바꾸면 **계약과 `wiki.LINE_RX`·`check` 를 함께** 고친다(어긋나면 세션이 쓴 줄이 전부 형식 오류가 된다). `.opencode/command/mail-wiki.md` 는 스킬의 복사본 |
+| [.claude/skills/mail-wiki/](.claude/skills/mail-wiki/) | 주제 위키 스킬(`/mail-wiki`) — 계약은 `agent-guides/minerva-wiki.md`, 손발은 `mailkb/wiki.py`. 페이지 형식·표시·꼬리를 바꾸면 **계약과 `wiki.LINE_RX`·`check` 를 함께** 고치고, 이미 쓰인 페이지가 있으면 `wiki.FORMAT` 을 올리되 옛 판의 문법을 `GRAMMAR` 에 남긴다(어긋나면 세션이 쓴 줄이 전부 형식 오류가 된다). '새 메일'은 머리말 `seq`(도착 순서)로 가른다 — 발신 시각으로 가르지 않는다(불변식 8). `.opencode/command/mail-wiki.md` 는 스킬의 복사본 |
 | [.claude/skills/mail-research/](.claude/skills/mail-research/) | 사용자용 조사 스킬(`/mail-research`) — **계약의 원본이 아니다**. agent-guides 를 가리키기만 하므로, 그쪽 파일 이름이 바뀌면 여기도 고친다(테스트가 막는다) |

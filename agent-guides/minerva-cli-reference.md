@@ -171,25 +171,32 @@ JSON·메시지 수 제한 옵션은 아직 없다.
 <PYTHON> -m mailkb wiki check '프로젝트 알파'
 <PYTHON> -m mailkb wiki report
 <PYTHON> -m mailkb wiki leak <글 파일>
+<PYTHON> -m mailkb wiki freeze '프로젝트 알파'
+<PYTHON> -m mailkb wiki unfreeze '프로젝트 알파'
 ```
 
 | 명령 | 출력 | 종료 코드 |
 |---|---|---|
-| `wiki status` | 주제마다 새 메일·새 확정 스레드·새 후보·판정 대기 후보·표시 안 된 지난 기한 | 0 |
-| `wiki scan --topic` | JSON — `confirmed_threads[].messages_all`(메일 본문), `candidates`, `alias_variants_found`, `noise_excluded`, `through`, `batch` | 이미 있는 주제면 2 |
-| `wiki scan --page` | JSON — `nothing_new`, `new_messages`, `new_confirmed_threads`, `candidates`, `deadlines_passed_unmarked`, `terms_hits_outside`, `threads_table`, `through_after_update`, `batch` | 0 |
-| `wiki scan --page --thread` | JSON — 그 스레드의 `messages`, `now_in_page`, `threads_table_if_added` | 0 |
+| `wiki status` | 주제마다 새 메일·새 확정 스레드·새 후보·판정 대기 후보·표시 안 된 지난 기한. 동결된 주제는 `[동결 <날짜>]` 와 기준 뒤에 온 관련 메일 수 하나만 | 0 |
+| `wiki scan --topic` | JSON — `confirmed_threads[].messages_all`(메일 본문), `candidates`, `alias_variants_found`, `noise_excluded`, `format`, `code`, `through`, `seq`, `batch` | 이미 있는 주제면 2 |
+| `wiki scan --page` | JSON — `nothing_new`, `new_messages`, `new_confirmed_threads`, `candidates`, `deadlines_passed_unmarked`, `terms_hits_outside`, `threads_table`, `through_after_update`, `seq_after_update`, `batch` | 동결됐거나 읽을 수 없는 형식이면 2 |
+| `wiki scan --page --thread` | JSON — 그 스레드의 `messages`(`seq` 까지 도착한 것만), `message_ids`, `held_for_update`, `now_in_page`, `threads_table_if_added` | 동결됐거나 읽을 수 없는 형식이면 2 |
 | `wiki check` | JSON — `ok`, `errors`, `warnings`, `marks`, `previous_lines_kept` | 실패면 1 |
-| `wiki report` | 평문 — 주제는 T1·T2 로만 나오는 수치 + 작업 메모 원문 | 0 |
+| `wiki report` | 평문 — 주제는 고정 코드(`T-k3f9` 꼴)로만 나오는 수치 + 작업 메모 원문 | 0 |
 | `wiki leak` | JSON — `ok`, `found[].kind`/`what` | 걸리면 1 |
+| `wiki freeze` · `wiki unfreeze` | JSON — `ok`, `changed`, `frozen`, `related_since`, `note`. 페이지의 동결 표시(머리말 `frozen:`·머리 줄)와 `index.md`·`log.md` 를 고친다 | 읽을 수 없는 형식이면 2 |
 
 - 메일 한 통은 `id`·`date`·`sender`·`body`(보존 인용을 뗀 신규 작성분) 이고, 있으면
   `attachments_unread`(읽지 못한 첨부 이름)·`earlier_context_not_citable`(보존된 이전
-  대화 — 이해용, 인용 금지)·`body_truncated` 가 붙는다.
+  대화 — 이해용, 인용 금지)·`body_truncated`·`arrived_late`(발신은 기준 시각보다 앞인데
+  뒤늦게 들어온 메일) 가 붙는다.
+- '새 메일'은 발신 시각이 아니라 **도착 순서**로 가른다 — 페이지 머리말의 `seq` 뒤에
+  도착한 메일이 새 메일이다. 수집 범위를 넓혀 들어온 옛 메일도 빠지지 않는다.
 - 자동 알림 발신자·숨긴 스레드·Outlook 에서 사라진 메일은 재료에 실리지 않는다.
 - `scan`·`check` 는 `<HOME>/vault/wiki/.history/` 에 실행 기록 한 줄(시각·명령·건수)을
-  남기고, `check` 는 통과한 판의 사본을 거기 둔다. DB 에는 쓰지 않는다.
-- `scan`·`check`·`status`·`report` 는 `--today YYYY-MM-DD` 로 기한 판정의 기준일을 바꿀 수 있다(시험용).
+  남기고, `check` 는 통과한 판의 사본을 거기 둔다. DB 에는 쓰지 않는다. 페이지 파일을
+  고치는 명령은 `freeze`·`unfreeze` 뿐이고, 그것도 동결 표시만 고친다.
+- `scan`·`check`·`status`·`report`·`freeze`·`unfreeze` 는 `--today YYYY-MM-DD` 로 기준일을 바꿀 수 있다(시험용).
 
 ## AI 를 부르는 명령 — 플래그가 없어도 부른다
 
