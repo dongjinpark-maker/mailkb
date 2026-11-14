@@ -50,7 +50,7 @@ from .clean import strip_preserved, take_preserved
 from .config import Config
 from .store import Store
 
-WIKI_VER = 2               # report 머리 줄에 싣는 도구 판 — 형식·판정 규칙을 바꾸면 올린다
+WIKI_VER = 3               # report 머리 줄에 싣는 도구 판 — 형식·판정 규칙을 바꾸면 올린다
 # 페이지 형식 판(머리말 `format:`). 경위 줄 문법은 실험 중에만 세 번 바뀌었다 — 판 번호가
 # 없으면 문법을 고치는 날 옛 페이지가 통째로 '형식 오류'가 된다. 판을 올릴 때는 옛 판의
 # 문법을 GRAMMAR 에 **남겨 둔다**: check 는 페이지가 적어 둔 판의 문법으로 읽는다.
@@ -70,6 +70,7 @@ LEAK_WINDOW = 12           # 원문과 이만큼 이어서 겹치면 반출 의�
 # 뒤집힘 신호 — 후보 스레드에 이 말이 새로 나왔으면 이유에 함께 싣는다(읽을지는 사용자 몫)
 SIGNALS = ("변경", "취소", "보류", "연기", "확정", "최종", "철회")
 RATINGS = ("쓸만함", "보통", "아님")
+OLD_DEADLINE_DAYS = 30     # report 가 '오래 지난 기한'으로 세는 기준 — 세기만 한다(동작은 안 바뀐다)
 FREEZE_MARK = "> **동결**"   # freeze 가 머리 줄에 넣고 unfreeze 가 빼는 줄의 머리
 _FILES_NOT_PAGES = ("index.md", "log.md", "notes.md")
 _TITLES = ("책임", "수석", "선임", "주임", "팀장", "사원", "대리", "과장", "차장", "부장",
@@ -277,7 +278,10 @@ class _Mail:
     def out(self, m) -> dict:
         """세션에 넘기는 메일 한 통. 보존 인용은 이해용으로만 따로 싣는다."""
         own = strip_preserved(m["new_content"] or "").strip()
-        d = {"id": m["id"], "date": m["sent_on"][:16],
+        # day = 경위 줄 머리(와 꼬리)에 쓸 날짜. date 의 앞 10자와 같은 값이지만 따로 준다 —
+        # 자정 넘어 보낸 회의 정리를 '회의한 날'로 적어 check 에 걸린 일이 있었다(첫 실사용,
+        # 2026-11-14: check 실패는 이 한 가지였다).
+        d = {"id": m["id"], "day": m["sent_on"][:10], "date": m["sent_on"][:16],
              "sender": m["sender_name"] or m["sender_addr"]}
         if len(own) > BODY_CAP:
             d["body"] = own[:BODY_CAP]
@@ -309,7 +313,8 @@ def _variants(names: list[str]) -> list[str]:
     return out
 
 
-def _alias_scan(mail: _Mail, names: list[str], skip=frozenset()) -> tuple[list[dict], int]:
+def _alias_scan(mail: _Mail, names: list[str], skip=frozenset(),
+                detail: bool = False) -> tuple[list[dict], int]:
     """별칭이 걸린 사람 스레드를 확정/후보로 가른다. 반환 (행들, 자동 알림 건수).
 
     이름 검색만으로는 양쪽으로 틀린다(데모 실측: 이름이 걸린 62통 중 37통이 자동
@@ -352,7 +357,11 @@ def _alias_scan(mail: _Mail, names: list[str], skip=frozenset()) -> tuple[list[d
             verdict, why = "후보", "별칭이 보존된 이전 대화 안에만 있음"
         else:
             continue                       # 답장 제목에만 걸린 경우는 in_title 이 이미 잡았다
-        rows.append({**mail.row(tid), "verdict": verdict, "why": why})
+        row = {**mail.row(tid), "verdict": verdict, "why": why}
+        if detail:      # report 의 분포용 — scan 출력에는 싣지 않는다
+            row["kind"] = ("이전 대화 안에만" if not hit["own"] else "한 통짜리" if n == 1
+                           else "여러 통 중 한 통" if hit["own"] == 1 else "여러 통")
+        rows.append(row)
     return sorted(rows, key=lambda r: r["last"]), noise
 
 
@@ -418,6 +427,17 @@ def _deadline_passed(line: str, today: date) -> bool:
         return date(int(m.group(1)), int(m.group(2)), int(m.group(3))) < today
     except ValueError:
         return False
+
+
+def _deadline_days(line: str, today: date) -> int | None:
+    """`- 기한: YYYY-MM-DD …` 줄의 날짜가 며칠 지났나. 기한 줄이 아니면 None."""
+    m = re.match(r"- 기한:\s*(\d{4})-(\d\d)-(\d\d)\b", line)
+    if not m:
+        return None
+    try:
+        return (today - date(int(m.group(1)), int(m.group(2)), int(m.group(3)))).days
+    except ValueError:
+        return None
 
 
 def _new_code(cfg: Config) -> str:
@@ -1064,6 +1084,18 @@ def report(store: Store, cfg: Config, today: date | None = None) -> str:
         rating = page.meta.get("rating", "").strip()
         rating = rating if rating in RATINGS else ("없음" if not rating else "기타")
         dead = sum(1 for t in terms if outside.get(t, 0) == 0)
+        # 후보가 '어떻게' 걸렸는지의 분포 — 첫 실사용에서 후보가 주제마다 수백 건 쌓이고
+        # 판정은 0건이었다. 무엇을 목록에서 덜어도 되는지는 이 분포를 보고 정한다(여기서는
+        # 세기만 한다 — scan 의 판정은 그대로다).
+        now_rows, _ = _alias_scan(mail, page.names, skip=set(threads) | set(excl), detail=True)
+        now_c = [r for r in now_rows if r["verdict"] == "후보"]
+        kinds_c = collections.Counter(r["kind"] for r in now_c)
+        use = [t for t in terms if t not in common]
+        t_hits = _term_hits(mail, use) if use else {}
+        brushed_with_term = sum(1 for r in now_c if r["kind"] != "여러 통"
+                                and any(r["thread"] in t_hits[t] for t in use))
+        loose = sum(1 for p in (_line_parts(l, page.fmt) for l in kyung)
+                    if p and p[1] == "논의" and not p[6])
         out += [
             "",
             f"[주제 {tag}] 형식 판 {page.meta.get('format', '').strip() or '없음'}{state}"
@@ -1079,15 +1111,23 @@ def report(store: Store, cfg: Config, today: date | None = None) -> str:
             f" · 지금은 안 걸림 {len(set(cands) - alias_c - term_c - auto)})"
             f" · 제외 {len(excl)} (자동 확정이었을 것 {len(set(excl) & auto)}"
             f" · 후보였을 것 {len(set(excl) & (alias_c | term_c))})",
+            "  지금 걸리는 후보의 분포: 별칭 "
+            + " · ".join(f"{k} {kinds_c.get(k, 0)}" for k in
+                         ("여러 통", "여러 통 중 한 통", "한 통짜리", "이전 대화 안에만"))
+            + f" (한 통 이하로 스친 것 중 고유 낱말도 걸림 {brushed_with_term})"
+            f" · 낱말 겹침 {len(term_c - set(threads) - set(excl))}",
             f"  자동 알림으로 제외한 메일 {noise} · 소속 메일 {n_in}통 · 숨겨져 빠진 소속 스레드 "
             f"{len(threads) - len(live)}",
             f"  경위 {len(kyung)}줄 (" + " · ".join(f"{k} {marks.get(k, 0)}" for k in MARKS)
-            + f") · 형식 어긋남 {bad} · 꼬리 {tails} · 메일당 {round(len(kyung) / max(n_in, 1), 2)}줄",
+            + f") · 형식 어긋남 {bad} · 꼬리 {tails} · 꼬리 없는 논의 {loose}"
+            f" · 메일당 {round(len(kyung) / max(n_in, 1), 2)}줄",
             f"  현재 상태 {len(cur)}줄 (결정 {sum(l.startswith('- 결정:') and '아직' not in l for l in cur)}"
             f" · 사실 {sum(l.startswith('- 사실:') for l in cur)}) · 열린 것 {len(opn)}줄 ("
             + (" · ".join(f"{k} {v}" for k, v in kinds.items()) or "없음")
             + f") · 지남 표시 {sum('지남' in l for l in opn)}"
-            f" · 표시 안 된 지난 기한 {sum(_deadline_passed(l, today) for l in opn)}",
+            f" · 표시 안 된 지난 기한 {sum(_deadline_passed(l, today) for l in opn)}"
+            f" · {OLD_DEADLINE_DAYS}일 넘게 지난 기한 "
+            f"{sum((_deadline_days(l, today) or 0) > OLD_DEADLINE_DAYS for l in opn)}",
             f"  반영 기준 뒤 경과 {age}일 · 기준 뒤에 도착해 아직 반영 안 된 메일 {pending}통",
         ]
         # 놓친 스레드의 생김새 — 내용 없이 수만. 찾기 규칙을 고칠 유일한 단서다.
@@ -1187,6 +1227,31 @@ def report(store: Store, cfg: Config, today: date | None = None) -> str:
 
 # ── leak ──────────────────────────────────────────────────────────────────
 
+# report 가 스스로 찍는 줄 — feedback 은 수치 부분을 '그대로 붙이므로' 여기서 걸리면 세션이
+# 고칠 수 없는 글이 막힌다(첫 실사용 2026-11-14: 모델 이름 일부와 날짜가 걸렸다). 아래
+# 꼴에 **통째로** 맞는 줄만 예외로 둔다 — 세션이 쓴 문장은 전과 똑같이 대조한다.
+#   날짜 줄: 날짜와 건수뿐이다. ' 2026-11-14 '(12자)가 같은 날짜를 적은 메일과 겹쳤다.
+#   작업 줄: 모델 이름은 회사 내용이 아니다(사용자 확정 2026-11-14 — 숨길 필요 없다).
+#            이름의 날짜 숫자가 '긴 숫자'에, 일부 글자가 사람 이름에 걸린다.
+_REPORT_DATE_LINE = re.compile(
+    r"생성 \d{4}-\d\d-\d\d · 도구 판 \d+"
+    r"|\[회차\] \d{4}-\d\d-\d\d check \d+\(실패 \d+\)(?: · \d{4}-\d\d-\d\d check \d+\(실패 \d+\))*")
+_OP = r"(?:new|update|add|drop|feedback|freeze|unfreeze) \d+"
+_MODEL = r"[A-Za-z0-9 ._:\-/]{1,40}\(\d+\)"
+_REPORT_OPS_LINE = re.compile(
+    r"(\[작업\] (?:없음|%s(?: · %s)*) · 변경 없음 \d+ · 모델: )(?:기록 없음|%s(?:, %s)*)"
+    % (_OP, _OP, _MODEL, _MODEL))
+
+
+def _without_report_models(text: str) -> str:
+    """report 의 작업 줄에서 모델 이름 자리만 비운 글 — 그 밖의 글자는 그대로 대조한다."""
+    out = []
+    for line in text.splitlines():
+        m = _REPORT_OPS_LINE.fullmatch(line.strip())
+        out.append(m.group(1) if m else line)
+    return "\n".join(out)
+
+
 def leak(store: Store, cfg: Config, text: str, window: int = LEAK_WINDOW) -> dict:
     """밖으로 보낼 글에 회사 내용이 섞였는지 대조한다.
 
@@ -1195,6 +1260,7 @@ def leak(store: Store, cfg: Config, text: str, window: int = LEAK_WINDOW) -> dic
     못 잡는 것: **뜻만 옮긴 문장** — 그래서 통과해도 보내기 전에 사람이 읽는다.
     이 함수는 아무것도 전송하지 않는다.
     """
+    text = _without_report_models(text)
     low = text.lower()
     found: list[dict] = []
 
@@ -1244,7 +1310,11 @@ def leak(store: Store, cfg: Config, text: str, window: int = LEAK_WINDOW) -> dic
 
     # 원문 겹침 — 글의 window 자 조각을 집합으로 두고 메일을 한 번 훑는다. 반대로(글
     # 조각마다 전 메일을 찾기) 하면 메일 수만 배가 든다.
-    t = _norm(text)
+    # report 의 날짜 줄(생성·회차)은 원문 겹침 대조에서 뺀다 — ' 2026-11-14 '(12자)가 같은
+    # 날짜를 적은 메일과 겹쳐, 세션이 고칠 수 없는 수치 부분이 막혔다(첫 실사용). 그 꼴에
+    # 통째로 맞는 줄만 빼므로, 세션이 쓴 문장 속 날짜는 지금처럼 걸린다.
+    t = _norm("\n".join(l for l in text.splitlines()
+                        if not _REPORT_DATE_LINE.fullmatch(l.strip())))
     grams = {t[i:i + window] for i in range(len(t) - window + 1)}
     hit = set()
     if grams:

@@ -20082,6 +20082,18 @@ class TestWiki(unittest.TestCase):
         self.assertEqual({r["thread"] for r in out["threads_table"]},
                          {self.tid("a1"), self.tid("b1")})
 
+    def test_message_carries_the_day_for_the_line_head(self):
+        # 첫 실사용의 check 실패는 한 가지였다 — 자정 넘어 보낸 회의 정리를 '회의한 날'로
+        # 적은 것. 줄 머리에 쓸 날짜를 scan 이 따로 준다
+        path = self.page(candidates=[self.tid("e1"), self.tid("g1"), self.tid("c1")])
+        self.store.ingest([_rec("a5", "park@corp.example", [ME], "RE: 알파 출시 일정",
+                                "2026-01-14T00:20:00", body="13일 회의 정리입니다.", reply_to="a1")])
+        out = self.wiki.scan_page(self.store, self.cfg, path, today=date(2026, 1, 15))
+        self.assertEqual((out["new_messages"][0]["day"], out["new_messages"][0]["date"]),
+                         ("2026-01-14", "2026-01-14T00:20"))
+        topic = self.wiki.scan_topic(self.store, self.cfg, "부하 시험", [])
+        self.assertEqual(topic["confirmed_threads"][0]["messages_all"][0]["day"], "2026-01-11")
+
     def test_scan_page_brings_new_thread_whole_and_term_candidates(self):
         # 새로 걸린 확정 스레드는 through 이전 메일도 처음 보는 것이라 통째로 준다
         path = self.page(threads=[self.tid("a1")], state=[
@@ -20478,6 +20490,61 @@ class TestWiki(unittest.TestCase):
         self.assertEqual(leak("새게이트웨이들"), ["게이트웨이"])           # 한글은 부분 일치
         self.assertEqual(leak("xALPHA-1x 로 적었다"), ["ALPHA-1"])        # 별칭은 부분 일치
 
+    def test_report_passes_its_own_leak_check_without_loosening_it(self):
+        # 첫 실사용(2026-11-14): feedback 은 수치 부분을 '그대로 붙이는데' leak 이 거기서
+        # 모델 이름 일부와 날짜를 잡았다 — 세션이 고칠 수 없는 글이 막혔다. leak 의 대조
+        # 규칙은 그대로 두고, report 가 찍는 줄의 꼴에 통째로 맞는 줄만 예외로 둔다.
+        self.store.ingest([
+            _recx("x1", "son@corp.example", "RE: 알파 출시 일정", "2026-01-13T09:00:00",
+                  body="회의 일시: 2026-01-20 (화) 14:00 입니다.", sender_name="Son Minho"),
+        ])
+        self.page()
+        leak = lambda t: [(f["kind"], f["what"]) for f in self.wiki.leak(self.store, self.cfg, t)["found"]]
+        # 세션이 쓴 글은 전과 똑같이 걸린다 — 이름의 부분 일치도, 긴 숫자도, 문장 속 날짜도
+        self.assertEqual(leak("claude-sonnet 으로 돌렸다"), [("사람 이름", "Son")])
+        self.assertEqual(leak("모델: claude-sonnet-5-20260115(2)"),
+                         [("사람 이름", "Son"), ("긴 숫자(메일·스레드 번호일 수 있음)", "20260115")])
+        self.assertTrue(any(k.startswith("메일 원문과") for k, _ in leak("회의는 2026-01-20 에 했다")))
+        self.assertTrue(any(k.startswith("메일 원문과")
+                            for k, _ in leak("[평가] 2026-01-20 check 3(실패 0) 이었다")))
+        # report 가 찍는 꼴에 통째로 맞는 줄 — 날짜 줄과, 작업 줄의 모델 이름
+        self.assertEqual(leak("생성 2026-01-20 · 도구 판 3"), [])
+        self.assertEqual(leak("[회차] 2026-01-19 check 2(실패 1) · 2026-01-20 check 3(실패 0)"), [])
+        self.assertEqual(leak("[작업] new 1 · update 2 · 변경 없음 1 · 모델: claude-sonnet-5-20260115(2), "
+                              "internal/qwen3(1)"), [])
+        # 작업 줄이라도 꼴에서 벗어나면(뒤에 글을 덧붙임) 예외가 아니다
+        self.assertEqual(leak("[작업] new 1 · 변경 없음 0 · 모델: claude-sonnet-5(1) 로 Son 이 돌림"),
+                         [("사람 이름", "Son")])
+        # 수치 부분은 모델 이름을 숨기지 않고도 통째로 leak 을 통과한다
+        w = self.wiki.wiki_dir(self.cfg)
+        (w / "log.md").write_text(
+            "- 2026-01-12 new 알파: 읽은 메일 5 · 경위 +5 · 새 페이지 · 모델 claude-sonnet-5-20260115\n"
+            "- 2026-01-13 update 알파: 읽은 메일 1 · 경위 +1 · 반영 · 모델 internal/qwen3\n",
+            encoding="utf-8")
+        self.check(w / "알파.md")
+        text = self.wiki.report(self.store, self.cfg, date(2026, 1, 20))
+        self.assertIn("모델: claude-sonnet-5-20260115(1), internal/qwen3(1)", text)
+        self.assertRegex(text, r"\[회차\] \d{4}-\d\d-\d\d check 1\(실패 0\)")
+        numeric = text.split("\n[작업 메모")[0]
+        self.assertEqual(leak(numeric), [])
+
+    def test_report_counts_what_the_deferred_decisions_need(self):
+        # 후보를 목록에서 덜지, 지난 기한을 접을지는 득실이 갈려 아직 정하지 않았다 —
+        # 정할 재료를 수로 낸다. scan 의 판정과 출력은 그대로다.
+        old = f"- 기한: 2026-01-15 각 파트 일정 회신. 지남. [메일 #{self.mid('a3')}]"
+        path = self.page(open=[old], candidates=[self.tid("e1"), self.tid("g1"), self.tid("c1")])
+        text = self.wiki.report(self.store, self.cfg, date(2026, 3, 1))
+        self.assertIn("지금 걸리는 후보의 분포: 별칭 여러 통 0 · 여러 통 중 한 통 1 · 한 통짜리 1 · "
+                      "이전 대화 안에만 0 (한 통 이하로 스친 것 중 고유 낱말도 걸림 0) · 낱말 겹침 1", text)
+        self.assertIn("꼬리 없는 논의 2", text)
+        self.assertIn("30일 넘게 지난 기한 1", text)
+        self.assertIn("30일 넘게 지난 기한 0", self.wiki.report(self.store, self.cfg, date(2026, 1, 20)))
+        out = self.wiki.scan_page(self.store, self.cfg, path, today=date(2026, 3, 1))
+        self.assertTrue(out["nothing_new"])                     # 세기만 한다 — 동작은 그대로
+        self.assertEqual({r["thread"] for r in out["candidates"]},
+                         {self.tid("e1"), self.tid("g1"), self.tid("c1")})
+        self.assertFalse(any("kind" in r for r in out["candidates"]))
+
     # ── 불변식 ──
     def test_no_command_writes_to_the_database(self):
         # 읽기 경로에서 쓰지 않는다(불변식 9). 파일은 .history/ 에만 쓴다.
@@ -20592,7 +20659,7 @@ class TestWiki(unittest.TestCase):
                      "threads_hidden_by_user", "noise_excluded", "through_after_update",
                      "seq_after_update"):
                 self.assertIn(k, keys)
-        for k in ("seq_after_update", "arrived_late", "held_for_update", "message_ids"):
+        for k in ("seq_after_update", "arrived_late", "held_for_update", "message_ids", "day"):
             self.assertIn(f"`{k}", guide)
         self.assertIn("held_for_update", self.wiki.scan_thread(self.store, self.cfg, path, self.tid("h1")))
         skill = (root / ".claude" / "skills" / "mail-wiki" / "SKILL.md").read_text(encoding="utf-8")

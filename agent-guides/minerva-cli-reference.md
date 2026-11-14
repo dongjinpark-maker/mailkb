@@ -178,7 +178,7 @@ JSON·메시지 수 제한 옵션은 아직 없다.
 | 명령 | 출력 | 종료 코드 |
 |---|---|---|
 | `wiki status` | 주제마다 새 메일·새 확정 스레드·새 후보·판정 대기 후보·표시 안 된 지난 기한. 동결된 주제는 `[동결 <날짜>]` 와 기준 뒤에 온 관련 메일 수 하나만 | 0 |
-| `wiki scan --topic` | JSON — `confirmed_threads[].messages_all`(메일 본문), `candidates`, `alias_variants_found`, `noise_excluded`, `format`, `code`, `through`, `seq`, `batch` | 이미 있는 주제면 2 |
+| `wiki scan --topic` | JSON — `confirmed_threads[].messages_all`(메일 본문), `candidates`, `alias_variants_found`, `noise_excluded`, `format`, `code`, `through`, `seq`, `batch`. 메일마다 `day`(경위 줄 머리에 쓸 날짜) | 이미 있는 주제면 2 |
 | `wiki scan --page` | JSON — `nothing_new`, `new_messages`, `new_confirmed_threads`, `candidates`, `deadlines_passed_unmarked`, `terms_hits_outside`, `threads_table`, `through_after_update`, `seq_after_update`, `batch` | 동결됐거나 읽을 수 없는 형식이면 2 |
 | `wiki scan --page --thread` | JSON — 그 스레드의 `messages`(`seq` 까지 도착한 것만), `message_ids`, `held_for_update`, `now_in_page`, `threads_table_if_added` | 동결됐거나 읽을 수 없는 형식이면 2 |
 | `wiki check` | JSON — `ok`, `errors`, `warnings`, `marks`, `previous_lines_kept` | 실패면 1 |
