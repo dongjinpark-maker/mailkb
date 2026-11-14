@@ -19965,9 +19965,10 @@ class TestWiki(unittest.TestCase):
         self.assertEqual(set(conf), {self.tid("a1"), self.tid("b1")})
         self.assertEqual(conf[self.tid("a1")]["why"], "제목에 별칭")
         self.assertIn("2통 중 2통", conf[self.tid("b1")]["why"])
-        # 스치기만 한 것과 한 통짜리는 자동 확정하지 않는다 — 사용자가 판정한다
-        self.assertEqual(set(cand), {self.tid("e1"), self.tid("g1")})
-        self.assertIn("3통 중 1통", cand[self.tid("e1")]["why"])
+        # 스치기만 한 것(e1)과 한 통짜리(g1)는 확정도 후보도 아니다 — 건수만 센다
+        self.assertEqual(cand, {})
+        self.assertEqual(out["candidates_not_listed"]["weak"], 2)
+        self.assertEqual(out["limits"], {"current_state_lines": 6, "open_lines": 15})
         self.assertEqual(out["through"], "2026-01-12T18:30")
         self.assertEqual(out["page_file"], "알파.md")
         self.assertEqual(out["batch"], {"delivered": 5, "remaining": 0, "limit": self.wiki.SCAN_LIMIT})
@@ -20039,7 +20040,7 @@ class TestWiki(unittest.TestCase):
     def test_late_arriving_old_mail_is_not_missed(self):
         # 2026-11-10 판의 결함: '새 메일'을 발신 시각으로 갈라, 수집 범위를 넓혀 뒤늦게
         # 들어온 옛 메일이 영영 '이미 반영됨'으로 빠졌다. 도착 순서(seq)로 가른다(불변식 8).
-        path = self.page(candidates=[self.tid("e1"), self.tid("g1"), self.tid("c1")])
+        path = self.page(candidates=[self.tid("c1")])
         self.assertTrue(self.wiki.scan_page(self.store, self.cfg, path,
                                             today=date(2026, 1, 13))["nothing_new"])
         self.store.ingest([_rec("a0", "kang@corp.example", [ME], "RE: 알파 출시 일정",
@@ -20066,7 +20067,7 @@ class TestWiki(unittest.TestCase):
                                             today=date(2026, 1, 13))["nothing_new"])
 
     def test_scan_page_delivers_only_mail_after_seq(self):
-        path = self.page(candidates=[self.tid("e1"), self.tid("g1"), self.tid("c1")])
+        path = self.page(candidates=[self.tid("c1")])
         out = self.wiki.scan_page(self.store, self.cfg, path, today=date(2026, 1, 13))
         self.assertTrue(out["nothing_new"])
         self.assertEqual(out["new_messages"], [])
@@ -20094,8 +20095,75 @@ class TestWiki(unittest.TestCase):
         self.assertEqual(len(new[self.tid("b1")]["messages_all"]), 2)
         cand = {r["thread"]: r["why"] for r in out["candidates"]}
         self.assertIn("고유 낱말 2개 겹침", cand[self.tid("c1")])     # 이름 없는 스레드
-        self.assertIn(self.tid("e1"), cand)
+        self.assertNotIn(self.tid("e1"), cand)                       # 스친 것은 목록에 없다
+        self.assertEqual(out["candidates_not_listed"]["weak"], 2)
         self.assertEqual(out["terms_hits_outside"]["서명키"], 1)
+
+    def test_brushed_threads_are_counted_not_listed(self):
+        # 첫 실사용(2026-11-14): 후보 220·359건, 판정 0건 — 거의 전부가 '별칭이 한 통에
+        # 스친' 것이었다. 올려도 아무도 안 보는 것은 세기만 하고, 근거가 더 있는 것만 올린다.
+        R = _rec
+        self.store.ingest([
+            # S — 5통 중 2통에 별칭(절반 미만, 제목엔 없음): 올릴 후보
+            R("s1", "kang@corp.example", [ME], "분기 계획", "2026-01-05T09:00:00", body="분기 계획입니다."),
+            R("s2", "lee@corp.example", [ME], "RE: 분기 계획", "2026-01-05T10:00:00",
+              body="알파 인력은 그대로 둡니다.", reply_to="s1"),
+            R("s3", "kang@corp.example", [ME], "RE: 분기 계획", "2026-01-05T11:00:00",
+              body="알파 예산은 다음 주에 봅니다.", reply_to="s1"),
+            R("s4", "lee@corp.example", [ME], "RE: 분기 계획", "2026-01-05T12:00:00", body="네.", reply_to="s1"),
+            R("s5", "kang@corp.example", [ME], "RE: 분기 계획", "2026-01-05T13:00:00", body="확인.", reply_to="s1"),
+            # T — 별칭은 한 통에 스쳤지만 고유 낱말도 걸림: 올릴 후보
+            R("t1", "kang@corp.example", [ME], "장애 보고", "2026-01-06T09:00:00", body="새벽 장애 보고입니다."),
+            R("t2", "lee@corp.example", [ME], "RE: 장애 보고", "2026-01-06T10:00:00",
+              body="알파 쪽 게이트웨이도 영향을 받았습니다.", reply_to="t1"),
+            R("t3", "kang@corp.example", [ME], "RE: 장애 보고", "2026-01-06T11:00:00", body="확인했습니다.", reply_to="t1"),
+        ])
+        S, T, E, G, C = (self.tid(k) for k in ("s1", "t1", "e1", "g1", "c1"))
+        # 예전 판이 쌓아 둔 후보(E·G)가 머리말에 남아 있는 페이지
+        path = self.page(candidates=[E, G, C])
+        out = self.wiki.scan_page(self.store, self.cfg, path, today=date(2026, 1, 13))
+        cand = {r["thread"]: r["why"] for r in out["candidates"]}
+        self.assertEqual(set(cand), {S, T, C})
+        self.assertIn("5통 중 2통", cand[S])
+        self.assertIn("고유 낱말도 걸림: 게이트웨이", cand[T])
+        self.assertEqual(out["candidates_not_listed"]["weak"], 2)        # E, G
+        self.assertEqual(sorted(out["candidates_to_remove"]), sorted([E, G]))
+        self.assertFalse(out["nothing_new"])                             # 목록을 줄이라고 알린다
+        self.assertNotIn("_kind", out["candidates"][0])
+        self.assertNotIn("candidates_no_longer_matching", out)
+        row = self.wiki.status(self.store, self.cfg, date(2026, 1, 13))[0]
+        self.assertEqual((row["new_candidates"], row["candidates_to_remove"],
+                          row["candidates_not_listed"], row["todo"]), (2, 2, 2, "update"))
+        self.assertIn("목록에 올리지 않은 스레드 2", self.wiki.status_text([row]))
+        # 목록을 scan 그대로 맞추면 조용해진다
+        path = self.page(candidates=[S, T, C])
+        self.assertTrue(self.wiki.scan_page(self.store, self.cfg, path,
+                                            today=date(2026, 1, 13))["nothing_new"])
+        # 수치 보고는 분포를 낸다 — 밖에서 기준을 고칠 사람이 볼 수 있는 유일한 단서
+        text = self.wiki.report(self.store, self.cfg, date(2026, 1, 13))
+        self.assertIn("걸린 스레드 분포: 별칭 여러 통 1 · 별칭+낱말 1 · 낱말 겹침 1 · 스침(한 통짜리) 1 · "
+                      "스침(여러 통 중 한 통) 1 · 스침(이전 대화 안에만) 0 · 상한 밖 0", text)
+        self.assertIn("후보 대기 3(상한 20 · 지금 목록에 없는 것 0) · 목록에 안 올린 스레드 2", text)
+        # 올릴 후보도 상한까지만 — 최근 것부터, 넘는 것은 건수만
+        with mock.patch.object(self.wiki, "CAND_MAX", 2):
+            out = self.wiki.scan_page(self.store, self.cfg, path, today=date(2026, 1, 13))
+            self.assertEqual([r["thread"] for r in out["candidates"]], [C, T])      # 최근 것부터
+            self.assertEqual(out["candidates_not_listed"]["over_cap"], 1)
+            self.assertEqual(out["candidates_to_remove"], [S])
+            # 후보를 상한보다 많이 적은 페이지는 check 가 알린다(막지는 않는다)
+            res = self.check(path)
+            self.assertTrue(res["ok"])
+            self.assertTrue(any("후보 3건" in w for w in res["warnings"]), res["warnings"])
+
+    def test_message_carries_the_day_for_the_line_head(self):
+        # 자정 넘어 보낸 회의 정리를 '회의한 날'로 적어 check 에 걸린 일이 있었다 —
+        # 줄 머리에 쓸 날짜를 scan 이 따로 준다
+        path = self.page(candidates=[self.tid("c1")])
+        self.store.ingest([_rec("a5", "park@corp.example", [ME], "RE: 알파 출시 일정",
+                                "2026-01-14T00:20:00", body="13일 회의 정리입니다.", reply_to="a1")])
+        out = self.wiki.scan_page(self.store, self.cfg, path, today=date(2026, 1, 15))
+        self.assertEqual((out["new_messages"][0]["day"], out["new_messages"][0]["date"]),
+                         ("2026-01-14", "2026-01-14T00:20"))
 
     def test_excluded_thread_never_comes_back(self):
         path = self.page(excluded=[self.tid("e1"), self.tid("c1")])
@@ -20117,7 +20185,7 @@ class TestWiki(unittest.TestCase):
     def test_passed_deadline_is_reported_even_without_new_mail(self):
         # 가끔 돌리는 도구다 — 새 메일이 없어도 지난 기한은 다시 판정해야 한다
         line = f"- 기한: 2026-01-15 각 파트 일정 회신. [메일 #{self.mid('a3')}]"
-        path = self.page(open=[line], candidates=[self.tid("e1"), self.tid("g1"), self.tid("c1")])
+        path = self.page(open=[line], candidates=[self.tid("c1")])
         out = self.wiki.scan_page(self.store, self.cfg, path, today=date(2026, 1, 14))
         self.assertTrue(out["nothing_new"])
         out = self.wiki.scan_page(self.store, self.cfg, path, today=date(2026, 1, 20))
@@ -20125,9 +20193,20 @@ class TestWiki(unittest.TestCase):
         self.assertFalse(out["nothing_new"])
         self.assertTrue(self.check(path, "2026-01-20")["warnings"])
         path = self.page(open=[line.replace("각 파트", "지남 — 각 파트")],
-                         candidates=[self.tid("e1"), self.tid("g1"), self.tid("c1")])
+                         candidates=[self.tid("c1")])
         out = self.wiki.scan_page(self.store, self.cfg, path, today=date(2026, 1, 20))
         self.assertEqual(out["deadlines_passed_unmarked"], [])
+        # 오래 지난 기한은 '묵은 기한' — 지남 표시가 있어도 열린 것에서 빼라고 알린다
+        out = self.wiki.scan_page(self.store, self.cfg, path, today=date(2026, 3, 1))
+        self.assertEqual(len(out["deadlines_stale"]), 1)
+        self.assertFalse(out["nothing_new"])
+        res = self.check(path, "2026-03-01")
+        self.assertTrue(res["ok"])
+        self.assertTrue(any("30일 넘게" in w for w in res["warnings"]), res["warnings"])
+        self.assertEqual(self.wiki.status(self.store, self.cfg, date(2026, 3, 1))[0]["deadlines_stale"], 1)
+        self.assertIn("묵은 기한 1", self.wiki.report(self.store, self.cfg, date(2026, 3, 1)))
+        self.assertEqual(self.wiki.scan_page(self.store, self.cfg, path,
+                                             today=date(2026, 1, 20))["deadlines_stale"], [])
         # 연도가 적혀 있으니 해를 넘겨도 추측하지 않는다. 연도 없는 날짜는 판정하지 않는다
         self.assertTrue(self.wiki._deadline_passed("- 기한: 2026-12-20 무엇", date(2027, 1, 5)))
         self.assertFalse(self.wiki._deadline_passed("- 기한: 2027-01-20 무엇", date(2027, 1, 5)))
@@ -20398,7 +20477,8 @@ class TestWiki(unittest.TestCase):
         row = self.wiki.status(self.store, self.cfg, date(2026, 1, 20))[0]
         self.assertEqual((row["new_messages"], row["candidates_waiting"], row["days_since"]),
                          (1, 1, 8))
-        self.assertEqual(row["new_candidates"], 2)          # g1(한 통짜리) · c1(낱말)
+        self.assertEqual(row["new_candidates"], 1)          # c1(낱말) — g1 은 스친 것이라 세기만
+        self.assertEqual(row["candidates_to_remove"], 1)    # e1 — 이제 목록에 없다
         self.assertEqual(row["todo"], "update")
         self.assertIn("새 메일 1", self.wiki.status_text([row]))
 
@@ -20477,6 +20557,53 @@ class TestWiki(unittest.TestCase):
         self.assertEqual(leak("sta_hold.rpt 를 봤다"), ["STA"])
         self.assertEqual(leak("새게이트웨이들"), ["게이트웨이"])           # 한글은 부분 일치
         self.assertEqual(leak("xALPHA-1x 로 적었다"), ["ALPHA-1"])        # 별칭은 부분 일치
+
+    def test_leak_does_not_trip_on_its_own_report(self):
+        # 첫 실사용(2026-11-14): 수치 부분은 '그대로 붙이는' 것인데 leak 이 거기서 모델 이름
+        # 일부와 날짜를 잡았다 — 세션이 고칠 수 없는 글이 막힌 것이다.
+        self.store.ingest([
+            _recx("x1", "son@corp.example", "RE: 알파 출시 일정", "2026-01-13T09:00:00",
+                  body="회의 일시: 2026-01-20 (화) 14:00, 문의 010-1234-5678 입니다.",
+                  sender_name="Son Minho"),
+        ])
+        self.page()
+        leak = lambda t: [(f["kind"], f["what"]) for f in self.wiki.leak(self.store, self.cfg, t)["found"]]
+        # 영문 이름은 낱말 경계로 — 'Son' 이 'sonnet' 에 걸리지 않는다. 이름 자체는 잡는다
+        self.assertEqual(leak("모델: claude-sonnet-5(3)"), [])
+        self.assertEqual(leak("Son 이 보낸 메일"), [("사람 이름", "Son")])
+        self.assertEqual(leak("minho-son 계정"), [("사람 이름", "Minho"), ("사람 이름", "Son")])
+        # 날짜만 겹친 것은 회사 내용이 아니다. 다른 숫자열은 그대로 잡는다
+        self.assertEqual(leak("생성 2026-01-20 · 도구 판 3\n[회차] 2026-01-20 check 3(실패 0)"), [])
+        self.assertTrue(any(k.startswith("메일 원문과") for k, _ in leak("연락처 010-1234-5678 로")))
+        self.assertTrue(any(k.startswith("메일 원문과") for k, _ in leak("2026-01-20 (화) 14:00 에")))
+        # 수치 보고는 걸릴 모델 이름을 스스로 가린다 — 통째로 leak 을 통과해야 한다
+        w = self.wiki.wiki_dir(self.cfg)
+        (w / "log.md").write_text(
+            "- 2026-01-12 new 알파: 읽은 메일 5 · 경위 +5 · 새 페이지 · 모델 claude-sonnet-5\n"
+            "- 2026-01-13 update 알파: 읽은 메일 1 · 경위 +1 · 반영 · 모델 son-large\n"
+            "- 2026-01-13 update 알파: 읽은 메일 0 · 경위 +0 · 변경 없음 · 모델 alpha-1-mini\n",
+            encoding="utf-8")
+        self.check(w / "알파.md")
+        text = self.wiki.report(self.store, self.cfg, date(2026, 1, 20))
+        self.assertIn("모델: claude-sonnet-5(1), 가림(2)", text)
+        self.assertEqual(leak(text), [])
+
+    def test_limits_scale_with_the_topic_and_only_warn(self):
+        # 현재 상태 6줄은 수십 통짜리 주제에 맞춘 값이었다 — 결정이 37건인 주제에는 좁았다.
+        # 열린 것은 반대로 상한이 없어 34~39줄까지 자랐다. 둘 다 scan 이 상한을 알려 주고
+        # check 는 넘으면 알리기만 한다(넘쳤다고 페이지가 틀린 것은 아니다).
+        self.assertEqual(self.wiki._limits(100)["current_state_lines"], self.wiki.STATE_MAX)
+        self.assertEqual(self.wiki._limits(101)["current_state_lines"], self.wiki.STATE_MAX_BIG)
+        fact = f"- 사실: 부하 시험에서 오류가 없었다. [메일 #{self.mid('b1')}]"
+        wait = f"- 대기: 답 없음. [메일 #{self.mid('b2')}]"
+        path = self.page(state=[fact] * 7, open=[wait] * 16 + ["(오래된 것은 접었다 — 경위에 남아 있다)"])
+        out = self.wiki.scan_page(self.store, self.cfg, path, today=date(2026, 1, 13))
+        self.assertEqual(out["limits"], {"current_state_lines": 6, "open_lines": self.wiki.OPEN_MAX})
+        res = self.check(path)
+        self.assertTrue(res["ok"], res["errors"])               # 접었다는 줄은 근거를 요구받지 않는다
+        self.assertTrue(any("현재 상태 7줄 — 상한 6줄" in w for w in res["warnings"]), res["warnings"])
+        self.assertTrue(any("열린 것 16줄 — 상한 15줄" in w for w in res["warnings"]), res["warnings"])
+        self.assertEqual(self.check(self.page())["warnings"], [])
 
     # ── 불변식 ──
     def test_no_command_writes_to_the_database(self):
@@ -20587,13 +20714,23 @@ class TestWiki(unittest.TestCase):
         keys = set(self.wiki.scan_page(self.store, self.cfg, path))
         for k in re.findall(r"`([a-z_]+)`", guide):
             if k in ("nothing_new", "new_messages", "new_confirmed_threads", "candidates",
-                     "candidates_no_longer_matching", "deadlines_passed_unmarked",
+                     "candidates_not_listed", "candidates_to_remove", "limits",
+                     "deadlines_stale", "deadlines_passed_unmarked",
                      "terms_too_common_ignored", "terms_hits_outside", "threads_table",
                      "threads_hidden_by_user", "noise_excluded", "through_after_update",
                      "seq_after_update"):
                 self.assertIn(k, keys)
-        for k in ("seq_after_update", "arrived_late", "held_for_update", "message_ids"):
+        for k in ("seq_after_update", "arrived_late", "held_for_update", "message_ids",
+                  "candidates_not_listed", "candidates_to_remove", "deadlines_stale",
+                  "limits.current_state_lines", "limits.open_lines", "day"):
             self.assertIn(f"`{k}", guide)
+        self.assertNotIn("candidates_no_longer_matching", guide)
+        # 계약이 적어 둔 수가 코드의 상수와 같다
+        self.assertIn(f"최대 {self.wiki.CAND_MAX}건", guide)
+        self.assertIn(f"`limits.open_lines`({self.wiki.OPEN_MAX})줄", guide)
+        self.assertIn(f"기한이 {self.wiki.STALE_DAYS}일 넘게 지났는데", guide)
+        self.assertIn(f"작은 주제는 {self.wiki.STATE_MAX}줄, 소속 메일이 {self.wiki.STATE_BIG_MAILS}통을 "
+                      f"넘으면 {self.wiki.STATE_MAX_BIG}줄", guide)
         self.assertIn("held_for_update", self.wiki.scan_thread(self.store, self.cfg, path, self.tid("h1")))
         skill = (root / ".claude" / "skills" / "mail-wiki" / "SKILL.md").read_text(encoding="utf-8")
         head = skill.split("---")[1]
