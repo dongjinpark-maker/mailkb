@@ -1605,8 +1605,8 @@ THREAD_DIAGNOSE = """당신은 업무 메일 스레드를 읽고 **지금 무엇
 - **관련 스레드가 붙어 있으면** 이 스레드와 어긋나거나 겹치는 지점을 찾아 문제·원인에
   반영하라. 단 근거 인용은 **이 스레드 본문에서만** 딴다(관련 스레드 문장은 검증에서
   버려진다). 관련 스레드에만 있는 사실은 `모르는 것`으로 적어라.
-- **[내 노트]·[지식]·[사용자 지침]이 붙어 있으면** 사안을 이해하고 용어를 해석하는
-  데 써라. 근거 인용·일정·수치는 메일에서만 따고, 메일과 어긋나면 메일을 따른다.
+- **[내 노트]·[지식]·[내 메모]·[사용자 지침]이 붙어 있으면** 사안을 이해하고 용어를
+  해석하는 데 써라. 근거 인용·일정·수치는 메일에서만 따고, 메일과 어긋나면 메일을 따른다.
 
 [스레드: {subject}]
 {messages}
@@ -1970,8 +1970,10 @@ def diagnose_thread(store: Store, cfg: Config, tid: int,
     cmd = cfg.ai_cmd(backend or cfg.ai_diagnose_backend)
     from . import ask as ask_mod     # 지연 임포트 — ask 가 review 를 임포트
     # 직접 지목한 스레드라 그 스레드의 숨김은 보지 않는다(재료와 같은 판례).
+    # 메모는 스레드 브리핑에만 싣는다(인물 브리핑은 끈 채 — memory_for_threads).
     memory = ask_mod.memory_for_threads(
-        store, cfg, [tid], subject, store.hidden_thread_ids() - {tid})
+        store, cfg, [tid], subject, store.hidden_thread_ids() - {tid},
+        memos=True)
     raw = ai_run(cmd, THREAD_DIAGNOSE.format(
         subject=subject, messages=blob, related=_related_block(store, tid),
         memory=memory),

@@ -345,6 +345,20 @@ CREATE TABLE IF NOT EXISTS knowledge (
     supersedes TEXT DEFAULT '',       -- frontmatter supersedes: 의 파일 이름(확장자 없음)
     parse_ver INTEGER DEFAULT 0       -- knowledge.PARSE_VER — 오르면 mtime 이 같아도 다시 읽는다
 );
+
+-- 메모 색인(2026-11-18) — 원본은 vault/memo/*.md (메모 한 건에 파일 하나).
+-- notes·knowledge 와 같은 계약: 미러라 지워도 memo.reindex 가 복구한다.
+-- content 는 **파일 전체**다 — 메모에는 frontmatter 가 없어 화면 = 파일 = 색인이다.
+CREATE TABLE IF NOT EXISTS memos (
+    path      TEXT PRIMARY KEY,       -- 절대 경로(knowledge 관례)
+    no        INTEGER DEFAULT 0,      -- 메모 번호(파일 이름 머리, is_memo_id). 없으면 0
+    kind      TEXT DEFAULT 'ref',     -- todo | done | ref — 첫 줄의 [ ] / [x] / 없음
+    title     TEXT NOT NULL DEFAULT '',
+    due       TEXT DEFAULT '',        -- 기한(YYYY-MM-DD) — `기한:` 줄. 없으면 ''
+    mtime     REAL NOT NULL,
+    content   TEXT NOT NULL DEFAULT '',
+    parse_ver INTEGER DEFAULT 0       -- memo.PARSE_VER — 오르면 mtime 이 같아도 다시 읽는다
+);
 """
 
 _FTS_TRIGRAM = """
@@ -379,6 +393,47 @@ VALUES (?, ?, ?)
 DAY_SPAN = 100000            # 하루 한 칸. 넘으면 다음 날과 PK 충돌이다.
 SLOT_SPAN = 1000             # 15분 슬롯 한 칸 — 슬롯당 999건
 SLOTS_PER_DAY = 96           # 24시간 / 15분
+# 메모 번호는 **메일이 안 쓰는 칸**에서 낸다(2026-11-18). 메일·스레드는 0..95 칸만
+# 쓰므로(next_id 의 상한이 SLOTS_PER_DAY) 99번 칸은 영영 비어 있다. 그래서 같은
+# 11자리 `#번호` 표기를 쓰면서도 메일·스레드 번호와 **겹칠 수 없고**, 번호만 보고
+# 메모인지 코드가 가른다(is_memo_id). 같은 규칙을 그대로 쓰면(만든 시각의 15분 칸)
+# 그 칸의 첫 메일과 번호가 같아진다 — 데모 실측으로 근무 시간 칸의 17%에 메일이
+# 있었다. 종류를 말로 구분(`[메모 #N]`)하는 안은 번호만 적힌 참조가 조용히 다른
+# 글로 풀려서 버렸다(메일 번호를 시각 기반으로 바꾼 것과 같은 이유다).
+# 96~98 은 비워 둔다 — 다른 종류(업무·위키)에 번호가 필요해질 때의 자리다.
+MEMO_SLOT = 99
+
+
+def memo_base(day: str) -> int:
+    """그날 메모 번호의 바닥(순번 0) — YYMMDD*DAY_SPAN + 99*SLOT_SPAN.
+
+    순번은 1..999(SLOT_SPAN-1). 넘는 날은 번호를 내지 않는다 — 다음 칸이 없고
+    (99가 마지막), 다음 날로 넘기면 그날 메모와 겹친다. 날짜를 모르면 0."""
+    key = day_key(day)
+    return key * DAY_SPAN + MEMO_SLOT * SLOT_SPAN if key else 0
+
+
+def is_memo_id(n) -> bool:
+    """이 번호가 메모 번호인가 — 날짜가 달력에 있고, 칸이 99이고, 순번이 1 이상.
+
+    날짜까지 보는 이유: `#99999999999` 처럼 9 로 채운 수도 칸이 99 다. 글 속의
+    아무 숫자나 메모 링크가 되면 없는 메모로 간다."""
+    return bool(memo_day(n))
+
+
+def memo_day(n) -> str:
+    """메모 번호 → 만든 날(YYYY-MM-DD). 메모 번호가 아니면 ''."""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return ""
+    if n < DAY_SPAN or (n % DAY_SPAN) // SLOT_SPAN != MEMO_SLOT or n % SLOT_SPAN < 1:
+        return ""
+    key = n // DAY_SPAN
+    yy, mm, dd = key // 10000, (key // 100) % 100, key % 100
+    if yy > 99 or not (1 <= mm <= 12 and 1 <= dd <= 31):
+        return ""
+    return f"20{yy:02d}-{mm:02d}-{dd:02d}"
 
 
 def day_key(sent_on: str) -> int:
@@ -3366,6 +3421,72 @@ class Store:
                              + hay[j:j + 60] + "…").split())
             out.append({"path": r["path"], "title": r["title"],
                         "threads": r["threads"], "snippet": snip})
+            if len(out) >= limit:
+                break
+        return out
+
+    # ───────────────────────────── 메모 색인 (2026-11-18)
+    # 원본은 vault/memo/*.md — 여기는 목록·검색·AI 문맥용 미러. 쓰기는 memo 모듈의
+    # 저장·재색인에서만 온다(파일 → DB 단방향).
+
+    def memo_rows(self) -> list[sqlite3.Row]:
+        """전체 목록(최근 수정 순) — 메모는 손으로 쓰는 것이라 소량이다."""
+        return self.db.execute(
+            "SELECT * FROM memos ORDER BY mtime DESC").fetchall()
+
+    def memo_row(self, path: str) -> sqlite3.Row | None:
+        return self.db.execute(
+            "SELECT * FROM memos WHERE path=?", (path,)).fetchone()
+
+    def memo_by_no(self, no: int) -> sqlite3.Row | None:
+        return self.db.execute(
+            "SELECT * FROM memos WHERE no=? ORDER BY path LIMIT 1",
+            (int(no),)).fetchone()
+
+    def index_memo(self, path: str, no: int, kind: str, title: str, due: str,
+                   mtime: float, content: str, parse_ver: int = 0) -> None:
+        self.db.execute(
+            "INSERT INTO memos(path, no, kind, title, due, mtime, content, "
+            "parse_ver) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET "
+            "no=excluded.no, kind=excluded.kind, title=excluded.title, "
+            "due=excluded.due, mtime=excluded.mtime, content=excluded.content, "
+            "parse_ver=excluded.parse_ver",
+            (path, int(no), kind, title, due, mtime, content, parse_ver))
+        self.db.commit()
+
+    def prune_memos(self, keep: set) -> int:
+        """파일이 사라진 색인 제거 — prune_notes 와 같은 계약. 지울 것이 있을
+        때만 쓴다(읽기 경로에서 조건 없이 쓰지 않는다 — CLAUDE.md 9)."""
+        gone = [r["path"] for r in self.db.execute("SELECT path FROM memos")
+                if r["path"] not in keep]
+        for p in gone:
+            self.db.execute("DELETE FROM memos WHERE path=?", (p,))
+        if gone:
+            self.db.commit()
+        return len(gone)
+
+    def search_memos(self, query: str, limit: int = 20) -> list[dict]:
+        """메모 본문 검색 — search_notes 와 같은 이유로 FTS 없이 부분일치(AND).
+
+        숨김 필터가 없다: 메모는 스레드에 묶이지 않는다."""
+        terms = [t.lower() for t in re.split(r"[^0-9A-Za-z가-힣]+", query or "")
+                 if len(t) >= 2]
+        if not terms:
+            return []
+        out: list[dict] = []
+        for r in self.memo_rows():
+            hay = r["content"] or ""
+            low = hay.lower()
+            if not all(t in low for t in terms):
+                continue
+            i = low.find(terms[0])
+            j = i + len(terms[0])
+            snip = " ".join((("…" if i > 30 else "") + hay[max(0, i - 30):i]
+                             + "⟪" + hay[i:j] + "⟫"
+                             + hay[j:j + 60] + "…").split())
+            out.append({"path": r["path"], "no": r["no"], "kind": r["kind"],
+                        "title": r["title"], "due": r["due"],
+                        "mtime": r["mtime"], "snippet": snip})
             if len(out) >= limit:
                 break
         return out

@@ -9,6 +9,7 @@ demo/blocked_senders.txt
 demo/overrides.json
 demo/vault/daily/
 demo/vault/notes/
+demo/vault/memo/
 demo/vault/weekly/
 demo/logs/
 demo/*.pid

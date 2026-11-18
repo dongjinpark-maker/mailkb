@@ -12296,8 +12296,9 @@ class TestWeb(unittest.TestCase):
         # 숨김은 여전히 스레드 경로다 — 두 대상이 갈린 것이 코드에 남아야 한다
         self.assertIn("/\\/thread\\/\\d+\\/(hide|unhide|note-save)$/.test(action)", js)
         self.assertNotIn("thread\\/\\d+\\/(flag|unflag|hide", js)   # 옛 묶음
-        # f 키 경로도 좌측을 다시 그린다(폼 경로와 같은 계약)
-        self.assertEqual(js.count('load(leftCur, "left", false)'), 2)
+        # f 키 경로도 좌측을 다시 그린다(폼 경로와 같은 계약). 셋째는 메모다
+        # (memoLeftRefresh — 메모를 고치면 목록·회고의 '내 할 일'이 따라온다).
+        self.assertEqual(js.count('load(leftCur, "left", false)'), 3)
         # f 가 고르는 목록과 n/p 가 도는 목록은 같은 선택자여야 한다 —
         # 갈리면 커서와 대상이 어긋난다(스레드 밖 .msg 가 생기는 순간).
         self.assertEqual(js.count('querySelectorAll(".mthread .msg")'), 2)
@@ -12565,13 +12566,16 @@ class TestWeb(unittest.TestCase):
     def test_appjs_fh_toggle_keys(self):
         # f 플래그 · h 숨김 — 대상은 우측에 열린 스레드 1순위(주소 →
         # 우측 폼 action 순), 없으면 j/k 커서 행. 서버 -toggle 호출 + 커서 복원.
-        # (x 신호 토글은 2026-07-30 제거 — 판정 노출 폐지와 함께)
+        # (x 신호 토글은 2026-07-30 제거 — 판정 노출 폐지와 함께. 2026-11-18 부터
+        #  x 는 메모의 끝냄·다시 열기다 — 다른 대상이고 메모 화면에서만 동작한다)
         js = self.web._APP_JS
         self.assertIn("function openTid", js)          # 우측 열린 스레드 판별
         self.assertIn('load("/thread/" + tid, "right", false)', js)  # 우측 상세 동기화
         self.assertIn("right.scrollTop = rsc", js)     # 갱신 후 읽던 위치 유지
         self.assertNotIn('k === "s"', js)              # 구 's' 분기 제거
-        self.assertNotIn('k === "x"', js)              # 신호 토글 소멸
+        self.assertNotIn("signal", js)                 # 신호 토글 소멸
+        self.assertEqual(js.count('k === "x"'), 1)     # x = 메모 끝냄 하나뿐
+        self.assertIn("memoToggleKey()", js)
         self.assertIn('k === "f"', js)
         self.assertIn('k === "h"', js)
         self.assertIn('"-toggle"', js)                 # /thread/N/<kind>-toggle 호출
@@ -12759,8 +12763,9 @@ class TestWeb(unittest.TestCase):
         base = ("# 2026-07-04 일간 회고\n\n수신 3\n\n"
                 "## 내 약속 — 후속이 없는 것 (1건)\n- [#1] 가\n\n"
                 "## 변화 — 어제 이후\n- 새로 내 차례 (0건) — 없음\n")
-        # 회고 없음 → 안내 타일(전폭) + 작은 칸 — 줄은 여전히 12열로 떨어진다
-        self.assertEqual(spans(), [12, 4, 4, 4])
+        # 회고 없음 → 안내 타일(전폭) + 작은 칸 — 줄은 여전히 12열로 떨어진다.
+        # 작은 칸은 넷이다(2026-11-18 '할 일' 타일 추가) — 3칸씩 한 줄.
+        self.assertEqual(spans(), [12, 3, 3, 3, 3])
         # AI 요약 없음(기본) → 8 + 4 로 대비가 난다
         (d / "2026-07-04.md").write_text(base, encoding="utf-8")
         self.assertEqual(spans()[:2], [8, 4])
@@ -20694,6 +20699,665 @@ class TestWiki(unittest.TestCase):
         src = inspect.getsource(self.wiki)
         for banned in ("ai_run", "subprocess", "urlopen", "socket"):
             self.assertNotIn(banned, src)
+
+
+class TestMemo(unittest.TestCase):
+    """메모(2026-11-18) — 메일에 묶이지 않는 내 기록과 할 일.
+
+    계약: 메모 한 건에 파일 하나이고 파일의 글이 곧 메모다(frontmatter 없음).
+    파일이 원본, DB 는 미러. 번호는 메일이 안 쓰는 99번 칸에서 내고 파일 이름에
+    둔다. 분석·스레드 현안 브리핑에는 **문맥으로만** 싣는다(1단계) — 인용 근거는
+    여전히 메일 본문뿐이고, 인물 브리핑에는 싣지 않는다."""
+
+    KIM = "kim@corp.example"
+    TODAY = "2026-11-10"          # 화요일 — 이번 주는 11/15(일)까지
+
+    def setUp(self):
+        from mailkb import ask, memo
+        from mailkb import store as store_mod
+        self.ask, self.memo, self.sm = ask, memo, store_mod
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.cfg = Config(home=self.home, my_addresses=[ME], my_names=["김도현"],
+                          internal_domains=["corp.example"],
+                          ai_default="internal",
+                          ai_backends={"internal": {"cmd": ["echo"]},
+                                       "opus": {"cmd": ["echo"]}})
+        self.store = Store(self.home / "t.sqlite", [ME], ["김도현"], noise=self.cfg)
+        self.store.ingest([
+            _rec("m1", self.KIM, [ME], "NPX-200 양산 이관 일정", "2026-11-09T10:05:00",
+                 body="양산 이관 일정은 다음 주에 공지하겠습니다."),
+        ])
+        self.tid = self.store.db.execute(
+            "SELECT thread_id FROM messages").fetchone()[0]
+
+    def tearDown(self):
+        self.store.close()
+        shutil.rmtree(self.tmp.name, ignore_errors=True)
+
+    # ── 도우미
+    def _new(self, body, todo=False, due="", today=None):
+        st, p = self.memo.create(self.cfg, self.store, body, todo=todo, due=due,
+                                 today=today or self.TODAY)
+        self.assertEqual(st, "created")
+        return p
+
+    def _touch(self, path, text):
+        """밖(외부 편집기)에서 고친 것처럼 — 내용과 mtime 을 함께 바꾼다."""
+        path.write_text(text, encoding="utf-8")
+        t = path.stat().st_mtime + 5
+        os.utime(path, (t, t))
+
+    def _rows(self):
+        return {r["title"]: r for r in self.store.memo_rows()}
+
+    # ── 번호: 메일이 안 쓰는 99번 칸
+    def test_memo_slot_is_outside_every_slot_mail_can_get(self):
+        # 이 한 줄이 '번호만 보고 메모인지 안다'의 전제다. 메일 번호 규칙을 바꿔
+        # 칸이 96 이상으로 넘어가면 메모 번호와 겹친다 — 그때 여기서 걸린다.
+        self.assertLess(self.sm.SLOTS_PER_DAY - 1, 96)
+        self.assertEqual(self.sm.MEMO_SLOT, 99)
+        self.assertLess(self.sm.MEMO_SLOT * self.sm.SLOT_SPAN + 999,
+                        self.sm.DAY_SPAN)             # 다음 날로 안 넘친다
+        last = self.sm.next_id(self.store.db, "messages", "2026-11-10T23:59:00")
+        self.assertEqual((last % self.sm.DAY_SPAN) // self.sm.SLOT_SPAN, 95)
+        for row in self.store.db.execute("SELECT id FROM messages"):
+            self.assertFalse(self.sm.is_memo_id(row[0]))
+        for row in self.store.db.execute("SELECT id FROM threads"):
+            self.assertFalse(self.sm.is_memo_id(row[0]))
+
+    def test_is_memo_id_needs_slot_99_a_sequence_and_a_real_date(self):
+        ok = self.sm.is_memo_id
+        self.assertTrue(ok(26111099001))
+        self.assertTrue(ok("26111099999"))
+        self.assertFalse(ok(26111040001))        # 10:00 의 메일 번호
+        self.assertFalse(ok(26111099000))        # 순번 0 은 없다
+        self.assertFalse(ok(26131099001))        # 13월
+        self.assertFalse(ok(99999999999))        # 9 로 채운 수 — 날짜가 아니다
+        self.assertFalse(ok(99001))              # 날짜 없음
+        self.assertFalse(ok(None))
+        self.assertFalse(ok("메모"))
+        self.assertEqual(self.sm.memo_day(26111099001), "2026-11-10")
+        self.assertEqual(self.sm.memo_base("2026-11-10"), 26111099000)
+
+    def test_numbers_run_within_the_day_and_live_in_the_file_name(self):
+        a = self._new("첫 메모")
+        b = self._new("둘째 메모")
+        c = self._new("다음 날 메모", today="2026-11-11")
+        self.assertEqual([self.memo.no_of(p.name) for p in (a, b, c)],
+                         [26111099001, 26111099002, 26111199001])
+        self.assertEqual(a.name, "26111099001-첫-메모.md")
+        self.assertEqual(a.parent, self.cfg.vault / "memo")
+        # DB 를 새로 만들어도 번호가 이어진다 — 번호는 파일 이름에 있다
+        self.store.close()
+        (self.home / "t.sqlite").unlink()
+        self.store = Store(self.home / "t.sqlite", [ME], noise=self.cfg)
+        d = self._new("DB 를 새로 만든 뒤")
+        self.assertEqual(self.memo.no_of(d.name), 26111099003)
+        self.assertEqual(self.memo.find(self.cfg, 26111099001), a)
+
+    def test_deleted_number_is_not_handed_out_again_the_same_day(self):
+        # 그날 맨 뒤 메모를 지우고 새로 쓰면 파일만 봐서는 같은 번호가 나온다 —
+        # 지운 메모를 가리키던 참조가 새 메모로 풀린다(오류가 아니라 오답).
+        self._new("남는 메모")
+        gone = self._new("지울 메모")
+        self.assertEqual(self.memo.delete(self.cfg, self.store, gone.name)[0],
+                         "deleted")
+        self.assertFalse(gone.exists())
+        self.assertEqual(self.memo.no_of(self._new("새 메모").name), 26111099003)
+
+    def test_day_runs_out_at_999_and_says_so(self):
+        self.store.set_state("memo_last_no", "26111099999")
+        st, p = self.memo.create(self.cfg, self.store, "천 번째", today=self.TODAY)
+        self.assertEqual((st, p), ("full", None))            # 조용히 다른 번호 X
+        self.assertEqual(list(self.memo.memo_dir(self.cfg).glob("*.md"))
+                         if self.memo.memo_dir(self.cfg).is_dir() else [], [])
+
+    # ── 글이 곧 메모
+    def test_first_line_decides_kind_and_title(self):
+        P = self.memo.parse
+        self.assertEqual(P("[ ] 로그 요청\n본문")["kind"], "todo")
+        self.assertEqual(P("[x] 로그 요청")["kind"], "done")
+        self.assertEqual(P("- [X] 로그 요청")["kind"], "done")     # 마크다운 꼴
+        self.assertEqual(P("\n\n[ ] 로그 요청")["title"], "로그 요청")
+        ref = P("# 양산 이관은 12월\n[ ] 이건 본문 줄이다")
+        self.assertEqual((ref["kind"], ref["title"]), ("ref", "양산 이관은 12월"))
+        self.assertEqual(P("[ ]")["title"], "(제목 없음)")
+
+    def test_due_is_read_only_from_a_line_of_its_own(self):
+        P = self.memo.parse
+        self.assertEqual(P("[ ] 가\n기한: 2026-11-09\n")["due"], "2026-11-09")
+        self.assertEqual(P("[ ] 가\n\n  기한 : 2026-1-9  \n")["due"], "2026-01-09")
+        # 남의 말을 옮겨 적은 문장 속의 기한은 내 할 일의 기한이 아니다
+        self.assertEqual(P("[ ] 가\n그쪽 말로는 기한: 2026-11-09 까지라고")["due"], "")
+        self.assertEqual(P("[ ] 가\n기한: 2026-02-30")["due"], "")       # 없는 날
+        self.assertEqual(P("[ ] 가\n기한: 다음 주")["due"], "")
+
+    def test_new_memo_box_moves_check_and_due_into_the_text(self):
+        C = self.memo.compose
+        self.assertEqual(
+            C("ECO 결과 물어볼 것\n다음 주 초에 나온다고 함", True, "2026-11-12"),
+            "[ ] ECO 결과 물어볼 것\n기한: 2026-11-12\n\n다음 주 초에 나온다고 함\n")
+        self.assertEqual(C("참고할 것\r\n둘째 줄  ", False, ""),
+                         "참고할 것\n둘째 줄\n")
+        # 사용자가 직접 썼으면 겹쳐 붙이지 않는다
+        self.assertEqual(C("[x] 이미 끝남\n기한: 2026-11-01", True, "2026-11-30"),
+                         "[x] 이미 끝남\n기한: 2026-11-01\n")
+        self.assertEqual(C("  \n\n", True, "2026-11-12"), "")
+        self.assertEqual(C("가", True, "내일"), "[ ] 가\n")               # 날짜가 아니면 무시
+
+    def test_created_file_holds_exactly_the_composed_text(self):
+        p = self._new("로그 요청\n- 금요일까지", todo=True, due="2026-11-09")
+        self.assertEqual(p.read_text(encoding="utf-8"),
+                         "[ ] 로그 요청\n기한: 2026-11-09\n\n- 금요일까지\n")
+        r = self._rows()["로그 요청"]
+        self.assertEqual((r["no"], r["kind"], r["due"]),
+                         (26111099001, "todo", "2026-11-09"))
+        self.assertEqual(r["content"], p.read_text(encoding="utf-8"))   # 화면 = 파일 = 색인
+        self.assertEqual(self.memo.create(self.cfg, self.store, " \n")[0], "empty")
+
+    def test_toggle_flips_only_the_first_line_mark(self):
+        p = self._new("로그 요청\n- [ ] 본문 속 체크는 그대로", todo=True)
+        self.assertEqual(self.memo.toggle(self.cfg, self.store, p.name)[0], "done")
+        self.assertEqual(p.read_text(encoding="utf-8"),
+                         "[x] 로그 요청\n- [ ] 본문 속 체크는 그대로\n")
+        self.assertEqual(self._rows()["로그 요청"]["kind"], "done")
+        self.assertEqual(self.memo.toggle(self.cfg, self.store, p.name)[0], "todo")
+        ref = self._new("참고 메모")
+        before = ref.read_text(encoding="utf-8")
+        self.assertEqual(self.memo.toggle(self.cfg, self.store, ref.name)[0], "ref")
+        self.assertEqual(ref.read_text(encoding="utf-8"), before)       # 끝낼 것이 없다
+        self.assertEqual(self.memo.toggle(self.cfg, self.store, "없는.md")[0], "gone")
+
+    # ── 파일이 원본
+    def test_reindex_follows_outside_edits_and_prunes(self):
+        p = self._new("로그 요청", todo=True)
+        self._touch(p, "[x] 로그 받음\n기한: 2026-11-12\n")
+        self.assertEqual(self.memo.reindex(self.cfg, self.store), 1)
+        r = self._rows()["로그 받음"]
+        self.assertEqual((r["kind"], r["due"], r["no"]),
+                         ("done", "2026-11-12", 26111099001))   # 제목이 바뀌어도 번호는 그대로
+        p.unlink()
+        self.assertEqual(self.memo.reindex(self.cfg, self.store), 1)
+        self.assertEqual(self.store.memo_rows(), [])
+
+    def test_reindex_writes_nothing_when_nothing_changed(self):
+        # 목록·첫 화면·회고가 그릴 때마다 부른다 — 쓰기가 한 줄이라도 있으면 sync
+        # 중에 화면이 멈춘다(CLAUDE.md 9).
+        self._new("가", todo=True)
+        self._new("나")
+        self.memo.reindex(self.cfg, self.store)
+        before = self.store.db.total_changes
+        self.assertEqual(self.memo.reindex(self.cfg, self.store), 0)
+        web.render_memo_list(self.store, self.cfg, {}, self.TODAY)
+        web._bento_home(self.store, self.cfg, self.TODAY)
+        web.render_daily(self.cfg, self.TODAY, self.TODAY, self.store)
+        self.assertEqual(self.store.db.total_changes, before)
+
+    def test_memo_screens_do_not_wait_for_a_busy_writer(self):
+        # 밖에서 고친 파일이 있어 색인을 써야 하는데 sync 가 쓰기를 쥐고 있다 —
+        # 화면은 기다리지 않고 이번에는 옛 색인으로 그린다(다음에 다시 맞춘다).
+        p = self._new("옛 제목")
+        self._touch(p, "새 제목\n")
+        w = sqlite3.connect(self.home / "t.sqlite", timeout=30.0)
+        self.addCleanup(w.close)
+        w.execute("BEGIN IMMEDIATE")
+        w.execute("INSERT INTO sync_state(key, value) VALUES('probe', '1')")
+        t0 = time.time()
+        html = web.render_memo_list(self.store, self.cfg, {"kind": ["ref"]}, self.TODAY)
+        self.assertLess(time.time() - t0, 3.0, "메모 화면이 쓰기 잠금을 기다렸다")
+        self.assertIn("옛 제목", html)
+        w.rollback()
+        html = web.render_memo_list(self.store, self.cfg, {"kind": ["ref"]}, self.TODAY)
+        self.assertIn("새 제목", html)
+
+    def test_hand_made_file_is_listed_without_a_number_until_asked(self):
+        d = self.memo.memo_dir(self.cfg)
+        d.mkdir(parents=True)
+        # 메모장이 붙이는 BOM 과 CRLF — 첫 줄의 [ ] 가 읽혀야 한다
+        (d / "장보기.md").write_bytes(
+            "﻿[ ] 우유 사기\r\n기한: 2026-11-20\r\n".encode("utf-8"))
+        self.memo.reindex(self.cfg, self.store)
+        r = self._rows()["우유 사기"]
+        self.assertEqual((r["no"], r["kind"], r["due"]), (0, "todo", "2026-11-20"))
+        self.assertTrue((d / "장보기.md").exists())          # 코드가 이름을 안 바꿨다
+        st, p = self.memo.assign_no(self.cfg, self.store, "장보기.md", today=self.TODAY)
+        self.assertEqual((st, p.name), ("numbered", "26111099001-장보기.md"))
+        self.assertFalse((d / "장보기.md").exists())
+        self.assertEqual(self._rows()["우유 사기"]["no"], 26111099001)
+        self.assertEqual(self.memo.assign_no(self.cfg, self.store, p.name)[0], "has")
+
+    def test_copied_file_does_not_share_the_number(self):
+        a = self._new("원본")
+        b = a.with_name("26111099001-원본-사본.md")
+        b.write_text("사본\n", encoding="utf-8")
+        self.memo.reindex(self.cfg, self.store)
+        rows = self._rows()
+        self.assertEqual(rows["원본"]["no"], 26111099001)
+        self.assertEqual(rows["사본"]["no"], 0)               # 한 번호는 한 메모만
+        self.assertEqual(self.memo.find(self.cfg, 26111099001), a)
+        st, p = self.memo.assign_no(self.cfg, self.store, b.name, today=self.TODAY)
+        self.assertEqual((st, p.name), ("numbered", "26111099002-원본-사본.md"))
+
+    def test_path_of_keeps_inside_the_memo_folder(self):
+        p = self._new("가")
+        self.assertEqual(self.memo.path_of(self.cfg, p.name), p)
+        (self.home / "secret.md").write_text("x", encoding="utf-8")
+        for bad in ("../secret.md", "..\\secret.md", "/etc/passwd", "a/b.md",
+                    ".숨김.md", p.name[:-3], "", None):
+            self.assertIsNone(self.memo.path_of(self.cfg, bad), bad)
+
+    # ── 저장: 사람이 쓴 글을 코드가 말없이 지우지 않는다
+    def test_save_checks_base_and_refuses_an_empty_body(self):
+        p = self._new("로그 요청", todo=True)
+        base = p.stat().st_mtime
+        st, _ = self.memo.save(self.cfg, self.store, p.name, "[ ] 로그 요청\n- 받음\n", base)
+        self.assertEqual(st, "saved")
+        self.assertIn("- 받음", self._rows()["로그 요청"]["content"])
+        self._touch(p, "[ ] 밖에서 고침\n")
+        st, _ = self.memo.save(self.cfg, self.store, p.name, "내 글", base)
+        self.assertEqual(st, "conflict")
+        self.assertEqual(p.read_text(encoding="utf-8"), "[ ] 밖에서 고침\n")   # 그대로
+        cur = p.stat().st_mtime
+        self.assertEqual(self.memo.save(self.cfg, self.store, p.name, "  \n", cur)[0],
+                         "empty")
+        self.assertTrue(p.exists())                       # 비운 저장이 삭제가 아니다
+        self.assertEqual(self.memo.save(self.cfg, self.store, p.name,
+                                        "[ ] 밖에서 고침", cur)[0], "same")
+        self.assertEqual(p.stat().st_mtime, cur)          # 안 바뀌었으면 mtime 도 그대로
+        st, _ = self.memo.save(self.cfg, self.store, p.name, "[ ] 밖에서 고침\n", cur,
+                               toggle=True)
+        self.assertEqual(st, "saved")
+        self.assertTrue(p.read_text(encoding="utf-8").startswith("[x] "))
+
+    # ── 화면
+    def test_memo_is_a_tab_of_records_not_a_top_menu(self):
+        # 기억 = vault 에 쌓인 것(2026-11-18 사용자 확정). 메모(바로 적은 것) · 지식
+        # (승인한 것) · 앞으로 올 위키는 같은 계열이라 나란히 둔다 — 상단 메뉴는 그대로다.
+        self.assertNotIn("메모", web._NAV)
+        self.assertNotIn('href="/memo"', web._NAV)
+        self._new("로그 요청", todo=True)
+        title, inner, code, pane = web.route(
+            self.store, self.cfg, "/records", {"tab": ["memo"]}, self.TODAY)
+        self.assertEqual((title, code, pane), ("기억", 200, "left"))
+        bar = inner[:inner.index("</div>")]
+        self.assertIn("<b>메모</b>", bar)
+        order = [bar.index(x) for x in ("일간 회고", "주간 보고", "메모", "지식")]
+        self.assertEqual(order, sorted(order))               # 가공된 정도 순
+        self.assertIn("href='/memo/26111099001'", inner)
+        # 제목을 한 줄 더 두지 않는다 — 탭 줄의 굵은 '메모'가 제목이다. 종류는 탭이
+        # 아니라 칸이다(같은 모양의 탭이 두 줄이면 단계가 헷갈린다).
+        self.assertNotIn("<h1>", inner)
+        self.assertEqual(inner.count("class='listtabs'"), 1)
+        self.assertIn("<b class='facet on'>할 일 1</b>", inner)
+        self.assertIn("class='facet' href='/records?tab=memo&kind=ref'", inner)
+        # 다른 탭에서는 메모가 링크다
+        other = web.render_records(self.store, self.cfg, {"tab": ["knowledge"]}, self.TODAY)
+        self.assertIn("<a href='/records?tab=memo'>메모</a>", other)
+
+    def test_short_address_moves_to_the_records_tab(self):
+        # /memo 는 목록의 짧은 주소다 — do_GET 이 기억 › 메모로 넘긴다. 받은 값은
+        # 종류·검색어·msg 만, 다시 인코딩해서 싣는다(Location 헤더로 간다).
+        M = web._memo_moved
+        self.assertEqual(M({}), "/records?tab=memo&kind=todo")
+        self.assertEqual(M({"tab": ["ref"]}), "/records?tab=memo&kind=ref")
+        self.assertEqual(M({"kind": ["done"], "q": ["양산 이관"]}),
+                         "/records?tab=memo&kind=done&q=" + web._q("양산 이관"))
+        bad = M({"tab": ["x\r\nX-Injected: 1"], "msg": ["a\r\nb"]})
+        self.assertTrue(bad.startswith("/records?tab=memo&kind=todo&msg="), bad)
+        self.assertNotIn("\n", bad)
+        self.assertNotIn("\r", bad)
+        # route 는 /memo 를 모른다 — 한 화면에 주소가 둘이 되지 않게
+        self.assertEqual(web.route(self.store, self.cfg, "/memo", {}, self.TODAY)[2], 404)
+
+    def test_routes_list_left_and_editor_right(self):
+        p = self._new("로그 요청\n- 금요일까지", todo=True, due="2026-11-09")
+        title, inner, code, pane = web.route(self.store, self.cfg, "/records",
+                                             {"tab": ["memo"]}, self.TODAY)
+        self.assertEqual((code, pane), (200, "left"))
+        self.assertIn("href='/memo/26111099001'", inner)
+        _, ed, code, pane = web.route(self.store, self.cfg, "/memo/26111099001", {},
+                                      self.TODAY)
+        self.assertEqual((code, pane), (200, "right"))
+        # 바로 편집 상자 — 상자의 글이 곧 파일이다
+        self.assertIn("<textarea name='body'", ed)
+        self.assertIn(web.esc(p.read_text(encoding="utf-8")) + "</textarea>", ed)
+        self.assertIn(f"name='base' value='{p.stat().st_mtime!r}'", ed)
+        self.assertIn("data-memo-no='#26111099001'", ed)
+        self.assertIn("기한 11/09 ⚠ 1일 지남", ed)
+        self.assertIn("만든 날 11/10", ed)
+        self.assertIn("value='delete'", ed)
+        self.assertIn("끝냄 ✓", ed)
+        _, miss, _, _ = web.route(self.store, self.cfg, "/memo/26111099777", {}, self.TODAY)
+        self.assertIn("그 메모가 없습니다", miss)
+        _, blank, _, _ = web.route(self.store, self.cfg, "/memo/none", {}, self.TODAY)
+        self.assertIn("새 메모", blank)
+        _, new, _, _ = web.route(self.store, self.cfg, "/memo/new", {}, self.TODAY)
+        self.assertIn("action='/memo/new'", new)
+        self.assertIn("name='todo' value='1' checked", new)      # 할 일이 기본
+
+    def test_list_groups_todos_by_due_and_counts_tabs(self):
+        self._new("지난 것", todo=True, due="2026-11-09")
+        self._new("오늘 것", todo=True, due="2026-11-10")
+        self._new("일요일 것", todo=True, due="2026-11-15")
+        self._new("다음 주 것", todo=True, due="2026-11-16")
+        self._new("기한 없는 것", todo=True)
+        self._new("참고 하나")
+        done = self._new("끝낸 것", todo=True)
+        self.memo.toggle(self.cfg, self.store, done.name)
+        html = web.render_memo_list(self.store, self.cfg, {}, self.TODAY)
+        self.assertIn("<b class='facet on'>할 일 5</b>", html)
+        self.assertIn("참고 1</a>", html)
+        self.assertIn("끝남 1</a>", html)
+        order = [html.index(s) for s in (
+            ">기한 지남<", "지난 것", ">이번 주<", "오늘 것", "일요일 것",
+            ">그 뒤<", "다음 주 것", ">기한 없음<", "기한 없는 것")]
+        self.assertEqual(order, sorted(order))
+        self.assertIn("<b>오늘</b>", html)
+        self.assertNotIn("참고 하나", html)                  # 다른 탭
+        ref = web.render_memo_list(self.store, self.cfg, {"kind": ["ref"]}, self.TODAY)
+        self.assertIn("참고 하나", ref)
+        self.assertNotIn("action='/memo/toggle'", ref)       # 참고에는 체크가 없다
+        dn = web.render_memo_list(self.store, self.cfg, {"kind": ["done"]}, self.TODAY)
+        self.assertIn("memorow done", dn)
+        self.assertIn("끝낸 것", dn)
+        found = web.render_memo_list(self.store, self.cfg, {"q": ["일요일"]}, self.TODAY)
+        self.assertIn("검색 결과 1건", found)
+        self.assertIn("action='/records'", found)            # 검색도 기억 › 메모 안에서
+        self.assertIn("name='tab' value='memo'", found)
+        self.assertIn("일요일 것", found)
+        self.assertNotIn("다음 주 것", found)
+
+    def test_unnumbered_memo_opens_by_file_name_and_offers_a_number(self):
+        d = self.memo.memo_dir(self.cfg)
+        d.mkdir(parents=True)
+        (d / "회의실 규칙.md").write_text("회의실 규칙\n전날 17시까지\n", encoding="utf-8")
+        lst = web.render_memo_list(self.store, self.cfg, {"kind": ["ref"]}, self.TODAY)
+        self.assertIn("번호 없음", lst)
+        href = "/memo/file?f=" + web._q("회의실 규칙.md")
+        self.assertIn(f"href='{href}'", lst)
+        _, ed, _, pane = web.route(self.store, self.cfg, "/memo/file",
+                                   {"f": ["회의실 규칙.md"]}, self.TODAY)
+        self.assertEqual(pane, "right")
+        self.assertIn("action='/memo/number'", ed)
+        self.assertNotIn("data-memo-no", ed)
+        self.assertNotIn("<p class='memometa'>", ed)   # p 안의 form 은 줄이 쪼개진다
+        loc = web.perform_action(self.store, self.cfg, "/memo/number",
+                                 {"f": ["회의실 규칙.md"]})
+        no = self.sm.memo_base(date.today().isoformat()) + 1
+        self.assertTrue(loc.startswith(f"/memo/{no}?msg="), loc)
+
+    # ── 동작(POST)
+    def test_new_action_creates_and_lands_on_the_memo(self):
+        loc = web.perform_action(self.store, self.cfg, "/memo/new",
+                                 {"body": ["ECO 결과 물어볼 것"], "todo": ["1"],
+                                  "due": ["2026-11-20"]})
+        no = self.sm.memo_base(date.today().isoformat()) + 1
+        self.assertTrue(loc.startswith(f"/memo/{no}?msg="), loc)
+        self.assertEqual(self.memo.find(self.cfg, no).read_text(encoding="utf-8"),
+                         "[ ] ECO 결과 물어볼 것\n기한: 2026-11-20\n")
+        loc = web.perform_action(self.store, self.cfg, "/memo/new", {})
+        self.assertTrue(loc.startswith("/memo/new?msg="))        # 빈 메모는 안 만든다
+
+    def test_quick_box_answers_one_line_and_keeps_the_screen(self):
+        got = web._memo_quick(self.store, self.cfg,
+                              {"body": ["양산 이관은 12월 둘째 주\n구두로 정함"]})
+        no = self.sm.memo_base(date.today().isoformat()) + 1
+        self.assertEqual(got, f"ok\t{no}\t양산 이관은 12월 둘째 주")
+        self.assertEqual(self._rows()["양산 이관은 12월 둘째 주"]["kind"], "ref")
+        self.assertTrue(web._memo_quick(self.store, self.cfg, {}).startswith("err\t"))
+
+    def test_save_action_needs_our_base_and_reports_conflict(self):
+        p = self._new("로그 요청", todo=True)
+        f, base = p.name, repr(p.stat().st_mtime)
+        before = p.read_text(encoding="utf-8")
+        # base 가 없으면 우리 폼이 아니다 — 엉뚱한 POST 한 번에 메모가 바뀌면 안 된다
+        loc = web.perform_action(self.store, self.cfg, "/memo/save",
+                                 {"f": [f], "body": ["엉뚱한 글"]})
+        self.assertIn("건드리지", urllib_unquote(loc))
+        self.assertEqual(p.read_text(encoding="utf-8"), before)
+        loc = web.perform_action(self.store, self.cfg, "/memo/save",
+                                 {"f": [f], "base": [base],
+                                  "body": ["[ ] 로그 요청\n- 받음"]})
+        self.assertTrue(loc.startswith("/memo/26111099001?msg="), loc)
+        self.assertIn("- 받음", p.read_text(encoding="utf-8"))
+        self._touch(p, "[ ] 밖에서 고침\n")
+        loc = web.perform_action(self.store, self.cfg, "/memo/save",
+                                 {"f": [f], "base": [base], "body": ["내가 친 글"]})
+        self.assertIn("conflict=1", loc)
+        self.assertEqual(p.read_text(encoding="utf-8"), "[ ] 밖에서 고침\n")
+        ed = web.render_memo(self.store, self.cfg, "26111099001",
+                             {"conflict": ["1"]}, self.TODAY)
+        self.assertIn("data-conflict='1'", ed)          # app.js 가 내 원고를 되살린다
+        self.assertIn("밖에서 고침", ed)                # 서버는 파일의 지금 내용을 그린다
+
+    def test_editor_toggle_saves_and_flips(self):
+        p = self._new("로그 요청", todo=True)
+        loc = web.perform_action(
+            self.store, self.cfg, "/memo/save",
+            {"f": [p.name], "base": [repr(p.stat().st_mtime)], "act": ["toggle"],
+             "body": ["[ ] 로그 요청\n- 11-10 받음"]})
+        self.assertIn("끝냄", urllib_unquote(loc))
+        self.assertEqual(p.read_text(encoding="utf-8"), "[x] 로그 요청\n- 11-10 받음\n")
+        self.assertIn("다시 열기", web.render_memo(self.store, self.cfg, "26111099001",
+                                                    {}, self.TODAY))
+
+    def test_delete_only_the_file_i_was_looking_at(self):
+        p = self._new("지울 메모")
+        base = repr(p.stat().st_mtime)
+        self._touch(p, "밖에서 덧붙인 글이 있는 메모\n")
+        loc = web.perform_action(self.store, self.cfg, "/memo/save",
+                                 {"f": [p.name], "base": [base], "act": ["delete"]})
+        self.assertIn("지우지 않았습니다", urllib_unquote(loc))
+        self.assertTrue(p.exists())
+        loc = web.perform_action(
+            self.store, self.cfg, "/memo/save",
+            {"f": [p.name], "base": [repr(p.stat().st_mtime)], "act": ["delete"]})
+        self.assertTrue(loc.startswith("/memo/none?msg="), loc)
+        self.assertFalse(p.exists())
+        self.assertEqual(self.store.memo_rows(), [])
+
+    def test_list_toggle_returns_to_a_rebuilt_address(self):
+        p = self._new("로그 요청", todo=True)
+        loc = web.perform_action(
+            self.store, self.cfg, "/memo/toggle",
+            {"f": [p.name], "back": ["/records?tab=memo&kind=done&q=로그"]})
+        self.assertTrue(loc.startswith(
+            "/records?tab=memo&kind=done&q=" + web._q("로그") + "&msg="), loc)
+        self.assertTrue(p.read_text(encoding="utf-8").startswith("[x] "))
+        # 받은 back 을 그대로 Location 에 싣지 않는다 — 다시 만든다
+        for evil in ("//evil.example/x", "/records?tab=memo&kind=todo\r\nX-Injected: 1",
+                     "https://evil.example/memo", "/records?tab=memo&kind=<script>"):
+            loc = web.perform_action(self.store, self.cfg, "/memo/toggle",
+                                     {"f": [p.name], "back": [evil]})
+            self.assertTrue(loc.startswith("/records?tab=memo&kind=todo&msg="), loc)
+            self.assertNotIn("\n", loc)
+            self.assertNotIn("evil", loc)
+        loc = web.perform_action(
+            self.store, self.cfg, "/memo/toggle",
+            {"f": [p.name], "back": ["/records?tab=daily&date=2026-11-10"]})
+        self.assertTrue(loc.startswith("/records?tab=daily&date=2026-11-10&msg="), loc)
+        # 폴더 밖 이름은 아무것도 건드리지 않는다
+        (self.home / "secret.md").write_text("[ ] 비밀\n", encoding="utf-8")
+        web.perform_action(self.store, self.cfg, "/memo/toggle",
+                           {"f": ["../secret.md"], "back": ["/memo"]})
+        self.assertEqual((self.home / "secret.md").read_text(encoding="utf-8"),
+                         "[ ] 비밀\n")
+
+    # ── 일간 회고 · 첫 화면 · 검색 · 링크
+    def test_daily_shows_open_todos_today_only_and_not_in_the_file(self):
+        d = self.cfg.vault / "daily"
+        d.mkdir(parents=True, exist_ok=True)
+        md = ("# 2026-11-10 일간 회고\n\n수신 3\n\n"
+              "## 내 약속 — 후속이 없는 것 (1건)\n- [#1] 가\n")
+        (d / "2026-11-10.md").write_text(md, encoding="utf-8")
+        (d / "2026-11-09.md").write_text(md.replace("11-10", "11-09"), encoding="utf-8")
+        for i in range(7):
+            self._new(f"할 일 {i}", todo=True, due=f"2026-11-{9 + i:02d}")
+        self._new("참고는 안 나온다")
+        html = web.render_daily(self.cfg, self.TODAY, self.TODAY, self.store)
+        self.assertIn("내 할 일 — 메모 (열린 7건)", html)
+        self.assertEqual(html.count("action='/memo/toggle'"), review.DAILY_TOP)
+        self.assertIn("외 2건", html)
+        self.assertIn("class='mno' href='/memo/26111099001'", html)
+        self.assertIn("name='back' value='/records?tab=daily&amp;date=2026-11-10'", html)
+        self.assertNotIn("참고는 안 나온다", html)
+        # 하루 요약 다음, 첫 절 앞에 선다
+        self.assertLess(html.index("class='dsum'"), html.index("내 할 일 — 메모"))
+        self.assertLess(html.index("내 할 일 — 메모"), html.index("내 약속"))
+        # 지난 날짜의 회고에는 없다 — 메모는 '지금'의 목록이다
+        self.assertNotIn("내 할 일", web.render_daily(self.cfg, "2026-11-09",
+                                                       self.TODAY, self.store))
+        # 회고 파일은 그대로다
+        self.assertEqual((d / "2026-11-10.md").read_text(encoding="utf-8"), md)
+        # 회고가 아직 없는 날에도 할 일은 보인다
+        (d / "2026-11-10.md").unlink()
+        self.assertIn("내 할 일 — 메모", web.render_daily(self.cfg, self.TODAY,
+                                                          self.TODAY, self.store))
+
+    def test_home_tile_counts_open_and_late(self):
+        self.cfg.raw = {"web": {"skin": "bento"}}
+        home = web._bento_home(self.store, self.cfg, self.TODAY)
+        self.assertIn("data-href='/records?tab=memo'", home)   # 메모가 없어도 타일은 있다
+        self.assertIn("<div class='bnum'>0</div>", home)
+        self._new("지난 것", todo=True, due="2026-11-09")
+        self._new("남은 것", todo=True)
+        self._new("참고")
+        home = web._bento_home(self.store, self.cfg, self.TODAY)
+        self.assertIn("<div class='bnum'>2<span class='sub'>기한 지남 1</span></div>", home)
+        self.assertIn("지난 것", home)
+        self.assertEqual(home.count("<div"), home.count("</div>"))
+
+    def test_bare_number_links_to_memo_or_thread_by_itself(self):
+        got = web._linkify_refs("메모 #26111099001 과 스레드 #26111040001")
+        self.assertIn('href="/memo/26111099001"', got)
+        self.assertIn('href="/thread/26111040001"', got)
+        self.assertNotIn('href="/thread/26111099001"', got)
+
+    def test_search_finds_memos_and_resolves_a_memo_number(self):
+        self._new("양산 이관은 12월 둘째 주\n구두로 정함")
+        html = web.render_search(self.store, self.cfg, {"q": ["양산 이관"]}, self.TODAY)
+        self.assertIn("<h2>메모 (1)</h2>", html)
+        self.assertIn("href='/memo/26111099001'", html)
+        html = web.render_search(self.store, self.cfg, {"q": ["#26111099001"]}, self.TODAY)
+        self.assertIn("메모 <a class='mno' href='/memo/26111099001'>#26111099001</a>", html)
+        self.assertNotIn("메일 <b>#26111099001</b> 없음", html)
+        html = web.render_search(self.store, self.cfg, {"q": ["#26111099555"]}, self.TODAY)
+        self.assertIn("메모 <b>#26111099555</b> 없음", html)
+
+    def test_shell_carries_the_new_memo_box_and_appjs_drives_it(self):
+        out = web._shell("t", "L", "R")
+        self.assertIn("id='memoquick' class='memoshade' hidden", out)
+        self.assertEqual(out.count("id='memoquick'"), 1)
+        js = web._APP_JS
+        self.assertIn('fetch("/memo/quick"', js)             # 화면을 안 바꾸는 저장
+        self.assertIn('k === "m"', js)                       # 어느 화면에서든
+        # 메모 한 건을 열어 둔 동안에도 상단 밑줄은 기억이다(메모는 기억의 탭)
+        self.assertIn('path.indexOf("/memo/") === 0) return "/records";', js)
+        self.assertNotIn('"/memo", "/stats"', js)
+        # /memo/… 전체 로드의 좌측 기본 = 기억 › 메모(서버 _panes 와 짝)
+        self.assertIn('? "/records?tab=memo"', js)
+        self.assertIn("form.memoedit[data-conflict='1'] textarea[name='body']", js)
+        self.assertIn("저장하지 않은 메모가 있습니다", js)
+        # [＋ 새 메모] 클릭은 링크 가로채기보다 먼저 잡아야 칸이 열린다
+        self.assertLess(js.index('t.closest("a.memonew")'),
+                        js.index("링크 가로채기: 내부 링크는 해당 패널만 갱신"))
+
+    def test_form_payload_is_built_before_the_buttons_are_disabled(self):
+        # 잠긴(disabled) 버튼은 폼 데이터에서 빠진다 — 눌린 버튼도 그렇다. 잠근 뒤에
+        # FormData 를 만들면 act=toggle/delete/ext 가 실리지 않아 [끝냄]이 그냥
+        # 저장이 된다(2026-11-18 실제 브라우저에서 잡았다. 노트의 ext 도 같은 길).
+        js = web._APP_JS
+        self.assertEqual(js.count("new FormData(form, e.submitter)"), 1)
+        self.assertLess(js.index("new FormData(form, e.submitter)"),
+                        js.index("setDisabled(true);"))
+        self.assertIn("body: payload,", js)
+
+    # ── AI 문맥(1단계): 싣되, 근거로는 못 쓴다
+    def test_related_memos_are_injected_with_kind_and_dates(self):
+        self._new("NPX-200 양산 이관, 구두로 12월 둘째 주\n\n주간 회의에서 구두로 정함. "
+                  "메일 공지는 아직 없음.")
+        self._new("회식 장소는 2층 식당")
+        self._new("양산 이관 체크리스트 받기", todo=True, due="2026-11-20")
+        blk = self.ask._memo_block(self.store, "양산 이관 언제로 정했지?")
+        self.assertTrue(blk.startswith("\n[내 메모 — "))
+        self.assertIn("문맥 전용, 인용 금지", blk)
+        self.assertIn("- [#26111099001] NPX-200 양산 이관, 구두로 12월 둘째 주 (참고 · 고침 ",
+                      blk)
+        self.assertIn("  주간 회의에서 구두로 정함. 메일 공지는 아직 없음.", blk)
+        self.assertIn("(할 일 · 기한 2026-11-20 · 고침 ", blk)
+        self.assertNotIn("회식", blk)                        # 겹침 0 은 안 싣는다
+        self.assertEqual(self.ask._memo_block(self.store, "전혀 다른 질문"), "")
+
+    def test_long_memo_keeps_its_head_and_its_tail(self):
+        body = ("전류 스파이크 로그 요청\n기한: 2026-11-09\n처음 사정: 구두로 요청함\n"
+                + "".join(f"- 경과 {i:03d} 줄입니다 길게 적은 내용\n" for i in range(80))
+                + "가장 새 경과: 어제 받았다\n")
+        self._new(body, todo=True)
+        blk = self.ask._memo_block(self.store, "전류 스파이크 로그")
+        self.assertIn("처음 사정: 구두로 요청함", blk)
+        self.assertIn("가장 새 경과: 어제 받았다", blk)
+        self.assertIn("…(중략)…", blk)
+        self.assertNotIn("경과 040", blk)
+        self.assertNotIn("기한: 2026-11-09\n", blk)          # 머리 줄이 이미 말한다
+        self.assertLess(len(blk), self.ask.ASK_MEMO_CHARS + 400)
+
+    def test_at_most_three_memos_best_overlap_first(self):
+        for i in range(5):
+            self._new(f"양산 메모 {i}")
+        self._new("양산 이관 일정 메모")
+        blk = self.ask._memo_block(self.store, "양산 이관 일정")
+        self.assertEqual(blk.count("\n- "), self.ask.ASK_MEMO_TOP)
+        self.assertLess(blk.index("양산 이관 일정 메모"), blk.index("양산 메모"))
+
+    def test_engine_and_context_command_carry_the_same_memo_block(self):
+        self._new("NPX-200 양산 이관, 구두로 12월 둘째 주")
+        q = "양산 이관 언제로 정했지?"
+        prompts = []
+
+        def fake_run(cmd, prompt, **kw):
+            prompts.append(prompt)
+            raise review.AIError("stop")
+
+        with mock.patch.object(review, "ai_run", side_effect=fake_run):
+            try:
+                self.ask.ask(self.store, self.cfg, q, use_cache=False)
+            except Exception:
+                pass
+        self.assertTrue(prompts, "엔진 프롬프트를 못 잡았다")
+        blk = self.ask._memo_block(self.store, q).strip()
+        self.assertIn(blk, prompts[0])
+        with mock.patch.object(review, "ai_run",
+                               side_effect=AssertionError("AI 호출됨")):
+            ctx = self.ask.context_text(self.store, self.cfg, q)
+            bare = self.ask.context_text(self.store, self.cfg, "")
+            none = self.ask.context_text(self.store, self.cfg, "회식 장소")
+        self.assertIn(blk, ctx)
+        self.assertIn("[내 메모]  색인 1건", bare)
+        self.assertIn("[내 메모]  관련 0건 (색인 1건 — 질문과 겹치는 말이 없다)", none)
+
+    def test_thread_briefing_gets_memos_and_person_briefing_does_not(self):
+        self._new("NPX-200 양산 이관, 구두로 12월 둘째 주")
+        with mock.patch.object(review, "ai_run", return_value="정리: 두 문장.") as m:
+            review.diagnose_thread(self.store, self.cfg, self.tid)
+        self.assertIn("[내 메모 — ", m.call_args[0][1])
+        self.assertIn("구두로 12월 둘째 주", m.call_args[0][1])
+        # 인물 현안 브리핑에는 싣지 않는다(2026-11-18 사용자 확정)
+        with mock.patch.object(review, "ai_run", return_value="정리: 두 문장.") as m:
+            review.diagnose_person(self.store, self.cfg, self.KIM)
+        self.assertTrue(m.called)
+        self.assertNotIn("[내 메모 — ", m.call_args[0][1])
+        self.assertNotIn("구두로 12월 둘째 주", m.call_args[0][1])
+
+    def test_memo_sentence_cannot_become_evidence(self):
+        # 1단계: 메모는 문맥이다. 메모 문장을 근거로 달면 메일 대조에서 떨어진다.
+        self._new("NPX-200 양산 이관, 구두로 12월 둘째 주")
+        raw = ('정리: 두 문장.\n'
+               '문제: 이관 시점 | 근거: "구두로 12월 둘째 주"')
+        with mock.patch.object(review, "ai_run", return_value=raw):
+            got = review.diagnose_thread(self.store, self.cfg, self.tid)
+        self.assertNotIn("12월 둘째 주", got)
+        self.assertEqual(review.diagnose_thread.last_dropped, 1)
 
 
 if __name__ == "__main__":

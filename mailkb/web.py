@@ -28,12 +28,12 @@ from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-from . import (__version__, actions, config as cfgmod, promises, report,
-               review, search as search_mod, terms, weekly)
+from . import (__version__, actions, config as cfgmod, memo as memo_mod,
+               promises, report, review, search as search_mod, terms, weekly)
 from .clean import (PRESERVED_MARK, QFOLD_CLOSE, QFOLD_OPEN, add_dark_colors,
                     hide_image_signatures, parse_preserved, preserved_label,
                     qfold_open, retitle_qfold, smart_truncate, strip_preserved)
-from .store import Store, image_cutoff_for
+from .store import Store, image_cutoff_for, is_memo_id
 
 # 백그라운드 잡 상태 표준형 — 모든 잡(회고·검색·동기화·주간·분석·인물 요약·지식 저장)이
 # 같은 모양을 쓰고 같은 대기 카드로 그려진다. 스트리밍 필드는 ai_run 이 흘리는
@@ -547,7 +547,8 @@ button.flag.on { color: var(--danger); }            /* ⚑ 플래그(색 있음)
           color: var(--ink-3); vertical-align: 1px; }
 .rbadge.first { color: var(--accent2); border-color: var(--accent2); }
 .more { text-align: center; padding: 10px 0 16px; color: var(--ink-3); font-size: 13px; }
-#toast { position: fixed; bottom: 18px; right: 18px; z-index: 10;
+/* 새 메모 칸(.memoshade, z 50)보다 위 — 칸을 연 채 뜨는 안내가 덮개에 가리면 안 된다 */
+#toast { position: fixed; bottom: 18px; right: 18px; z-index: 60;
          background: var(--toast-bg); color: #fff; padding: 10px 16px; border-radius: var(--r-md);
          box-shadow: 0 2px 10px rgba(0,0,0,.25); font-size: 14px; }
 h1 { font-size: 20px; } h2 { font-size: 17px; margin-top: 22px; }
@@ -729,6 +730,75 @@ details.mynote .noteconf { margin: 8px 0 0; padding: 8px 12px; font-size: 13px;
   color: var(--warn); background: var(--warn-bg);
   border: 1px solid var(--warn-border); border-radius: var(--r-sm); }
 details.mynote .ihint { cursor: help; color: var(--ink-3); font-size: 12px; }
+/* 메모(2026-11-18) — 목록 행 · 편집 상자 · 새 메모 칸. 색·반경은 기존 변수 그대로다.
+   편집 상자는 노트와 달리 본문 글꼴이다: 노트는 스레드 곁의 짧은 기록이지만
+   메모는 그 자체가 읽고 고치는 글(할 일 경과·참고 사실)이라 길어진다. */
+/* 종류(할 일·참고·끝남)는 탭이 아니라 칸이다 — 바로 위가 기억의 탭 줄이라, 같은
+   모양의 글자 탭을 한 줄 더 두면 어느 줄이 위 단계인지 헷갈린다(2026-11-18). */
+.memokinds { display: flex; align-items: center; gap: 6px; margin: 2px 0 8px; }
+.memokinds .facet.on { border-color: var(--accent); color: var(--accent);
+  font-weight: 600; }
+.memokinds a.facet:hover { text-decoration: none; }
+.memokinds .kbdhelp { margin-left: auto; }
+.memohead { display: flex; gap: 8px; align-items: center; margin: 4px 0 10px; }
+.memohead form { flex: 1; min-width: 0; margin: 0; display: flex; }
+.memohead input[type=search] { flex: 1; min-width: 0; font: inherit; font-size: 13.5px;
+  padding: 6px 12px; border: 1px solid var(--border-strong); border-radius: 999px;
+  background: var(--surface); color: var(--ink); }
+.memorow { display: flex; gap: 8px; align-items: flex-start; padding: 7px 10px;
+  margin: 3px 0; border-radius: var(--r-md); background: var(--surface);
+  border: 1px solid var(--border); }
+.memorow:hover { border-color: var(--accent); }
+.memorow form { margin: 0; flex: none; }
+.memorow .mchk { flex: none; display: inline-block; box-sizing: border-box;
+  width: 20px; height: 20px; padding: 0; margin-top: 1px; font-size: 13px;
+  line-height: 17px; text-align: center; border: 1.5px solid var(--border-strong);
+  border-radius: 5px; background: var(--surface); color: var(--accent); }
+.memorow span.mchk { border-color: transparent; background: transparent;
+  color: var(--ink-3); }
+.memorow .mlink { flex: 1; min-width: 0; color: var(--ink); }
+.memorow .mlink:hover { text-decoration: none; }
+.memorow.done .mfrom { text-decoration: line-through; color: var(--ink-3);
+  font-weight: 400; }
+.memorow .late, .memometa .late { color: var(--warn); font-weight: 600; }
+.memometa { color: var(--ink-3); font-size: 13px; margin: -4px 0 10px; }
+.memometa form { display: inline; margin: 0 0 0 6px; }
+.memometa form button { font-size: 12px; padding: 1px 8px; }
+.memono { font-family: var(--mono); font-size: .95em; color: var(--ink-2);
+  font-variant-numeric: tabular-nums; background: transparent; border: 0;
+  padding: 0; cursor: pointer; }
+.memono:hover { text-decoration: underline; background: transparent; }
+.daily a.mno { font-family: var(--mono); font-variant-numeric: tabular-nums;
+  font-size: .9em; }
+form.memoedit textarea { width: 100%; box-sizing: border-box; font: inherit;
+  font-size: 14px; line-height: 1.6; padding: 10px 12px; color: var(--ink);
+  background: var(--surface); border: 1px solid var(--border-strong);
+  border-radius: var(--r-md); resize: vertical; }
+form.memoedit textarea:focus-visible { outline: 2px solid var(--accent);
+  outline-offset: 1px; }
+form.memoedit .noterow { display: flex; flex-wrap: wrap; gap: 8px;
+  align-items: center; margin-top: 10px; }
+form.memoedit .noterow .sp { flex: 1; }
+form.memoedit .notehint { margin: 6px 0 0; font-size: 12.5px; color: var(--ink-3); }
+form.memoedit label { font-size: 13.5px; color: var(--ink-2); display: inline-flex;
+  gap: 5px; align-items: center; }
+form.memoedit label + label { margin-left: 10px; }
+form.memoedit input[type=date] { font: inherit; font-size: 13px; padding: 2px 6px;
+  color: var(--ink); background: var(--surface);
+  border: 1px solid var(--border-strong); border-radius: var(--r-sm); }
+form.memoedit kbd { font: inherit; font-size: 11px; padding: 0 5px; margin-left: 7px;
+  border: 1px solid currentColor; border-radius: 4px; opacity: .8; }
+.memoconf { margin: 0 0 8px; padding: 8px 12px; font-size: 13px; color: var(--warn);
+  background: var(--warn-bg); border: 1px solid var(--warn-border);
+  border-radius: var(--r-sm); }
+.memoshade { position: fixed; inset: 0; z-index: 50; display: flex;
+  align-items: flex-start; justify-content: center; padding-top: 14vh;
+  background: rgba(15,20,30,.38); }
+.memoshade[hidden] { display: none; }
+.memoquick { width: min(620px, 92vw); padding: 14px 18px 16px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r-lg); box-shadow: 0 18px 50px rgba(0,0,0,.28); }
+.memoquick h3 { margin: 0 0 8px; font-size: 15px; }
 /* 스레드 상세 sticky 헤더 — 제목이 스크롤을 따라온다. hookThreadHead 가
    센티널 이탈 시 .stuck(컴팩트 1줄 말줄임). 배경 필수 — 비치면 타임라인과 겹침. */
 .threadhead { position: sticky; top: 0; z-index: 5; background: var(--bg);
@@ -1278,9 +1348,18 @@ def _row_get(row, name: str, default=None):
         return default
 
 
+def _ref_link(m) -> str:
+    n = m.group(1)
+    # 99번 칸은 메모 번호다(store.is_memo_id) — 메일·스레드는 그 칸을 쓰지 않으므로
+    # 번호만 적어도 어디로 갈지 갈린다.
+    if is_memo_id(n):
+        return f'<a class="mno" href="/memo/{n}">#{n}</a>'
+    return f'<a href="/thread/{n}">#{n}</a>'
+
+
 def _linkify_refs(text: str) -> str:
-    """이미 escape 된 텍스트의 #123 을 스레드 링크로."""
-    return _REF_RX.sub(r'<a href="/thread/\1">#\1</a>', text)
+    """이미 escape 된 텍스트의 #123 을 스레드 링크로(메모 번호면 메모로)."""
+    return _REF_RX.sub(_ref_link, text)
 
 
 _PRI_RX = re.compile(r"\[(상|중|하)\]")            # 개입 항목 긴급도 → 색 칩
@@ -1432,7 +1511,7 @@ def _apply_done(md: str, done: set) -> str:
 
 
 def _md_to_html(md: str, back: str = "", done: set | None = None,
-                cards: bool = False) -> str:
+                cards: bool = False, head: str = "") -> str:
     """데일리 마크다운(앱·AI 생성)을 구조화된 HTML 로 — 다른 페이지와 톤 일치.
 
     지원: `##` 헤딩, 중첩 불릿(2칸 들여쓰기), `**굵게**`, `#123` 링크.
@@ -1449,6 +1528,10 @@ def _md_to_html(md: str, back: str = "", done: set | None = None,
     줄을 **화면에서도** 뺀다 — 저장된 리포트 파일은 그대로라, 안 빼면 버튼을
     눌러도 그 자리에 남아 아무 일도 안 일어난 것처럼 보인다. 개수 표기를 다시
     세고 빈 절을 지우는 것까지 _apply_done 이 마크다운 단계에서 한다.
+
+    head 는 **파일에 없는** 절 하나(이미 HTML)다 — 하루 요약 다음, 첫 절 앞에
+    끼운다. 회고의 '내 할 일'(메모)이 여기로 온다: 메모는 회고 뒤에도 바뀌므로
+    파일에 박지 않고 그릴 때 읽는다.
     """
     if done:
         md = _apply_done(md, done)
@@ -1485,6 +1568,12 @@ def _md_to_html(md: str, back: str = "", done: set | None = None,
             out.append("<div class='dsum'>" + "\n".join(lead) + "</div>")
             lead = []
 
+    def put_head() -> None:
+        nonlocal head
+        if head:
+            out.append(head)
+            head = ""
+
     def flush_quote() -> None:
         """'> ' 줄 묶음 → blockquote. 주간 머리의 AI 인증 만료 안내가 여기 걸린다 —
         예전에는 `&gt;` 가 본문에 그대로 찍혀 깨진 줄처럼 보였다."""
@@ -1510,6 +1599,7 @@ def _md_to_html(md: str, back: str = "", done: set | None = None,
         if stripped.startswith("## "):
             close_lists()
             flush_lead()
+            put_head()
             seen_h2 = True
             title = stripped[3:].strip()
             if in_ref:
@@ -1580,6 +1670,7 @@ def _md_to_html(md: str, back: str = "", done: set | None = None,
     close_card()
     if in_ref:
         out.append("</details>")
+    put_head()                 # 절이 하나도 없는 글이면 맨 끝에
     return "<div class='daily'>" + "\n".join(out) + "</div>"
 
 
@@ -2187,6 +2278,35 @@ def render_stats_page(store, cfg) -> str:
                       skin=cfg.opt("web", "skin", default=_DEFAULT_SKIN))
 
 
+def _memo_new_form(quick: bool) -> str:
+    """새 메모 입력 폼 — 새 메모 칸(m)과 /memo/new 화면이 같이 쓴다.
+
+    '할 일' 체크와 기한은 입력란이지만 **저장되면 글 안으로 들어간다**
+    (memo.compose) — 그 뒤로는 편집 상자의 글이 전부다."""
+    cancel = ("<button type='button' class='btn' data-memo-close='1'>취소"
+              "<kbd>Esc</kbd></button>" if quick
+              else "<a class='btn' href='/memo/none'>취소</a>")
+    hint = ("보던 화면은 그대로 둡니다 · " if quick else "")
+    return ("<form class='memoedit' method='post' action='/memo/new'>"
+            f"<textarea name='body' rows='{5 if quick else 14}' spellcheck='false' "
+            "placeholder='첫 줄이 제목입니다. 이어서 길게 써도 됩니다.'></textarea>"
+            "<div class='noterow'><label><input type='checkbox' name='todo' "
+            "value='1' checked> 할 일</label>"
+            "<label>기한 <input type='date' name='due'></label>"
+            "<span class='sp'></span>"
+            "<button class='btn-primary'>저장<kbd>Ctrl+Enter</kbd></button>"
+            f"{cancel}</div>"
+            f"<p class='notehint'>{hint}할 일을 끄면 참고 메모로 저장됩니다 · "
+            "기한은 비워도 됩니다</p></form>")
+
+
+# 새 메모 칸 — 어느 화면에서든 m 으로 여는 덮개. 모든 셸 문서에 실려 있고 평소엔
+# 숨어 있다(app.js 가 연다). 통계처럼 app.js 가 없는 전폭 페이지에는 없다.
+_MEMO_QUICK = ("<div id='memoquick' class='memoshade' hidden>"
+               "<div class='memoquick' role='dialog' aria-label='새 메모'>"
+               "<h3>새 메모</h3>" + _memo_new_form(True) + "</div></div>")
+
+
 def _shell(title: str, left: str, right: str, refresh: int | None = None,
            read_w: int | None = None, theme: str = "light",
            read_fs: int | None = None, skin: str = _DEFAULT_SKIN) -> str:
@@ -2199,6 +2319,7 @@ def _shell(title: str, left: str, right: str, refresh: int | None = None,
         + "<div id='splitter' title='드래그로 폭 조절'></div>"
         + f"<main id='right'><div class='inner'>{right}</div></main>"
         + "</div><div id='toast' hidden></div>"
+        + _MEMO_QUICK
         + "<script src='/app.js'></script></body></html>"
     )
 
@@ -2264,15 +2385,20 @@ _SKIN_CSS = """
 :root[data-skin='bento'] .btile.s8 { grid-column: span 8; }
 :root[data-skin='bento'] .btile.s6 { grid-column: span 6; }
 :root[data-skin='bento'] .btile.s4 { grid-column: span 4; }
+:root[data-skin='bento'] .btile.s3 { grid-column: span 3; }
+:root[data-skin='bento'] .bnum .sub { font-size: 12.5px; font-weight: 400;
+  letter-spacing: 0; color: var(--warn); margin-left: 7px; }
 /* 숫자 한 줄짜리 칸은 진짜 작게 — 큰 칸과 대비가 나야 격자로 읽힌다 */
 :root[data-skin='bento'] .btile.mini { padding: 10px 13px 11px; }
 :root[data-skin='bento'] .btile.ai { border-color: var(--accent2); }
 @media (max-width: 900px) {
   :root[data-skin='bento'] .btile.s8 { grid-column: span 12; }
   :root[data-skin='bento'] .btile.s4 { grid-column: span 6; }
+  :root[data-skin='bento'] .btile.s3 { grid-column: span 6; }
 }
 @media (max-width: 620px) {
-  :root[data-skin='bento'] .btile.s4, :root[data-skin='bento'] .btile.s6 {
+  :root[data-skin='bento'] .btile.s4, :root[data-skin='bento'] .btile.s6,
+  :root[data-skin='bento'] .btile.s3 {
     grid-column: span 12; }
 }
 :root[data-skin='bento'] .bth {
@@ -2431,7 +2557,7 @@ _APP_JS = r"""
     /* 홈(/)=분석 대화록 — 우측. 좌측은 목록/메뉴 성격 페이지들 */
     if (path === "/mail" || path === "/threads" ||
         path === "/search" || path === "/records" || path === "/daily" ||
-        path === "/settings") return "left";
+        path === "/settings" || path === "/memo") return "left";
     if (path === "/lens/intervene" || path === "/person" ||
         path === "/people" || path === "/ask/list") return "left";
     /* 주간 보고는 기억(좌측) 소속 — POST /weekly 의 303 이 여기로 온다.
@@ -2898,8 +3024,19 @@ _APP_JS = r"""
     /* 질문 이력은 /ask?id=N 이 곧 선택 항목 (스레드와 달리 id 가 쿼리에 있다) */
     var askId = location.pathname.indexOf("/ask") === 0
       ? new URLSearchParams(location.search).get("id") : null;
+    /* 메모는 주소가 아니라 **우측에 실제로 열린 편집 상자**로 고른다 — 왼쪽에서
+       탭을 옮기면 주소는 /records?tab=… 이 되지만 열린 메모는 그대로다. */
+    var memoEd = right.querySelector("form.memoedit[data-url]");
+    var memoCur = memoEd ? memoEd.getAttribute("data-url") : null;
     var links = left.getElementsByTagName("a");
     for (var i = 0; i < links.length; i++) {
+      var mrow = links[i].closest(".memorow");
+      if (mrow) {
+        if (links[i].classList.contains("mlink"))
+          mrow.classList.toggle("selected", !!memoCur
+            && (links[i].getAttribute("href") || "") === memoCur);
+        continue;
+      }
       var row = links[i].closest(".item, .digest, .mrow");
       if (!row) continue;
       var href = links[i].getAttribute("href") || "";
@@ -2924,6 +3061,8 @@ _APP_JS = r"""
     if (path === "/") return "/";
     if (path.indexOf("/ask") === 0) return "/";  /* 홈=분석 — /ask* 도 홈 밑줄 */
     if (path === "/daily") return "/records";   /* 구 데일리 경로 → 기억 메뉴 */
+    /* 메모는 기억의 탭이다 — 메모 한 건(/memo/번호)을 열어 둔 동안에도 기억에 밑줄 */
+    if (path === "/memo" || path.indexOf("/memo/") === 0) return "/records";
     var tops = ["/mail", "/threads", "/people", "/search", "/records",
                 "/stats", "/settings"];
     for (var i = 0; i < tops.length; i++) {
@@ -3404,6 +3543,127 @@ _APP_JS = r"""
       });
   }
 
+  /* ---- 메모(2026-11-18) ------------------------------------------------
+     새 메모 칸은 어느 화면에서든 m 으로 연다. 저장해도 **화면을 바꾸지 않는다**
+     — 보던 메일을 그대로 둔 채 적는 것이 이 칸의 전부다. 그래서 303 을 따라가는
+     폼 가로채기를 타지 않고 한 줄 응답(ok/err)만 받는다. Esc 로 닫아도 쓰던
+     글은 남는다(저장했을 때만 비운다).
+     이 블록의 클릭 처리기는 아래 '링크 가로채기'보다 **먼저 등록돼야 한다** —
+     [＋ 새 메모]는 링크(JS 꺼짐이면 /memo/new 로 간다)라 먼저 잡아 칸을 연다. */
+  var memoBox = document.getElementById("memoquick");
+  function memoQuickOpen() {
+    if (!memoBox) return false;
+    memoBox.hidden = false;
+    var ta = memoBox.querySelector("textarea[name='body']");
+    if (ta) try { ta.focus(); } catch (e) {}
+    return true;
+  }
+  function memoQuickClose() {
+    if (!memoBox || memoBox.hidden) return false;
+    memoBox.hidden = true;
+    return true;
+  }
+  function memoLeftRefresh() {
+    /* 왼쪽이 메모를 그리고 있을 때만 — 메모 목록, 오늘 회고의 '내 할 일' */
+    if (!leftCur || !left.querySelector(".memohead, .memocard")) return;
+    var sc = left.scrollTop;
+    load(leftCur, "left", false)
+      .then(function () { left.scrollTop = sc; })
+      .catch(function () {});
+  }
+  function memoQuickSave(form) {
+    var ta = form.querySelector("textarea[name='body']");
+    if (!ta || !ta.value.trim()) { toast("빈 메모는 만들지 않습니다"); return; }
+    var btns = form.querySelectorAll("button"), i;
+    for (i = 0; i < btns.length; i++) btns[i].disabled = true;
+    function done() {
+      for (var j = 0; j < btns.length; j++) btns[j].disabled = false;
+    }
+    var fail = "메모를 저장하지 못했습니다 — 잠시 후 다시 눌러 주세요";
+    fetch("/memo/quick", {
+      method: "POST",
+      body: new URLSearchParams(new FormData(form)),
+      headers: { "X-Requested-With": "fetch" },
+    }).then(function (r) { return r.text(); }).then(function (t) {
+      var p = (t || "").split("\t");
+      if (p[0] !== "ok") {              /* 못 썼으면 칸과 글을 그대로 둔다 */
+        toast(p[0] === "err" && p[1] ? p[1] : fail);
+        return;
+      }
+      toast("메모 저장 #" + p[1]);
+      form.reset();
+      memoQuickClose();
+      memoLeftRefresh();
+    }).catch(function () { toast(fail); }).then(done);
+  }
+  function memoSameOpen(form) {
+    /* 이 체크 폼의 메모가 우측 편집 상자에 열려 있으면 그 상자, 아니면 null */
+    var fi = form.querySelector("input[name='f']");
+    var ed = right.querySelector("form.memoedit[data-url]");
+    var ef = ed && ed.querySelector("input[name='f']");
+    return (fi && ef && ef.value === fi.value) ? ed : null;
+  }
+  function memoTogLocal(form) {
+    /* 지금 고치고 있는(저장 안 한) 메모의 체크를 목록에서 눌렀다 — 파일을 바꾸면
+       편집 상자가 충돌로 막힌다. 상자 안의 첫 줄만 바꾸고 저장은 사람에게 맡긴다. */
+    var ed = memoSameOpen(form);
+    var ta = ed && ed.querySelector("textarea[name='body']");
+    if (!ta || ta.value === ta.defaultValue) return false;
+    ta.value = ta.value.replace(/^(\s*(?:[-*]\s+)?\[)( |x|X)(\])/,
+      function (m0, a, b, c) { return a + (b === " " ? "x" : " ") + c; });
+    toast("편집 중인 메모입니다 — 저장하면 반영됩니다");
+    return true;
+  }
+  function memoRightRefresh(form) {
+    /* 목록에서 끝낸 메모가 우측에 열려 있으면 다시 읽는다 — 안 그러면 상자가 옛
+       글을 쥐고 있다가 다음 저장에서 충돌한다. */
+    var ed = memoSameOpen(form);
+    if (ed) load(ed.getAttribute("data-url"), "right", false).catch(function () {});
+  }
+  function memoToggleKey() {
+    /* x — 목록 커서 행의 체크. 없으면 열려 있는 메모의 [끝냄]·[다시 열기]. */
+    var rows = navRows(), i = curIdx(rows);
+    var btn = (i >= 0 && rows[i].classList.contains("memorow"))
+      ? rows[i].querySelector("form.mtog button") : null;
+    if (!btn) btn = right.querySelector("form.memoedit button[value='toggle']");
+    if (!btn) return false;
+    btn.click();
+    return true;
+  }
+  document.addEventListener("click", function (e) {
+    var t = e.target;
+    if (!t || !t.closest) return;
+    if (t.closest("[data-memo-close]")) { e.preventDefault(); memoQuickClose(); return; }
+    if (memoBox && t === memoBox) { memoQuickClose(); return; }   /* 칸 바깥 */
+    if (t.closest("a.memonew") && memoBox && e.button === 0
+        && !(e.metaKey || e.ctrlKey || e.shiftKey || e.altKey)) {
+      e.preventDefault();
+      memoQuickOpen();
+      return;
+    }
+    var no = t.closest(".memono");
+    if (no) {
+      e.preventDefault();
+      var txt = no.getAttribute("data-memo-no") || "";
+      try {
+        if (navigator.clipboard) navigator.clipboard.writeText(txt).then(
+          function () { toast("번호 복사 " + txt); }, function () {});
+      } catch (err) { /* 안 되면 그대로 둔다 — 번호는 선택해 복사할 수 있다 */ }
+    }
+  });
+  /* Ctrl+Enter — 메모 저장(편집 상자·새 메모 칸). 아래 단축키 처리기는 Ctrl 조합을
+     통째로 넘기므로 따로 듣는다. */
+  document.addEventListener("keydown", function (e) {
+    if (e.key !== "Enter" || !(e.ctrlKey || e.metaKey)) return;
+    var t = e.target;
+    var form = (t && t.tagName === "TEXTAREA" && t.closest)
+      ? t.closest("form.memoedit") : null;
+    if (!form) return;
+    e.preventDefault();
+    if (form.requestSubmit) form.requestSubmit();
+    else { var b = form.querySelector("button.btn-primary"); if (b) b.click(); }
+  });
+
   /* ---- nav 뒤로(←): history.back() — popstate 가 좌우 패널을 함께 복원.
      앱 이력이 없으면(depth=0) 외부로 나가지 않고 no-op ---- */
   document.addEventListener("click", function (e) {
@@ -3430,7 +3690,8 @@ _APP_JS = r"""
        이미 받은 문서의 CSP 를 바꾸지 못해 이미지가 그대로 막힌다(조용히 안 됨). */
     if (a.classList && a.classList.contains("imgshow")) return;
     e.preventDefault();
-    if (!noteLeaveOk()) return;     /* 편집 중인 노트를 두고 떠나는가 */
+    /* 편집 중인 노트·메모를 두고 떠나는가 */
+    if (!noteLeaveOk(paneFor(new URL(href, location.origin).pathname))) return;
     if (a.classList && a.classList.contains("mrow")) a.classList.add("read");  /* 낙관적: 클릭 즉시 볼드 해제 */
     if (a.classList && a.classList.contains("aibtn")
         && href.slice(0, 8) === "/search?" && href.indexOf("ai=1") > -1) {
@@ -3470,10 +3731,19 @@ _APP_JS = r"""
      원본을 따로 실어 줄 필요가 없고, 충돌 복구로 값을 되살린 상태도 자동으로
      '미저장'이 된다. beforeunload 는 여기서도 쓰지 않는다(appwin.js 와 같은
      판단 — 신뢰할 수 없다). 그래서 창 닫기·브라우저 뒤로는 못 잡는다. */
-  function noteLeaveOk() {
+  function noteLeaveOk(pane) {
     var ta = document.querySelector("form.noteedit textarea[name='body']");
-    if (!ta || ta.value === ta.defaultValue) return true;
-    return window.confirm("저장하지 않은 노트가 있습니다 — 그대로 나갈까요?");
+    if (ta && ta.value !== ta.defaultValue)
+      return window.confirm("저장하지 않은 노트가 있습니다 — 그대로 나갈까요?");
+    /* 메모 편집 상자도 같은 규칙이다(자동 저장 없음). 다만 메모는 늘 편집 상태로
+       열려 있어서, **우측이 바뀌는 이동일 때만** 묻는다 — 왼쪽에서 탭을 옮기거나
+       다른 목록을 보는 것은 쓰던 글을 건드리지 않는다. 새 메모 칸은 #right 밖이라
+       대상이 아니다(닫아도 초안이 남는다). */
+    if (pane === "left") return true;
+    var mt = right.querySelector("form.memoedit textarea[name='body']");
+    if (mt && mt.value !== mt.defaultValue)
+      return window.confirm("저장하지 않은 메모가 있습니다 — 그대로 나갈까요?");
+    return true;
   }
 
   /* ---- 벤토 타일: 링크 있는 타일은 통째로 클릭(2026-08-11 사용자 확정) ----
@@ -3483,7 +3753,7 @@ _APP_JS = r"""
   function tileGo(t) {
     var href = t.getAttribute("data-href") || "";
     if (href.charAt(0) !== "/" || href.slice(0, 2) === "//") return;
-    if (!noteLeaveOk()) return;
+    if (!noteLeaveOk(paneFor(new URL(href, location.origin).pathname))) return;
     load(href).catch(function () { location.href = href; });
   }
   document.addEventListener("click", function (e) {
@@ -3521,6 +3791,8 @@ _APP_JS = r"""
     if (action.charAt(0) !== "/") return;
     var method = (form.getAttribute("method") || "get").toLowerCase();
     e.preventDefault();
+    /* 새 메모 칸 — 화면을 바꾸지 않는 별도 경로(위 메모 블록) */
+    if (form.closest && form.closest("#memoquick")) { memoQuickSave(form); return; }
     /* 분석 대화 삭제 — 문답 전체가 지워지므로 한 번 확인. 열려 있던 대화를
        지우면 우측도 비운다(주소의 ?id= 는 inject 가 갈아끼우기 전에 읽는다) */
     var delAsk = form.classList && form.classList.contains("askdel");
@@ -3535,13 +3807,31 @@ _APP_JS = r"""
        stash 는 충돌로 되돌아왔을 때 되살릴 내 원고다 — 서버는 파일을 지키느라
        파일의 현재 내용을 그려 주므로, 안 챙기면 내가 친 글이 사라진다. */
     var noteForm = form.classList && form.classList.contains("noteedit");
+    /* 메모 편집 상자(2026-11-18) — 삭제는 한 번 묻고, 빈 글은 저장하지 않는다
+       (노트와 달리 '비우고 저장 = 삭제'가 아니다 — [삭제]가 따로 있다).
+       mtog 는 목록·회고의 체크 폼이다: 떠나는 동작이 아니라서 이탈 확인을 안 탄다. */
+    var memoForm = form.classList && form.classList.contains("memoedit");
+    var memoTog = form.classList && form.classList.contains("mtog");
     var stash = null;
     if (noteForm) {
       var nta = form.querySelector("textarea[name='body']");
       stash = nta ? nta.value : "";
       if (!stash.trim() && !window.confirm(
           "본문이 비었습니다 — 저장하면 노트 파일이 삭제됩니다. 계속할까요?")) return;
-    } else if (!noteLeaveOk()) {
+    } else if (memoForm) {
+      var mta = form.querySelector("textarea[name='body']");
+      stash = mta ? mta.value : "";
+      var mact = (e.submitter && e.submitter.name === "act") ? e.submitter.value : "";
+      if (mact === "delete") {
+        if (!window.confirm(
+            "이 메모를 삭제할까요? 파일이 지워지고 되돌릴 수 없습니다.")) return;
+      } else if (!stash.trim()) {
+        toast("빈 메모는 저장하지 않습니다");
+        return;
+      }
+    } else if (memoTog) {
+      if (memoTogLocal(form)) return;
+    } else if (!noteLeaveOk(method === "get" ? paneFor(action.split("?")[0]) : null)) {
       return;
     }
     var btns = form.querySelectorAll("button");
@@ -3552,6 +3842,12 @@ _APP_JS = r"""
         else btns[i].removeAttribute("aria-busy");
       }
     }
+    /* 보낼 값은 버튼을 잠그기 **전에** 만든다. 잠긴(disabled) 버튼은 폼 데이터에서
+       빠진다 — 눌린 버튼(e.submitter)도 예외가 아니라, 잠근 뒤에 만들면 그 버튼의
+       name/value 가 실리지 않는다(2026-11-18 실제 브라우저에서 확인: 메모의
+       [끝냄]이 그냥 저장이 됐다. 노트 편집기의 [외부 편집기]도 같은 길이었다). */
+    var payload = method === "get" ? null
+      : new URLSearchParams(new FormData(form, e.submitter));
     setDisabled(true);                       /* 이중 제출 방지 */
     var done = function () { setDisabled(false); };
     if (method === "get") {
@@ -3566,7 +3862,7 @@ _APP_JS = r"""
       /* 서브미터를 넘긴다 — 노트 편집기의 '저장'과 '외부 편집기'처럼 버튼으로
          갈리는 폼이 성립하려면 눌린 버튼의 name/value 가 실려야 한다
          (2026-08-11). e.submitter 를 모르는 구형 브라우저면 종전과 같다. */
-      body: new URLSearchParams(new FormData(form, e.submitter)),
+      body: payload,
       headers: { "X-Requested-With": "fetch" },
     }).then(function (res) {
       return res.text().then(function (html) {
@@ -3586,9 +3882,14 @@ _APP_JS = r"""
            그렸다 — 내가 친 원고를 되살린다. 사람이 쓴 글을 버리지 않는다. */
         if (stash !== null) {
           var re = document.querySelector(
-            "form.noteedit[data-conflict='1'] textarea[name='body']");
+            "form.noteedit[data-conflict='1'] textarea[name='body'], "
+            + "form.memoedit[data-conflict='1'] textarea[name='body']");
           if (re) re.value = stash;
         }
+        /* 메모를 고쳤으면 왼쪽(목록·회고의 '내 할 일')도 따라온다. 목록에서
+           끝냈으면 우측에 열린 같은 메모를 다시 읽는다. */
+        if (memoForm || action === "/memo/number") memoLeftRefresh();
+        if (memoTog) memoRightRefresh(form);
         if (delOpen) load("/ask", "right", false)
           .then(function () { replacePaneUrl("right", "/ask"); })
           .catch(function () {});  /* 지운 대화록 비움 */
@@ -3661,7 +3962,7 @@ _APP_JS = r"""
        display:none(접힘 포함) 조상 아래에서 null. */
     if (!left) return [];
     return Array.prototype.slice.call(
-      left.querySelectorAll(".mrow, .item, .digest"))
+      left.querySelectorAll(".mrow, .item, .digest, .memorow"))
       .filter(function (r) { return r.offsetParent !== null; });
   }
   function curIdx(rows) {
@@ -3824,6 +4125,7 @@ _APP_JS = r"""
     if (e.ctrlKey || e.metaKey || e.altKey) return;
     var t = e.target;
     if (e.key === "Escape") {  /* 입력란 탈출('/' 의 짝) — 그 외 Esc 는 무동작 */
+      if (memoQuickClose()) { e.preventDefault(); return; }       /* 새 메모 칸이 맨 먼저 */
       if (selBtn) { hideSelBtn(); e.preventDefault(); return; }   /* 선택 버튼 먼저 닫는다 */
       if (t && (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.isContentEditable)) {
         t.blur(); e.preventDefault();
@@ -3834,6 +4136,7 @@ _APP_JS = r"""
     }
     if (t && (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.isContentEditable))
       return;                  /* 입력 중엔 개입 안 함 */
+    if (memoBox && !memoBox.hidden) return;   /* 새 메모 칸이 열려 있으면 아래 화면은 쉰다 */
     /* 선택 검색 버튼이 떠 있는 동안은 그쪽이 키를 갖는다. 이 가드가 없으면
        본문을 골라 놓고 Space 를 누르는 순간 읽기 창이 넘어간다(선택은 포커스가
        아니라 위의 입력란 가드에 안 걸린다). */
@@ -3875,6 +4178,10 @@ _APP_JS = r"""
       if (msgNav(1)) e.preventDefault();
     } else if (k === "p") {        /* 스레드 안 이전(최신) 메일 */
       if (msgNav(-1)) e.preventDefault();
+    } else if (k === "m" || k === "ㅡ") {   /* 새 메모 칸 — 한글 자판 상태여도 */
+      if (memoQuickOpen()) e.preventDefault();
+    } else if (k === "x" || k === "ㅌ") {   /* 메모 끝냄 · 다시 열기 */
+      if (memoToggleKey()) e.preventDefault();
     }
   });
 
@@ -3882,7 +4189,8 @@ _APP_JS = r"""
      focusRow 의 합성 클릭(isTrusted=false)은 무시해 키보드 커서를 덮지 않는다. */
   document.addEventListener("click", function (e) {
     if (!e.isTrusted || !left) return;
-    var row = e.target.closest ? e.target.closest(".mrow, .item, .digest") : null;
+    var row = e.target.closest
+      ? e.target.closest(".mrow, .item, .digest, .memorow") : null;
     if (!row || !left.contains(row)) return;
     var rows = navRows();
     for (var i = 0; i < rows.length; i++) rows[i].classList.remove("kbd");
@@ -3940,7 +4248,8 @@ _APP_JS = r"""
   var initialPane = paneFor(location.pathname);
   leftCur = (initialPane === "left")
     ? initialUrl
-    : (/^\/thread\/\d+/.test(location.pathname) ? "/threads" : "/ask");
+    : (/^\/memo\//.test(location.pathname) ? "/records?tab=memo"
+       : (/^\/thread\/\d+/.test(location.pathname) ? "/threads" : "/ask"));
   leftLbl = screenLabel(leftCur);   /* 스택은 비어 있다 — '← …'는 서버 기본값 */
   applyBriefFold(document);         /* 서버가 그린 첫 화면에도 기억값을 적용 */
     /* 우측 페이지의 좌측 기본은 분석 이력(서버 _panes 와 동일) — 홈(/)=분석 */
@@ -6733,7 +7042,7 @@ def render_search(store, cfg, qs, today: str) -> str:
     # 필터 옵션이 처음부터 보이게 한다.
     rows = store.search(effective, limit=50) if effective else []
     # 내 노트도 함께 찾는다(2026-08-11) — 파일이 바뀌었을 수 있어 색인부터 갱신.
-    nrows, krows = [], []
+    nrows, krows, mrows = [], [], []
     if effective:
         from . import knowledge as knowledge_mod
         from . import notes as notes_mod
@@ -6741,6 +7050,8 @@ def render_search(store, cfg, qs, today: str) -> str:
         nrows = store.search_notes(effective)
         knowledge_mod.reindex(cfg, store)
         krows = store.search_knowledge(effective)
+        _memo_sync(store, cfg)
+        mrows = store.search_memos(effective, limit=10)
     # 선택 검색(본문에서 드래그해 온 질의) — 읽고 있던 그 메일은 결과에서 뺀다.
     # 안 빼면 **1등이 자기 자신**이라 첫 줄이 늘 방금 읽던 문장이 된다(실측).
     ex = _int_or_none((qs.get("exclude") or [""])[0])
@@ -6785,7 +7096,14 @@ def render_search(store, cfg, qs, today: str) -> str:
                        f"<a class='aibtn' href='/search?ai=1&q={enc}'>"
                        "AI로 다시 찾기</a></div>")
         _mq = search_mod.parse_query(effective)
-        if _mq.mid is not None:                 # `#번호` — 무엇으로 풀렸는지 밝힌다
+        if _mq.mid is not None and is_memo_id(_mq.mid):
+            # 99번 칸 번호는 메모다 — 메일에서는 나올 수 없는 번호라 여기로 푼다.
+            mr = store.memo_by_no(_mq.mid)
+            out.append("<p class='dim'>" + (
+                f"메모 <a class='mno' href='/memo/{_mq.mid}'>#{_mq.mid}</a> · "
+                f"{esc(mr['title'])}" if mr else f"메모 <b>#{_mq.mid}</b> 없음")
+                + "</p>")
+        elif _mq.mid is not None:               # `#번호` — 무엇으로 풀렸는지 밝힌다
             out.append(_mid_note(store, _mq.mid, rows))
         out.append(f"<p class='dim'>{len(rows)}건</p>")
         out.append(_search_facets(rows, effective))
@@ -6827,7 +7145,17 @@ def render_search(store, cfg, qs, today: str) -> str:
                 doc = f"/records?tab=knowledge&doc={_q(k['path'])}"
                 out.append(f"<div class='item'>📄 <a href='{doc}'>"
                            f"{esc(k['title'])}</a>{tlink}{snip}</div>")
-        if not rows and not nrows and not krows:
+        if mrows:
+            # 메모 — 메일에 묶이지 않는 내 기록(파일이 원본). 노트·지식처럼 절을 나눈다
+            out.append(f"<h2>메모 ({len(mrows)})</h2>")
+            for m in mrows:
+                snip = (f"<div class='snip'>{_snip_html(m['snippet'])}</div>"
+                        if m["snippet"] else "")
+                ref = (f" <a class='mno' href='/memo/{m['no']}'>#{m['no']}</a>"
+                       if m["no"] else "")
+                out.append(f"<div class='item'>🗒 <a href='{_memo_href(m)}'>"
+                           f"{esc(m['title'])}</a>{ref}{snip}</div>")
+        if not rows and not nrows and not krows and not mrows:
             out.append("<p class='empty'>결과 없음</p>")
     return "\n".join(out)
 
@@ -6910,11 +7238,18 @@ def render_daily(cfg, day: str, today: str | None = None, store=None) -> str:
            "<div class='actions'>" + _review_button_forms(day) + "</div>"]
     if store is not None:
         out.append(_knowledge_cards(store, day))
+    # 내 할 일(메모) — 오늘 화면에만. 회고 파일이 아니라 지금의 메모를 읽는다.
+    memo_card = (_memo_daily_card(store, cfg, day)
+                 if store is not None and today is not None and day == today
+                 else "")
     if md is None:
+        if memo_card:
+            out.append("<div class='daily'>" + memo_card + "</div>")
         out.append("<p class='empty'>해당 날짜에 저장된 리뷰가 없습니다.</p>")
     else:
         back = f"/records?tab=daily&date={_q(day)}"
-        out.append(_md_to_html(md, back, _done_set(store), cards=_cards(cfg)))
+        out.append(_md_to_html(md, back, _done_set(store), cards=_cards(cfg),
+                               head=memo_card))
         out.append(_done_fold(store, back))
     # 이 회고를 만드는 데 든 AI 콜 — 보관분(마지막 AI 실행)이라 완료 flash 가
     # 사라진 뒤에도, 다른 날과 비교할 때도 남아 있다. 결정론 회고·옛 회고·
@@ -8421,6 +8756,19 @@ def _bento_home(store, cfg, today: str) -> str:
              "여기에 채워집니다. 지난 회고는 기록에서 볼 수 있어요.</div>",
              "오늘의 회고", link=daily_link, cls="empty")
 
+    # 할 일(메모) — 숫자와 기한 지난 건수, 그리고 맨 앞 세 건. 메모를 한 번도 안
+    # 써도 타일은 둔다: m 으로 적는 자리가 있다는 것을 첫 화면이 알려 준다.
+    _memo_sync(store, cfg)
+    mrows = store.memo_rows()
+    mcnt = memo_mod.counts(mrows, today)
+    tile(small, f"<div class='bnum'>{mcnt['todo']}"
+         + (f"<span class='sub'>기한 지남 {mcnt['late']}</span>"
+            if mcnt["late"] else "") + "</div>"
+         + ("".join(f"<div class='brow bdectitle'>{esc(r['title'])}</div>"
+                    for r in memo_mod.todos(mrows, today)[:3])
+            or "<div class='dim'>m 을 눌러 적습니다</div>"),
+         "할 일", link=_MEMO_LIST)
+
     kn = store.knowledge_all()
     pend = len(store.knowledge_candidates())
     # 최근 지식 미리보기 — 숫자만으로는 무엇이 쌓였는지 알 수 없다.
@@ -8449,7 +8797,7 @@ def _bento_home(store, cfg, today: str) -> str:
     out = []
     for (cls, attrs, html), sp in zip(big, spans):
         out.append(f"<div class='btile s{sp} {cls}'{attrs}>{html}</div>")
-    sspan = 4 if len(small) == 3 else (6 if len(small) == 2 else 12)
+    sspan = {4: 3, 3: 4, 2: 6}.get(len(small), 12)
     for cls, attrs, html in small:
         out.append(f"<div class='btile mini s{sspan} {cls}'{attrs}>{html}</div>")
     return "<div class='bhome'>" + "".join(out) + "</div>" if out else ""
@@ -8721,15 +9069,21 @@ def _render_knowledge_doc(store, cfg, path_str: str) -> str:
 
 
 def render_records(store, cfg, qs, today: str) -> str:
-    """기억 페이지 — 탭: 일간 회고 | 주간 보고 | 지식. (장기기억 탭은 2026-08-14
-    폐지 — 활용도가 낮아 사용자가 제거를 확정했고, 영구 기억은 vault/knowledge
-    의 암묵지 md 가 맡는다. 구 북마크 ?tab=decisions 는 일간으로 강등.)"""
+    """기억 페이지 — 탭: 일간 회고 | 주간 보고 | 메모 | 지식. (장기기억 탭은
+    2026-08-14 폐지 — 활용도가 낮아 사용자가 제거를 확정했고, 영구 기억은
+    vault/knowledge 의 암묵지 md 가 맡는다. 구 북마크 ?tab=decisions 는 일간으로 강등.)
+
+    **기억 = vault 에 쌓인 것**이다. 메모를 상단 메뉴가 아니라 여기 둔 이유
+    (2026-11-18 사용자 확정): 메모(바로 적은 것) · 지식(승인한 것) · 앞으로 올 위키
+    (주제로 엮은 것)는 가공된 정도만 다른 같은 계열이라 나란히 둔다 — 탭 순서도 그
+    순서다. 할 일 전체 목록까지 한 번 더 누르게 된 대신, 기억을 누르면 먼저 열리는
+    오늘 회고의 맨 위에 '내 할 일'이 있고 `m` 은 어느 화면에서든 듣는다."""
     tab = (qs.get("tab") or ["daily"])[0]
-    if tab not in ("daily", "weekly", "knowledge"):
+    if tab not in ("daily", "weekly", "memo", "knowledge"):
         tab = "daily"
     tabs = []
     for key, label in (("daily", "일간 회고"), ("weekly", "주간 보고"),
-                       ("knowledge", "지식")):
+                       ("memo", "메모"), ("knowledge", "지식")):
         if key == tab:
             tabs.append(f"<b>{esc(label)}</b>")
         else:
@@ -8738,6 +9092,8 @@ def render_records(store, cfg, qs, today: str) -> str:
            + " · ".join(tabs) + "</span></div>")
     if tab == "knowledge":
         return bar + render_knowledge_page(store, cfg, qs)
+    if tab == "memo":
+        return bar + render_memo_list(store, cfg, qs, today)
     if tab == "weekly":
         with _weekly_lock:
             running = _weekly_job["running"]
@@ -8748,6 +9104,436 @@ def render_records(store, cfg, qs, today: str) -> str:
     if day == today:                     # 오늘 데일리 조회 시에도 배경 자동 생성
         _maybe_auto_review(cfg, today, _max_rowid(store))
     return bar + render_daily(cfg, day, today, store)
+
+
+# ─────────────────────────────────────────────────── 메모 (2026-11-18)
+# 메일에 묶이지 않는 내 기록과 할 일. 원본은 vault/memo/*.md(memo 모듈 머리말).
+# 좌측 = 목록(기억 › 메모, /records?tab=memo), 우측 = 편집 상자(/memo/<번호>) —
+# 메일함·스레드와 같은 감각. 메모 한 건의 주소는 번호 그 자체라 메뉴 위치와 무관하다.
+
+_MEMO_KINDS = (("todo", "할 일"), ("ref", "참고"), ("done", "끝남"))
+_MEMO_LIST = "/records?tab=memo"       # 목록 주소 — 종류는 &kind=, 검색은 &q=
+_MEMO_DONE_MAX = 200      # 끝남 탭에 그리는 상한 — 넘는 것은 검색으로 찾는다
+_MEMO_BLANK = ("<p class='empty'>왼쪽에서 메모를 고르거나, "
+               "<b>m</b> 을 눌러 새 메모를 쓰세요.</p>")
+
+
+def _memo_sync(store, cfg) -> None:
+    """메모 색인을 파일에 맞춘다 — 메모를 그리는 화면이 그리기 전에 부른다.
+
+    바뀐 파일이 없으면 읽기뿐이다(memo.reindex). 밖에서 고친 파일이 있어 쓸 것이
+    생겼는데 sync 가 쓰기를 쥐고 있으면 **이번에는 넘어간다** — 색인은 다음에
+    그릴 때 다시 맞추면 되는 미러이고, 첫 화면·회고가 그걸 기다리다 멈추면 안
+    된다(mark_thread_read 와 같은 판단 — CLAUDE.md 9)."""
+    (prev,) = store.db.execute("PRAGMA busy_timeout").fetchone()
+    store.db.execute(f"PRAGMA busy_timeout={Store.READ_MARK_WAIT_MS}")
+    try:
+        memo_mod.reindex(cfg, store)
+    except sqlite3.OperationalError as e:
+        if "lock" not in str(e).lower() and "busy" not in str(e).lower():
+            raise
+        store.db.rollback()
+    finally:
+        store.db.execute(f"PRAGMA busy_timeout={int(prev)}")
+
+
+def _mmdd(iso: str) -> str:
+    """YYYY-MM-DD → MM/DD."""
+    return f"{iso[5:7]}/{iso[8:10]}" if len(iso or "") >= 10 else ""
+
+
+def _memo_href(row) -> str:
+    """메모 한 건의 주소 — 번호가 있으면 /memo/<번호>, 없으면 파일 이름으로."""
+    if row["no"]:
+        return f"/memo/{row['no']}"
+    return "/memo/file?f=" + _q(Path(row["path"]).name)
+
+
+def _memo_row(row, today: str, back: str, sub: str | None = None) -> str:
+    """목록 한 줄 — 체크 + 제목 + 오른쪽 날짜 하나 + 본문 첫 줄.
+
+    오른쪽 날짜는 종류마다 하나다: 할 일 = 기한, 참고 = 고친 날, 끝남 = 끝낸 날.
+    체크는 폼이다(목록에서 바로 끝낸다) — 링크 안에 버튼을 넣을 수 없어 행을
+    <a> 로 감싸지 않고 체크와 링크를 나란히 둔다."""
+    name = Path(row["path"]).name
+    kind = row["kind"]
+    mt = datetime.fromtimestamp(row["mtime"]).strftime("%m/%d")
+    if kind == "ref":
+        chk = "<span class='mchk' aria-hidden='true'>·</span>"
+        when = f"<span class='mdate' title='고친 날'>고침 {mt}</span>"
+    else:
+        done = kind == "done"
+        tip = "다시 열기 (x)" if done else "끝냄 (x)"
+        chk = ("<form class='mtog' method='post' action='/memo/toggle'>"
+               f"<input type='hidden' name='f' value='{esc(name)}'>"
+               f"<input type='hidden' name='back' value='{esc(back)}'>"
+               f"<button class='mchk' title='{tip}' aria-label='{tip}'>"
+               f"{'✓' if done else ''}</button></form>")
+        if done:
+            when = f"<span class='mdate' title='끝낸 날'>끝냄 {mt}</span>"
+        elif row["due"]:
+            late = memo_mod.days_between(row["due"], today)
+            if late > 0:
+                when = (f"<span class='mdate late' title='기한 지남 — {late}일'>"
+                        f"⚠ {_mmdd(row['due'])}</span>")
+            elif late == 0:
+                when = "<span class='mdate' title='기한'><b>오늘</b></span>"
+            else:
+                when = f"<span class='mdate' title='기한'>{_mmdd(row['due'])}</span>"
+        else:
+            when = ""
+    if sub is None:
+        sub = esc(memo_mod.snippet(row["content"]))
+    nono = ("" if row["no"] else
+            " <span class='rbadge' title='번호가 없어 #번호로 가리킬 수 없습니다'>"
+            "번호 없음</span>")
+    return (f"<div class='memorow{' done' if kind == 'done' else ''}'>{chk}"
+            f"<a class='mlink' href='{_memo_href(row)}'>"
+            f"<span class='mtop'><span class='mfrom'>{esc(row['title'])}{nono}</span>"
+            f"{when}</span><span class='msubj'>{sub}</span></a></div>")
+
+
+def render_memo_list(store, cfg, qs, today: str) -> str:
+    """메모 목록(좌측, 기억 › 메모) — 종류 칸: 할 일 | 참고 | 끝남, 그리고 메모 검색.
+
+    제목(h1)이 없다 — 바로 위 기억 탭 줄의 굵은 '메모'가 제목이다. 종류는 `kind`
+    로 받는다(`tab` 은 기억의 탭이 쓴다).
+
+    할 일은 기한으로 묶는다(기한 지남 · 이번 주 · 그 뒤 · 기한 없음) — 메일함이
+    날짜로 묶는 것과 같은 머리(.dghead)다."""
+    _memo_sync(store, cfg)
+    rows = store.memo_rows()
+    cnt = memo_mod.counts(rows, today)
+    tab = (qs.get("kind") or ["todo"])[0]
+    if tab not in dict(_MEMO_KINDS):
+        tab = "todo"
+    q = (qs.get("q") or [""])[0].strip()
+    tabs = []
+    for key, label in _MEMO_KINDS:
+        lbl = f"{label} {cnt[key]}"
+        if key == tab and not q:
+            tabs.append(f"<b class='facet on'>{esc(lbl)}</b>")
+        else:
+            tabs.append(f"<a class='facet' href='{_MEMO_LIST}&kind={key}'>"
+                        f"{esc(lbl)}</a>")
+    help = ("<span class='kbdhelp' tabindex='0' aria-label='키보드 단축키'>ⓘ"
+            "<span class='kbdpop'><b>키보드</b><br>m 새 메모 (어느 화면에서든)<br>"
+            "j / k 목록 이동<br>x 끝냄 · 다시 열기<br>Ctrl+Enter 저장<br>"
+            "Esc 새 메모 칸 닫기</span></span>")
+    out = ["<div class='memokinds'>" + "".join(tabs) + help + "</div>",
+           "<div class='memohead'>"
+           "<a class='btn btn-primary memonew' href='/memo/new'>＋ 새 메모 (m)</a>"
+           "<form method='get' action='/records'>"
+           "<input type='hidden' name='tab' value='memo'>"
+           f"<input type='hidden' name='kind' value='{tab}'>"
+           f"<input type='search' name='q' value='{esc(q)}' "
+           "placeholder='메모 검색' aria-label='메모 검색'></form></div>"]
+    back = f"{_MEMO_LIST}&kind={tab}" + (f"&q={_q(q)}" if q else "")
+    if q:
+        hits = store.search_memos(q, limit=50)
+        out.append(f"<div class='dghead'>검색 결과 {len(hits)}건 · "
+                   f"<a href='{_MEMO_LIST}&kind={tab}'>전체 목록</a></div>")
+        if not hits:
+            out.append("<p class='empty'>일치하는 메모가 없습니다.</p>")
+        for h in hits:
+            out.append(_memo_row(h, today, back,
+                                 sub=f"{esc(memo_mod.KINDS[h['kind']])} · "
+                                     + _snip_html(h["snippet"])))
+        return "\n".join(out)
+    if tab == "todo":
+        todo = memo_mod.todos(rows, today)
+        if not todo:
+            out.append("<p class='empty'>열린 할 일이 없습니다 — "
+                       "<b>m</b> 을 눌러 적어 두세요.</p>")
+        group = None
+        for r in todo:
+            g = memo_mod.due_group(r["due"], today)
+            if g != group:
+                group = g
+                out.append(f"<div class='dghead'>{esc(g)}</div>")
+            out.append(_memo_row(r, today, back))
+        return "\n".join(out)
+    picked = [r for r in rows if r["kind"] == tab]      # memo_rows 는 고친 순
+    if not picked:
+        out.append("<p class='empty'>" + (
+            "참고 메모가 없습니다 — 첫 줄을 <code>[ ]</code> 없이 쓰면 참고 메모입니다."
+            if tab == "ref" else "끝낸 할 일이 없습니다.") + "</p>")
+    out += [_memo_row(r, today, back) for r in picked[:_MEMO_DONE_MAX]]
+    if len(picked) > _MEMO_DONE_MAX:
+        out.append(f"<p class='dim'>… 그 전 {len(picked) - _MEMO_DONE_MAX}건은 "
+                   "메모 검색으로 찾을 수 있습니다.</p>")
+    return "\n".join(out)
+
+
+def _memo_editor(cfg, path: Path, today: str, conflict: bool = False) -> str:
+    """메모 한 건(우측) — **바로 편집 상자로 연다.**
+
+    스레드 노트는 보기 → [편집] 두 단계인데 메모는 한 줄 덧붙이는 일이 잦아 한
+    단계로 했다. 상자의 글이 곧 파일이다: 제목(첫 줄)·`[ ]`·`기한:` 줄이 그대로
+    보이고, 따로 뺀 입력란이 없다. 자동 저장은 없다(노트와 같은 규칙)."""
+    try:
+        text = memo_mod.read(path)
+        base = path.stat().st_mtime
+    except (OSError, UnicodeDecodeError):
+        return _MEMO_BLANK
+    meta = memo_mod.parse(text)
+    no = memo_mod.owner_no(cfg, path)
+    name = path.name
+    url = f"/memo/{no}" if no else "/memo/file?f=" + _q(name)
+    bits = []
+    if no:
+        bits.append(f"<button type='button' class='memono' data-memo-no='#{no}' "
+                    f"title='누르면 번호를 복사합니다'>#{no}</button>")
+    else:
+        bits.append("번호 없음<form method='post' action='/memo/number'>"
+                    f"<input type='hidden' name='f' value='{esc(name)}'>"
+                    "<button title='파일 이름 앞에 번호를 붙입니다 — 그래야 다른 글에서 "
+                    "#번호로 가리킬 수 있습니다'>번호 매기기</button></form>")
+    bits.append(memo_mod.KINDS[meta["kind"]])
+    if meta["kind"] == "todo" and meta["due"]:
+        late = memo_mod.days_between(meta["due"], today)
+        if late > 0:
+            bits.append(f"<span class='late'>기한 {_mmdd(meta['due'])} ⚠ "
+                        f"{late}일 지남</span>")
+        elif late == 0:
+            bits.append("기한 <b>오늘</b>")
+        else:
+            bits.append(f"기한 {_mmdd(meta['due'])}")
+    made = memo_mod.memo_day(no) if no else ""
+    if made:
+        bits.append(f"만든 날 {_mmdd(made)}")
+    bits.append("고친 날 " + datetime.fromtimestamp(base).strftime("%m/%d"))
+    warn = ("<div class='memoconf'>다른 곳에서 이 메모가 바뀌었습니다 — 덮어쓰지 "
+            "않았습니다. 아래 글을 그대로 저장하면 그 변경을 대신합니다.</div>"
+            if conflict else "")
+    dc = " data-conflict='1'" if conflict else ""
+    rows = max(12, min(40, text.count("\n") + 5))
+    tog = {"todo": "끝냄 ✓", "done": "다시 열기"}.get(meta["kind"])
+    togbtn = (f"<button name='act' value='toggle' class='btn' "
+              f"title='저장하면서 첫 줄의 체크를 바꿉니다 (x)'>{tog}</button>"
+              if tog else "")
+    # base(파일 수정 시각)는 충돌 검사용이자 우리 폼이라는 표식이다(노트와 같다).
+    return (f"<h1>{esc(meta['title'])}</h1>"
+            # div 다 — 번호 없는 메모는 이 줄에 [번호 매기기] 폼이 들어가는데, p 안의
+            # form 은 브라우저가 p 를 먼저 닫아 줄이 셋으로 쪼개진다(캡처로 확인).
+            f"<div class='memometa'>{' · '.join(bits)}</div>{warn}"
+            f"<form class='memoedit' method='post' action='/memo/save'{dc} "
+            f"data-url='{esc(url)}'>"
+            f"<input type='hidden' name='f' value='{esc(name)}'>"
+            f"<input type='hidden' name='base' value='{base!r}'>"
+            f"<textarea name='body' rows='{rows}' spellcheck='false'>"
+            f"{esc(text)}</textarea>"
+            "<p class='notehint'>첫 줄이 제목입니다 · <code>[ ]</code>로 시작하면 "
+            "할 일, 없으면 참고 메모 · <code>기한: 2026-11-25</code> 줄을 쓰면 "
+            "기한이 됩니다</p>"
+            "<div class='noterow'>"
+            "<button class='btn-primary'>저장<kbd>Ctrl+Enter</kbd></button>"
+            f"{togbtn}"
+            "<button name='act' value='ext' class='btn-quiet' "
+            "title='저장하고 기본 연결 프로그램으로 엽니다'>외부 편집기 ✎</button>"
+            "<span class='sp'></span>"
+            "<button name='act' value='delete' class='danger' "
+            "title='파일을 지웁니다 — 한 번 더 묻습니다'>삭제</button>"
+            "</div></form>"
+            f"<p class='dim'>{esc(str(path))}</p>")
+
+
+def render_memo(store, cfg, key: str, qs, today: str) -> str:
+    """우측 메모 화면 — /memo/<번호> · /memo/file?f=<이름> · /memo/new · /memo/none."""
+    if key == "new":
+        return "<h1>새 메모</h1>" + _memo_new_form(False)
+    path = None
+    if key == "file":
+        path = memo_mod.path_of(cfg, (qs.get("f") or [""])[0])
+    elif key.isdigit():
+        path = memo_mod.find(cfg, int(key))
+    if path is None:
+        if key == "none":
+            return _MEMO_BLANK
+        return ("<p class='empty'>그 메모가 없습니다 — 지워졌거나 파일 이름이 "
+                "바뀌었습니다.</p>")
+    return _memo_editor(cfg, path, today,
+                        conflict=(qs.get("conflict") or [""])[0] == "1")
+
+
+def _memo_daily_card(store, cfg, today: str) -> str:
+    """오늘 회고의 '내 할 일' 절 — 열린 메모 할 일, 기한이 이른 순.
+
+    회고 파일에 쓰지 않고 **그릴 때 읽는다**: 메모는 회고가 만들어진 뒤에도
+    바뀌고(끝냄·새 메모), 파일에 박으면 다시 만들 때까지 낡은 목록이 남는다.
+    그래서 오늘 화면에만 나오고 지난 날짜의 회고에는 없다. AI 호출 0."""
+    _memo_sync(store, cfg)
+    todo = memo_mod.todos(store.memo_rows(), today)
+    if not todo:
+        return ""
+    back = f"/records?tab=daily&date={today}"
+    items = []
+    for r in todo[:review.DAILY_TOP]:
+        if r["no"]:
+            head = (f"[<a class='mno' href='/memo/{r['no']}'>#{r['no']}</a>] "
+                    f"{esc(r['title'])}")
+        else:
+            head = f"<a href='{_memo_href(r)}'>{esc(r['title'])}</a>"
+        if r["due"]:
+            late = memo_mod.days_between(r["due"], today)
+            if late > 0:
+                due = (f"기한 {_mmdd(r['due'])} <span class='warnmark'>⚠</span> "
+                       f"{late}일 지남")
+            elif late == 0:
+                due = "기한 <b>오늘</b>"
+            elif late >= -7:
+                due = f"기한 {_mmdd(r['due'])} · {-late}일 남음"
+            else:
+                due = f"기한 {_mmdd(r['due'])}"
+        else:
+            due = "기한 없음"
+        snip = smart_truncate(memo_mod.snippet(r["content"]), 90)
+        items.append(
+            f"<li>{head} — {due}"
+            "<form class='donebtn mtog' method='post' action='/memo/toggle'>"
+            f"<input type='hidden' name='f' value='{esc(Path(r['path']).name)}'>"
+            f"<input type='hidden' name='back' value='{esc(back)}'>"
+            "<button title='메모를 끝냄으로 옮깁니다'>끝냄</button></form>"
+            + (f"<br><span class='cont'><span class='snip'>{esc(snip)}</span></span>"
+               if snip else "") + "</li>")
+    more = len(todo) - len(items)
+    tail = (f"<p class='dim'>… 외 {more}건 — <a href='{_MEMO_LIST}'>"
+            "메모 탭에서 전부 보기</a></p>"
+            if more > 0 else "")
+    return ("<section class='rcard memocard'>"
+            f"<h2>내 할 일 — 메모 (열린 {len(todo)}건)</h2>"
+            "<ul>" + "".join(items) + "</ul>" + tail + "</section>")
+
+
+def _memo_back(raw: str) -> str:
+    """메모 동작 뒤 돌아갈 주소를 **다시 만든다** — 받은 문자열은 쓰지 않는다
+    (_report_back 과 같은 이유: 사용자 입력이 Location 헤더로 가면 안 된다).
+    회고에서 눌렀으면 회고로, 그 밖에는 메모 목록의 그 종류로."""
+    try:
+        u = urllib.parse.urlparse(raw or "")
+        q = urllib.parse.parse_qs(u.query)
+    except ValueError:
+        return _MEMO_LIST
+    if u.path == "/records" and (q.get("tab") or [""])[0] != "memo":
+        return _report_back(raw)
+    return _memo_list_url(q)
+
+
+def _memo_list_url(q: dict) -> str:
+    """메모 목록 주소를 조립한다 — 종류(kind)와 검색어(q)만 받아 쓴다. 옛 목록
+    주소(/memo?tab=…)의 `tab` 도 종류로 읽는다."""
+    kind = (q.get("kind") or q.get("tab") or [""])[0]
+    out = _MEMO_LIST + "&kind=" + (kind if kind in dict(_MEMO_KINDS) else "todo")
+    find = (q.get("q") or [""])[0].strip()
+    return out + (f"&q={_q(find)}" if find else "")
+
+
+def _memo_moved(qs: dict) -> str:
+    """짧은 주소 /memo(와 그 옛 꼴 /memo?tab=ref) → 기억 › 메모의 주소.
+    받은 값은 종류·검색어·msg 만, 그것도 다시 인코딩해서 싣는다."""
+    out = _memo_list_url(qs)
+    msg = (qs.get("msg") or [""])[0]
+    return out + ("&msg=" + _q(msg) if msg else "")
+
+
+def _memo_place(cfg, path: Path) -> str:
+    no = memo_mod.owner_no(cfg, path)
+    return f"/memo/{no}" if no else "/memo/file?f=" + _q(path.name)
+
+
+def _msg_url(url: str, msg: str, extra: str = "") -> str:
+    """주소에 ?msg= 를 붙인다(이미 질의가 있으면 &). extra 는 'k=v' 한 쌍."""
+    sep = "&" if "?" in url else "?"
+    return url + sep + (extra + "&" if extra else "") + "msg=" + _q(msg)
+
+
+_MEMO_GONE = "메모 파일이 없습니다 — 옮겨졌거나 지워졌습니다"
+_MEMO_FULL = ("오늘 낼 수 있는 메모 번호(999건)를 다 썼습니다 — "
+              "저장하지 못했습니다")
+
+
+def _memo_action(store, cfg, action: str, form: dict) -> str:
+    """메모 동작(POST /memo/<동작>) → 돌아갈 주소. 대상은 폼의 f(파일 이름)다 —
+    번호 없는 파일도 같은 길로 다루려고 번호가 아니라 이름으로 받는다."""
+    f = (form.get("f") or [""])[0]
+    if action == "new":
+        st, p = memo_mod.create(
+            cfg, store, (form.get("body") or [""])[0],
+            todo=bool((form.get("todo") or [""])[0]),
+            due=(form.get("due") or [""])[0])
+        if st == "empty":
+            return _msg_url("/memo/new", "빈 메모는 만들지 않았습니다")
+        if st == "full":
+            return _msg_url("/memo/new", _MEMO_FULL)
+        return _msg_url(_memo_place(cfg, p),
+                        f"메모 저장 #{memo_mod.no_of(p.name)}")
+    if action == "toggle":
+        st, _p = memo_mod.toggle(cfg, store, f)
+        msg = {"done": "끝냄", "todo": "다시 열었습니다",
+               "ref": "참고 메모는 끝낼 것이 없습니다"}.get(st, _MEMO_GONE)
+        return _msg_url(_memo_back((form.get("back") or [""])[0]), msg)
+    if action == "number":
+        st, p = memo_mod.assign_no(cfg, store, f)
+        if st == "gone":
+            return _msg_url("/memo/none", _MEMO_GONE)
+        if st == "full":
+            return _msg_url(_memo_place(cfg, p), _MEMO_FULL)
+        return _msg_url(_memo_place(cfg, p),
+                        "이미 번호가 있습니다" if st == "has"
+                        else f"번호를 매겼습니다 #{memo_mod.no_of(p.name)}")
+    if action == "save":
+        # base 는 우리 폼이라는 표식이다 — 없으면 건드리지 않는다(노트와 같다).
+        try:
+            base_mtime = float((form.get("base") or [""])[0].strip())
+        except ValueError:
+            return _msg_url("/memo/none", "잘못된 요청 — 메모를 건드리지 않았습니다")
+        cur = memo_mod.path_of(cfg, f)
+        if cur is None:
+            return _msg_url("/memo/none", _MEMO_GONE)
+        here = _memo_place(cfg, cur)
+        act = (form.get("act") or [""])[0]
+        if act == "delete":
+            # 내가 본 그 파일일 때만 지운다 — 밖에서 고친 글을 못 본 채 지우지 않는다.
+            if abs(cur.stat().st_mtime - base_mtime) > 1e-6:
+                return _msg_url(here, "다른 곳에서 메모가 바뀌었습니다 — "
+                                "지우지 않았습니다. 내용을 확인하고 다시 눌러 주세요")
+            st, _p = memo_mod.delete(cfg, store, f)
+            return _msg_url("/memo/none", f"메모 삭제: {cur.name}"
+                            if st == "deleted" else _MEMO_GONE)
+        st, _p = memo_mod.save(cfg, store, f, (form.get("body") or [""])[0],
+                               base_mtime, toggle=(act == "toggle"))
+        if st == "conflict":
+            return _msg_url(here, "다른 곳에서 메모가 바뀌었습니다 — "
+                            "덮어쓰지 않았습니다", "conflict=1")
+        if st == "empty":
+            return _msg_url(here, "빈 메모는 저장하지 않습니다 — 지우려면 "
+                            "[삭제]를 누르세요")
+        if st == "gone":
+            return _msg_url("/memo/none", _MEMO_GONE)
+        msg = "메모 저장" if st == "saved" else "바뀐 것이 없습니다"
+        if act == "toggle":
+            kind = memo_mod.parse(memo_mod.read(cur))["kind"]
+            msg = {"done": "끝냄", "todo": "다시 열었습니다"}.get(kind, msg)
+        elif act == "ext":
+            msg += (" — 외부 편집기" if _open_external(cur)
+                    else f" — 편집기 열기 실패, 직접 여세요: {cur}")
+        return _msg_url(here, msg)
+    return _msg_url(_MEMO_LIST, "알 수 없는 동작")
+
+
+def _memo_quick(store, cfg, form: dict) -> str:
+    """새 메모 칸(m)의 저장 — **보던 화면을 바꾸지 않으려고** 주소가 아니라 한 줄을
+    돌려준다: `ok<TAB>번호<TAB>제목` 또는 `err<TAB>사유`. app.js 가 토스트만 띄운다."""
+    st, p = memo_mod.create(
+        cfg, store, (form.get("body") or [""])[0],
+        todo=bool((form.get("todo") or [""])[0]),
+        due=(form.get("due") or [""])[0])
+    if st == "empty":
+        return "err\t빈 메모는 만들지 않았습니다"
+    if st == "full":
+        return "err\t" + _MEMO_FULL
+    title = " ".join(memo_mod.parse(memo_mod.read(p))["title"].split())
+    return f"ok\t{memo_mod.no_of(p.name)}\t{title}"
 
 
 # ─────────────────────────────────────────────────── 조작(POST) 동작
@@ -8939,6 +9725,9 @@ def perform_action(store, cfg, path: str, form: dict) -> str:
 
     if path == "/ask/jobs":                           # 분석 잡 생성(GET 렌더와 분리)
         return _submit_ask_job(store, cfg, form)
+
+    if len(parts) == 2 and parts[0] == "memo":        # 메모 — 새로·저장·끝냄·번호
+        return _memo_action(store, cfg, parts[1], form)
 
     if path == "/ask/delete":                         # 분석 대화 삭제(뿌리+이어묻기 전체)
         from . import ask as ask_mod
@@ -9183,6 +9972,12 @@ def route(store, cfg, path, qs, today):
         return "검색", render_search(store, cfg, qs, today), 200, "left"
     if path == "/settings":
         return "설정", render_settings(store, cfg), 200, "left"
+    if path.startswith("/memo/"):
+        # 메모 한 건은 우측(편집 상자) — 스레드와 같은 배치. 좌측 기본은 _panes.
+        # 목록은 기억의 탭이다(/records?tab=memo). 짧은 주소 /memo 는 do_GET 이
+        # 그리로 넘긴다(_memo_moved).
+        return ("메모", render_memo(store, cfg, path[len("/memo/"):], qs, today),
+                200, "right")
     if path in ("/records", "/daily"):
         # 기억(데일리·주간). /daily 는 구 메뉴 경로 — 북마크 호환 흡수.
         # 경로 /records 는 표시명 개편(기록→기억, 2026-07-17) 후에도 유지 — URL 과
@@ -9291,6 +10086,10 @@ class _Handler(BaseHTTPRequestHandler):
             return inner, _READING_HINT
         if path.startswith("/thread/"):
             return render_threads(store, self.cfg), inner
+        if path.startswith("/memo/"):
+            # app.js 의 leftCur 부트스트랩(기억 › 메모)과 짝이다 — 위 주석 참고.
+            return (render_records(store, self.cfg, {"tab": ["memo"]}, today),
+                    inner)
         # 홈(=분석)·/ask*·상태 페이지의 좌측 기본 = 분석 대화 이력
         return render_ask_list(store, cfg=self.cfg), inner
 
@@ -9369,6 +10168,15 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         frag = (qs.get("frag") or [""])[0] == "1"
+        if path == "/memo":
+            # 메모 목록은 기억의 탭이다 — 짧은 주소는 그리로 넘긴다. app.js 의 fetch 는
+            # 넘겨진 주소(res.url)로 패널과 이력을 정하므로 frag 만 달아 주면 된다.
+            loc = _memo_moved(qs)
+            self.send_response(303)
+            self.send_header("Location", _with_frag(loc) if frag else loc)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if not frag:
             # 끝난 잡의 상태 주소를 전체 페이지로 열면(새로고침·뒤로가기·JS 꺼짐의
             # meta refresh) 그 잡의 **장소**로 보낸다(2026-10-25). 상태 주소는
@@ -9511,6 +10319,14 @@ class _Handler(BaseHTTPRequestHandler):
             if tog:                                   # 목록 단축키(h)
                 token = _toggle_thread(store, self.cfg, int(tog.group(1)), tog.group(2))
                 body = token.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return                                # finally 가 store.close()
+            if path == "/memo/quick":                 # 새 메모 칸(m) — 화면 유지
+                body = _memo_quick(store, self.cfg, form).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))

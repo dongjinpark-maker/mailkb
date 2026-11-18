@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 from . import review
@@ -63,6 +63,10 @@ ASK_NOTES_TOP = 3         # 프롬프트에 실을 내 노트 상한 (직접 지
 ASK_NOTE_CHARS = 500      # 노트 한 건당 싣는 길이 — 템플릿상 요지가 앞에 온다
 ASK_KNOWLEDGE_TOP = 3     # 프롬프트에 실을 지식 상한 — 노트와 같은 결정론 선정
 ASK_KNOWLEDGE_CHARS = 600 # 지식 한 건당 싣는 길이(보강된 본문이라 노트보다 김)
+# 메모(2026-11-18) — 건수·길이는 지식의 값을 그대로 썼다. **메모로 따로 잰 숫자가
+# 아니다**(데모에서만 돌려 봤다). 메모는 길어질 수 있어 넘치면 앞·뒤를 나눠 싣는다.
+ASK_MEMO_TOP = 3          # 프롬프트에 실을 메모 상한
+ASK_MEMO_CHARS = 600      # 메모 한 건당 싣는 길이(제목 줄 제외)
 # 인용 앞뒤로 원문에서 떼어 붙일 문맥(자). 인용만으로는 조건·전제·후속이 안 보여
 # 사용자가 메일을 다시 열게 된다(2026-08-03 지적). 실측: 100 이면 조건까지 들어오고
 # 250 은 과하다. 모델이 아니라 코드가 원문을 복사하므로 환각 위험이 0 이다.
@@ -911,7 +915,8 @@ def rules_block(cfg: Config) -> str:
 
 
 def memory_for_threads(store: Store, cfg: Config, tids, query: str,
-                       deny: frozenset, notes_top: int | None = None) -> str:
+                       deny: frozenset, notes_top: int | None = None,
+                       memos: bool = False) -> str:
     """현안 브리핑(스레드·인물)에 싣는 문맥 — 내 노트 · 지식 · 사용자 지침.
 
     종전(~2026-10-24)에는 이 셋이 분석(ask)에만 실려, 사람이 스레드에 적어 둔
@@ -922,6 +927,9 @@ def memory_for_threads(store: Store, cfg: Config, tids, query: str,
     - 노트: 이 스레드들(tids)의 노트만. 다른 스레드 노트를 낱말로 끌어오지 않는다
       (브리핑은 질문이 아니라 사안 하나를 본다). notes_top 이면 최근 것부터 그만큼.
     - 지식: 이 스레드들에서 나온 지식 먼저, 남는 자리는 query(스레드 제목) 낱말 겹침.
+    - 메모: memos=True 일 때만, query 낱말이 겹치는 것. **스레드 현안 브리핑만 켠다**
+      — 인물 브리핑에는 싣지 않기로 했다(2026-11-18 사용자 확정: 굳이 지금 넣을
+      필요가 없다. 인물 브리핑은 query 가 비어 있어 고를 기준도 없다).
     - 지침: rules_block 그대로.
 
     AI 호출 0. 색인은 파일을 따라가므로 조회 전에 한 번 맞춘다(엔진과 같은 순서).
@@ -933,6 +941,10 @@ def memory_for_threads(store: Store, cfg: Config, tids, query: str,
     allow = {int(t) for t in tids}
     memory = _notes_block(store, "", deny, allow, allow_top=notes_top)
     memory += _knowledge_block(store, query, deny, link=allow)
+    if memos:
+        from . import memo as memo_mod
+        memo_mod.reindex(cfg, store)
+        memory += _memo_block(store, query)
     return memory + rules_block(cfg)
 
 
@@ -1038,6 +1050,85 @@ def _knowledge_block(store: Store, question: str, deny: frozenset,
             " — 모든 인용 근거는 정독 본문에서만]\n" + lines + "\n")
 
 
+def _memo_for_prompt(content: str, limit: int = ASK_MEMO_CHARS) -> str:
+    """메모 글 → 프롬프트용 여러 줄. 제목 줄과 `기한:` 줄은 머리 줄이 따로 말하므로
+    뺀다. 길면 **앞과 뒤를 반씩** 싣는다 — 할 일 메모는 아래로 덧붙여 가는 글이라
+    처음 적은 사정은 앞에, 가장 새 경과는 끝에 있다. 가운데는 `…(중략)…`."""
+    from . import memo as memo_mod
+    lines, seen_title = [], False
+    for ln in (content or "").splitlines():
+        s_ = " ".join(ln.split())
+        if not s_:
+            continue
+        if not seen_title:
+            seen_title = True
+            continue
+        if memo_mod._DUE_RX.match(ln):
+            continue
+        lines.append("  " + s_[:limit])
+    if sum(len(ln) + 1 for ln in lines) <= limit:
+        return "\n".join(lines)
+    half = limit // 2
+    head, tail, n = [], [], 0
+    for ln in lines:
+        if n + len(ln) + 1 > half:
+            break
+        head.append(ln)
+        n += len(ln) + 1
+    n = 0
+    for ln in reversed(lines[len(head):]):
+        if n + len(ln) + 1 > half:
+            break
+        tail.insert(0, ln)
+        n += len(ln) + 1
+    return "\n".join(head + ["  …(중략)…"] + tail)
+
+
+def _memo_block(store: Store, question: str) -> str:
+    """내 메모(vault/memo 색인) 중 관련분 — 문맥 전용 블록('' 이면 생략).
+
+    메모는 메일에 묶이지 않는 내 기록이다: 구두로 정한 것, 누가 한 말, 할 일의
+    경과처럼 **메일에 없는 사정**이 여기 있다. 지식과 같은 쓰임이되 쓰는 길이
+    가볍다(승인 절차 없이 사람이 바로 적는다).
+
+    선정은 노트·지식과 같은 결정론(AI 콜 0): 질문 낱말과 제목·본문 겹침 순 상위
+    ASK_MEMO_TOP, 겹침 0이면 싣지 않는다. 종류(할 일·참고·끝남)로 거르지 않는다 —
+    끝낸 할 일에도 '언제 받았다' 같은 사실이 남는다. 대신 종류·기한·고친 날을 머리
+    줄에 적어 모델이 낡았는지 판단하게 한다. 숨김 필터가 없다(스레드에 안 묶인다).
+
+    **1단계에서는 근거가 아니라 문맥이다.** 메모 문장은 정독 본문이 아니라서 인용해도
+    검증(_quote_ok)에서 떨어진다 — 노트·지식과 같은 계약."""
+    rows = store.memo_rows()
+    if not rows:
+        return ""
+    from . import memo as memo_mod
+    toks = _query_tokens(question)
+    scored = []
+    for r in rows:
+        if not (r["content"] or "").strip():
+            continue
+        n = _match_score(toks, (r["content"] or "").lower())
+        if n:
+            scored.append((n, r["mtime"], r))
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    picked = [r for _, _, r in scored[:ASK_MEMO_TOP]]
+    if not picked:
+        return ""
+    out = []
+    for r in picked:
+        tags = [memo_mod.KINDS.get(r["kind"], "참고")]
+        if r["kind"] == "todo" and r["due"]:
+            tags.append(f"기한 {r['due']}")
+        tags.append("고침 " + datetime.fromtimestamp(r["mtime"]).strftime("%Y-%m-%d"))
+        no = f"[#{r['no']}] " if r["no"] else ""
+        body = _memo_for_prompt(r["content"])
+        out.append(f"- {no}{r['title']} ({' · '.join(tags)})"
+                   + (f"\n{body}" if body else ""))
+    return ("\n[내 메모 — 사용자가 직접 적은 기록·할 일. 메일에 없는 사정(구두 결정 등)이"
+            " 있을 수 있고 낡았을 수도 있다(고친 날을 보라). 문맥 전용, 인용 금지"
+            " — 모든 인용 근거는 정독 본문에서만]\n" + "\n".join(out) + "\n")
+
+
 def context_text(store: Store, cfg: Config, question: str) -> str:
     """`ask --context` — 엔진이 이 질문에 실을 결정론 문맥을 **같은 함수**로 보여 준다.
 
@@ -1053,9 +1144,11 @@ def context_text(store: Store, cfg: Config, question: str) -> str:
     **왜 비었는지**(경로·색인 건수)를 말한다 — 그게 `<home>` 혼란의 실제 해법이다.
     """
     from . import knowledge as knowledge_mod
+    from . import memo as memo_mod
     from . import notes as notes_mod
     notes_mod.reindex(cfg, store)
     knowledge_mod.reindex(cfg, store)
+    memo_mod.reindex(cfg, store)
     deny = store.hidden_thread_ids()
     q = (question or "").strip()
     out: list[str] = []
@@ -1077,6 +1170,7 @@ def context_text(store: Store, cfg: Config, question: str) -> str:
         tids = [int(t) for t in (r["threads"] or "").split(";") if t.strip()]
         if not (tids and all(t in deny for t in tids)):
             n_know += 1
+    n_memo = len(store.memo_rows())
     if q:
         notes = _notes_block(store, q, deny).strip()
         know = _knowledge_block(store, q, deny).strip()
@@ -1084,8 +1178,13 @@ def context_text(store: Store, cfg: Config, question: str) -> str:
         why_k = "지식 없음" if not n_know else f"색인 {n_know}건 — 질문과 겹치는 말이 없다"
         out.append(notes or f"[내 노트]  관련 0건 ({why_n})")
         out.append(know or f"[지식]  관련 0건 ({why_k})")
+        memos = _memo_block(store, q).strip()
+        why_m = ("메모 없음" if not n_memo
+                 else f"색인 {n_memo}건 — 질문과 겹치는 말이 없다")
+        out.append(memos or f"[내 메모]  관련 0건 ({why_m})")
     else:
-        out.append(f"[내 노트]  색인 {n_notes}건 · [지식]  색인 {n_know}건 — "
+        out.append(f"[내 노트]  색인 {n_notes}건 · [지식]  색인 {n_know}건 · "
+                   f"[내 메모]  색인 {n_memo}건 — "
                    "질문을 주면 관련분을 고른다: ask --context '<질문>'")
     return "\n\n".join(out)
 
@@ -1182,11 +1281,14 @@ def ask(store: Store, cfg: Config, question: str, backend: str | None = None,
     # 검증기의 "외부 지식과 상식은 쓰지 않는다" 계약을 문맥 주입이 흔들면 안 된다.
     # 색인은 파일을 따라가므로 조회 전에 한 번 맞춘다.
     from . import knowledge as knowledge_mod
+    from . import memo as memo_mod
     from . import notes as notes_mod
     notes_mod.reindex(cfg, store)
     knowledge_mod.reindex(cfg, store)
+    memo_mod.reindex(cfg, store)
     memory = _notes_block(store, q, deny, allow_tids)
     memory += _knowledge_block(store, q, deny)
+    memory += _memo_block(store, q)        # 내 메모 — 1단계는 문맥(인용 근거 아님)
     rules = rules_block(cfg)
 
     hits: dict[int, dict] = {}
