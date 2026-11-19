@@ -24,10 +24,19 @@ messages.raw_chars(원본 길이)와 new_content 길이를 비교하므로 실�
 상한(`review._DIAG_PRE_TOTAL`·`_DIAG_PRE_TURN`)은 데모의 한 건으로 정한 추측값이라
 실환경의 분포를 봐야 고칠 수 있다.
 
+`--cuts` 는 **재료에서 잘려 나간 양**을 잰다 — 역시 AI 호출 0, 숫자만. 브리핑이
+"생략된 본문 48,605자에 무엇이 있는지 확인 필요" 라고 신고했을 때, 그것이 어느
+조각(메일 한 통 / 앞선 대화의 발언 / 못 가른 인용 원문)인지 가른다. 스레드 번호를
+주면 그 스레드의 조각별 표, 안 주면 전체에서 긴 메일의 분포와 **옛 규칙(통당 최대
+3,000자)이면 잘리던 스레드가 지금 규칙(총예산을 나눠 씀)으로 몇 개 남는지**,
+그 대가로 재료가 얼마나 커졌는지를 찍는다.
+
 실행 (회사 PC 도 동일):
     python -m tools.bench_diagnose --home data 26080536001 26081240001
     python tools/bench_diagnose.py --model sonnet --out bench.md 26080536001
     python tools/bench_diagnose.py --home data --earlier
+    python tools/bench_diagnose.py --home data --cuts 26080536001
+    python tools/bench_diagnose.py --home data --cuts
 
 출력: 표(입력 토큰·출력 토큰·초·$)와 두 재료의 진단 전문. --out 을 주면 파일로.
 AI 호출은 스레드당 2콜이다 — 부르는 쪽이 개수를 통제하도록 상한을 두지 않는다.
@@ -239,6 +248,140 @@ def _earlier(store: Store) -> int:
     return 0
 
 
+# 2026-11-19 까지의 통당 상한 — 지금은 없다(review._body_share). 고치기 전과 견줘
+# "몇 개가 이제 전문이 실리고 재료는 얼마나 커졌나"를 찍는 데만 쓴다.
+_OLD_BODY_MAX = 3_000
+_CUT_RX = re.compile(r"…\(중략 — ([\d,]+)자\)…")
+_HEAD_RX = re.compile(r"^\[(?:(\d{4}-\d{2}-\d{2})T\d{2}:\d{2}|시각 미상) .+\]$")
+_RAW_HEAD = f"[{review.EARLIER_TAG} · 인용 원문]"
+
+
+def _pieces(blob: str) -> list[dict]:
+    """재료 블록을 조각으로 — [{kind, day, put, cut, rows}]. **내용은 돌려주지 않는다.**
+
+    조립을 흉내 내지 않고 **실제 재료를 읽는다**: 모델이 본 것이 곧 이 문자열이라,
+    상한이나 조립 순서를 고쳐도 이 표가 어긋날 수 없다.
+    """
+    out: list[dict] = []
+    for blk in blob.split("\n---\n"):
+        head, _, body = blk.partition("\n")
+        m = _HEAD_RX.match(head)
+        if head == _RAW_HEAD or m:
+            kind = ("앞선 대화(못 가른 원문)" if head == _RAW_HEAD
+                    else "앞선 대화(발언)" if head.endswith(f"· {review.EARLIER_TAG}]")
+                    else "메일")
+            out.append({"kind": kind, "day": (m.group(1) or "")[5:] if m else "",
+                        "put": 0, "cut": 0, "rows": 0})
+        elif not out or (blk.startswith("(") and blk.endswith(")") and "\n" not in blk):
+            continue                    # 안내 줄(경과일·생략 통수·앞선 대화 머리줄)
+        else:
+            body = blk                  # 본문 안의 `---` 로 갈린 뒷조각 — 앞 조각에 잇는다
+        cur = out[-1]
+        cur["put"] += len(body)
+        cur["cut"] += sum(int(x.replace(",", "")) for x in _CUT_RX.findall(body))
+        cur["rows"] += body.count("…(표 잘림")
+    return out
+
+
+def _cuts_thread(store: Store, tid: int) -> None:
+    subject, blob, n = review._diagnosis_material(store, tid)
+    if not blob:
+        print(f"#{tid}: 재료 없음")
+        return
+    from mailkb.clean import strip_preserved
+
+    seen = min(n, review._DIAG_MSGS)
+    lens = [len(strip_preserved(m["new_content"] or ""))
+            for m in store.thread_messages(tid)[-review._DIAG_MSGS:]]
+    ps = _pieces(blob)
+    mail_put = sum(p["put"] for p in ps if p["kind"] == "메일")
+    share = ("본문 합이 총예산 안이라 전문" if sum(lens) <= review._DIAG_TOTAL
+             else f"한 통의 몫 {review._body_share(lens):,}자")
+    print(f"\n#{tid} — 메일 {n}통 중 {seen}통 · {share} · "
+          f"메일 예산 {review._DIAG_TOTAL:,}자 중 {mail_put:,}자 사용")
+    print("| 조각 | 종류 | 날짜 | 실린 자수 | 생략 자수 | 표 잘림 |")
+    print("|---|---|---|---|---|---|")
+    for i, p in enumerate(ps, 1):
+        if p["cut"] or p["rows"]:
+            print(f"| {i} | {p['kind']} | {p['day'] or '-'} | {p['put']:,} | "
+                  f"{p['cut']:,} | {p['rows'] or '-'} |")
+    cut = [p for p in ps if p["cut"]]
+    if not cut:
+        print("| - | 잘린 조각 없음 | | | | |")
+        return
+    worst = max(cut, key=lambda p: p["cut"])
+    spare = review._DIAG_TOTAL - mail_put
+    print(f"조각 {len(ps)}개 중 {len(cut)}개가 잘렸다 · 가장 큰 생략 {worst['cut']:,}자"
+          f"({worst['kind']}) · 메일 예산의 남은 자리 {spare:,}자")
+
+
+def _cuts(store: Store, tids: list[int]) -> int:
+    """AI 없이 — 재료에서 잘려 나간 양. 번호를 주면 조각별, 안 주면 전체 분포."""
+    print("브리핑 재료에서 잘려 나간 양 — AI 호출 0, 숫자만")
+    if tids:
+        for tid in tids:
+            _cuts_thread(store, int(tid))
+        return 0
+    from mailkb.clean import PRESERVED_MARK
+
+    # 길이만 읽는다 — 본문을 올리지 않으므로 큰 DB 에서도 금방 끝난다.
+    # INSTR 은 1부터 센다: 표식이 k 번째 글자에서 시작하면 신규 작성분은 k-1 자다.
+    rows = store.db.execute(
+        "SELECT thread_id, CASE WHEN INSTR(new_content, ?) > 0 "
+        "THEN INSTR(new_content, ?) - 1 ELSE LENGTH(new_content) END AS own "
+        "FROM messages ORDER BY thread_id, sent_on, id",
+        (PRESERVED_MARK, PRESERVED_MARK)).fetchall()
+    by: dict[int, list[int]] = {}
+    for r in rows:
+        by.setdefault(r["thread_id"], []).append(r["own"] or 0)
+    n_all = len(rows)
+    over = [sum(1 for r in rows if (r["own"] or 0) > k)
+            for k in (_OLD_BODY_MAX, 10_000, 30_000)]
+    old_hit = now_hit = old_lost = now_lost = 0
+    old_put: list[int] = []
+    now_put: list[int] = []
+    top: list[tuple] = []
+    for tid, lens in by.items():
+        win = lens[-review._DIAG_MSGS:]
+        was = max(review._DIAG_BODY_MIN,
+                  min(_OLD_BODY_MAX, review._DIAG_TOTAL // max(1, len(win))))
+        lost_was = sum(max(0, size - was) for size in win)
+        if not lost_was:
+            continue                    # 옛 규칙으로도 전문이던 스레드 — 달라진 것이 없다
+        now = review._body_share(win)
+        lost = sum(max(0, size - now) for size in win)
+        old_hit += 1
+        old_lost += lost_was
+        old_put.append(sum(win) - lost_was)
+        now_put.append(sum(win) - lost)
+        if lost:
+            now_hit += 1
+            now_lost += lost
+        top.append((max(win), tid, len(lens), lost_was, lost, sum(win) - lost))
+    pc = f"{over[0] / n_all * 100:.1f}%" if n_all else "-"
+    print(f"\n메일 {n_all:,}통 · 스레드 {len(by):,}개")
+    print(f"  신규 본문이 {_OLD_BODY_MAX:,}자 넘는 메일 {over[0]:,}통({pc}) · "
+          f"10,000자 넘는 {over[1]:,}통 · 30,000자 넘는 {over[2]:,}통")
+    print(f"  옛 규칙(통당 최대 {_OLD_BODY_MAX:,}자)이면 메일 본문이 잘리던 스레드 "
+          f"{old_hit:,}개 — 생략 합계 {old_lost:,}자")
+    print(f"  지금 규칙(총예산 {review._DIAG_TOTAL:,}자를 나눠 씀)으로 잘리는 스레드 "
+          f"{now_hit:,}개 — 생략 합계 {now_lost:,}자")
+    print(f"  → {old_hit - now_hit:,}개는 이제 전문이 실린다")
+    if top:
+        print("\n치른 값 — 그 스레드들의 재료 크기(메일 본문 합, 자)")
+        print("| | 중앙 | 90% | 최대 |")
+        print("|---|---|---|---|")
+        print(f"| 옛 규칙 | {_spread(old_put)} |")
+        print(f"| 지금 | {_spread(now_put)} |")
+        print("\n| 가장 긴 메일(자) | 스레드 | 통수 | 옛 생략(자) | 지금 생략(자) | 지금 재료(자) |")
+        print("|---|---|---|---|---|---|")
+        for big, tid, n, lost_was, lost, put in sorted(top, reverse=True)[:10]:
+            print(f"| {big:,} | #{tid} | {n} | {lost_was:,} | {lost:,} | {put:,} |")
+    print("\n길이는 SQL 로만 읽은 근사다(몇 자 차이가 난다). 스레드 하나를 정확히 "
+          "보려면 --cuts <번호>, 앞선 대화(보존 인용) 쪽은 --earlier.")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Minerva 재료 vs 원문 재료 진단 비교")
     ap.add_argument("threads", nargs="*", type=int,
@@ -250,14 +393,18 @@ def main() -> int:
                     help="AI 없이 크기만 비교 (raw_chars 기반 — 실환경 권장)")
     ap.add_argument("--earlier", action="store_true",
                     help="AI 없이 — 앞선 대화(보존 인용)가 재료에 실리는 양의 분포")
+    ap.add_argument("--cuts", action="store_true",
+                    help="AI 없이 — 재료에서 잘려 나간 양 (번호를 주면 조각별, 생략 시 전체)")
     args = ap.parse_args()
-    if not args.threads and not args.sizes and not args.earlier:
-        ap.error("스레드 번호가 필요하다 (또는 --sizes · --earlier)")
+    if not args.threads and not (args.sizes or args.earlier or args.cuts):
+        ap.error("스레드 번호가 필요하다 (또는 --sizes · --earlier · --cuts)")
 
     cfg = config_mod.load(args.home)
     store = Store(cfg.db_path, cfg.my_addresses, cfg.my_names, noise=cfg)
-    if args.sizes or args.earlier:
+    if args.sizes or args.earlier or args.cuts:
         try:
+            if args.cuts:
+                return _cuts(store, args.threads)
             return (_earlier(store) if args.earlier
                     else _sizes(store, args.threads))
         finally:

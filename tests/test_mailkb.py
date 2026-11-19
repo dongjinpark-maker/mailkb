@@ -4593,23 +4593,56 @@ class TestThreadDiagnosis(unittest.TestCase):
         with web._diag_lock:
             self.assertIn("탈락 2줄", web._diag_job["msg"])
 
-    def test_material_budget_scales_with_thread_length(self):
+    def test_material_budget_is_shared_not_capped_per_mail(self):
         # 통당 800자 고정이었을 때, 회사 실측에서 "원문이 우리 재료가 놓친 구체
-        # 사실(인명·수량)을 잡았다"가 나왔다 — 업무 메일은 통당 1~2천 자가 흔해
-        # 800자면 절반 넘게 버린다. 총예산을 통수로 나눠 잡되 상·하한을 둔다.
-        per = lambda n: max(review._DIAG_BODY_MIN,
-                            min(review._DIAG_BODY_MAX, review._DIAG_TOTAL // n))
-        self.assertEqual(per(19), review._DIAG_BODY_MAX)   # 짧은 스레드는 넉넉히
-        self.assertLess(per(40), per(19))                  # 긴 스레드는 나눠 쓴다
-        self.assertGreaterEqual(per(200), review._DIAG_BODY_MIN)   # 하한은 지킨다
-        long_body = "가" * 2500
+        # 사실(인명·수량)을 잡았다"가 나왔다(2026-08-18) — 그래서 총예산을 통수로
+        # 나눴는데, 통당 상한 3,000자가 **총예산보다 먼저 걸렸다**: 3통짜리 스레드는
+        # 60,000자 중 9,000자까지만 쓸 수 있었고, 브리핑이 "생략된 본문 48,605자에 …"
+        # 라고 신고했다(2026-11-19 회사 PC). 지금은 짧은 메일이 안 쓴 자리를 긴 메일이 쓴다.
+        share, total = review._body_share, review._DIAG_TOTAL
+        self.assertFalse(hasattr(review, "_DIAG_BODY_MAX"))      # 통당 상한은 없다
+        self.assertEqual(share([300, 400, 51_581]), 51_581)      # 다 들어가면 아무것도 안 자른다
+        self.assertEqual(share([300, 400, 100_000]), total - 700)   # 남은 자리 전부를 긴 통이
+        self.assertEqual(share([5_000] * 40), total // 40)       # 전부 길면 똑같이 나눈다
+        self.assertEqual(share([1_000] * 30 + [50_000] * 2), 15_000)
+        self.assertEqual(share([]), 0)
+        for lens in ([300, 400, 100_000], [5_000] * 40, [2_000, 9_000, 30_000, 45_000],
+                     [1_000] * 30 + [50_000] * 2):
+            c = share(lens)
+            self.assertLessEqual(sum(min(x, c) for x in lens), total)    # 천장은 그대로다
+            self.assertGreater(sum(min(x, c + 40) for x in lens), total)   # 그리고 꽉 채운다
+        # 바닥 — 총예산이 아주 작아져도 한 통이 몇 백 자로 쪼그라들지 않는다
+        self.assertEqual(share([5_000] * 40, total=4_000), review._DIAG_BODY_MIN)
+
+        def tid_of(subject):
+            return self.store.db.execute(
+                "SELECT thread_id FROM messages WHERE subject=? LIMIT 1",
+                (subject,)).fetchone()["thread_id"]
+
+        # 5만 자 메일 한 통 — 종전에는 3,000자만 실렸다. 이제 전문이다
+        body = "첫머리표식 " + "가나다라마바사아자차 " * 4_600 + "한가운데표식 " \
+               + "가나다라마바사아자차 " * 100 + "끝머리표식"
+        self.assertGreater(len(body), 50_000)
         self.store.ingest([_rec("m1", "kim@corp.example", [ME], "긴 본문",
-                                "2026-07-21T09:00:00", body=long_body)])
-        tid = self.store.db.execute(
-            "SELECT thread_id FROM messages WHERE subject=? LIMIT 1",
-            ("긴 본문",)).fetchone()["thread_id"]
-        _, blob, _ = review._diagnosis_material(self.store, tid)
-        self.assertGreater(len(blob), 2000)                # 800자로 안 자른다
+                                "2026-07-21T09:00:00", body=body)])
+        _, blob, _ = review._diagnosis_material(self.store, tid_of("긴 본문"))
+        for mark in ("첫머리표식", "한가운데표식", "끝머리표식"):
+            self.assertIn(mark, blob)
+        self.assertNotIn("중략", blob)
+        # 총예산을 넘으면 그때 자른다 — 짧은 통은 통째로, 긴 통만 앞뒤로
+        self.store.ingest([
+            _rec("n1", "kim@corp.example", [ME], "넘치는 본문", "2026-07-23T09:00:00",
+                 body="짧은통표식 확인 부탁드립니다."),
+            _rec("n2", ME, ["kim@corp.example"], "RE: 넘치는 본문", "2026-07-23T10:00:00",
+                 body="머리표식 " + "가나다라마바사아자차 " * 9_000 + "꼬리표식",
+                 reply_to="n1"),
+        ])
+        _, blob, _ = review._diagnosis_material(self.store, tid_of("넘치는 본문"))
+        for mark in ("짧은통표식", "머리표식", "꼬리표식"):
+            self.assertIn(mark, blob)
+        self.assertIn("…(중략", blob)                       # 조각을 전문으로 믿지 않게
+        self.assertLessEqual(len(blob), total + 300)        # 머리줄·구분선만큼만 더
+        self.assertGreater(len(blob), total - 300)          # 남기지 않고 다 쓴다
 
     def test_card_warns_when_the_thread_is_old(self):
         # 회사 PC 실측(2026-08-18): 기각 12/21 이 전부 "그때는 문제였지만 지금은
@@ -4976,14 +5009,92 @@ class TestEarlierTalkInBriefing(unittest.TestCase):
                     home=str(self.home), threads=[self.tid], pick=1, backend=None))
         self.assertIn("← 앞선 대화 · 07-21 오태양 책임", buf.getvalue())
 
-    def test_measuring_tool_prints_numbers_only(self):
-        # 회사 PC 에서 돌려 숫자만 가져오는 도구 — 메일 내용이 새면 안 된다
+    def _bench(self):
         import importlib.util
         spec = importlib.util.spec_from_file_location(
             "bench_diagnose", Path(__file__).resolve().parent.parent
             / "tools" / "bench_diagnose.py")
         bench = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(bench)
+        return bench
+
+    def _out(self, fn, *a):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(fn(*a), 0)
+        return buf.getvalue()
+
+    def test_cut_tool_says_which_piece_lost_how_much(self):
+        # 브리핑이 "생략된 본문 48,605자에 …" 라고 신고했을 때(2026-11-19 회사 PC),
+        # 그것이 긴 메일 한 통인지 앞선 대화인지를 여기서는 볼 수 없었다 — 숫자만 찍어
+        # 가른다. 조립을 흉내 내지 않고 실제 재료의 중략 표시를 센다.
+        bench = self._bench()
+        # 5만 자 남짓 — 통당 상한이 있던 때는 48,000자쯤 버렸다. 지금은 전문이다
+        self._set("e2", "비밀낱말 " + "가나다라마바사아자차 " * 4700)
+        out = self._out(bench._cuts, self.store, [self.tid])
+        self.assertIn("본문 합이 총예산 안이라 전문", out)
+        self.assertIn("잘린 조각 없음", out)
+        whole = self._out(bench._cuts, self.store, [])
+        self.assertIn("신규 본문이 3,000자 넘는 메일 1통", whole)
+        self.assertIn("30,000자 넘는 1통", whole)
+        self.assertIn("옛 규칙(통당 최대 3,000자)이면 메일 본문이 잘리던 스레드 1개", whole)
+        self.assertIn("잘리는 스레드 0개 — 생략 합계 0자", whole)
+        self.assertIn("→ 1개는 이제 전문이 실린다", whole)
+        # 치른 값도 찍는다 — 그 스레드의 재료가 3천 자쯤에서 5만 자쯤으로 커졌다
+        self.assertRegex(whole, r"\| 옛 규칙 \| 3,\d{3} \|")
+        self.assertRegex(whole, r"\| 지금 \| 5\d,\d{3} \|")
+        self.assertRegex(whole, rf"\| #{self.tid} \| 2 \| 4\d,\d{{3}} \| 0 \|")
+        # 총예산도 넘는 10만 자 — 이것은 지금도 잘린다. 어느 조각이 얼마나인지 가른다
+        self._set("e2", "비밀낱말 " + "가나다라마바사아자차 " * 9400)
+        _s, blob, _n = self._blob()
+        want = sum(int(x.replace(",", ""))
+                   for x in re.findall(r"중략 — ([\d,]+)자", blob))
+        self.assertGreater(want, 40_000)
+        out = self._out(bench._cuts, self.store, [self.tid])
+        share = review._body_share([len(self._OWN), 103_405])
+        self.assertIn(f"한 통의 몫 {share:,}자", out)
+        self.assertIn("| 메일 | 07-22 | ", out)
+        self.assertIn(f"| {want:,} | - |", out)
+        self.assertIn(f"가장 큰 생략 {want:,}자(메일)", out)
+        self.assertRegex(out, r"메일 예산의 남은 자리 \d{1,2}자")   # 남기지 않고 다 쓴다
+        whole = self._out(bench._cuts, self.store, [])
+        self.assertIn("지금 규칙(총예산 60,000자를 나눠 씀)으로 잘리는 스레드 1개", whole)
+        self.assertIn("→ 0개는 이제 전문이 실린다", whole)
+        for text in (out, whole):
+            for leak in ("비밀낱말", "가나다라", "오태양", "kang", "DMA", "corp.example"):
+                self.assertNotIn(leak, text)
+        # 보존 인용은 신규 본문 길이에 세지 않는다(INSTR 경계) — e1 은 3,000자를 안 넘는다
+        self._set("e2", self._MINE)
+        self.assertIn("메일 본문이 잘리던 스레드 0개",
+                      self._out(bench._cuts, self.store, []))
+
+    def test_cut_tool_tells_earlier_talk_from_mail(self):
+        bench = self._bench()
+        # 못 가른 인용 원문 5만 자 — 상한(전체 6,000자)에 맞춰 잘린다
+        self._set("e1", self._OWN + "\n\n" + PRESERVED_MARK + "\n"
+                  + "> 앞사람 글 " + "가나다라마바사아자차 " * 4700)
+        out = self._out(bench._cuts, self.store, [self.tid])
+        self.assertIn("| 앞선 대화(못 가른 원문) | - |", out)
+        self.assertRegex(out, r"가장 큰 생략 4\d,\d{3}자\(앞선 대화\(못 가른 원문\)\)")
+        # 발언 하나가 5만 자 — 발언 상한(1,200자)에 걸린다
+        self._set("e1", self._OWN + "\n\n" + PRESERVED_MARK + "\n"
+                  + self._many_turns(1, 50_000))
+        out = self._out(bench._cuts, self.store, [self.tid])
+        self.assertIn("| 앞선 대화(발언) | 07-01 |", out)
+        self.assertRegex(out, r"가장 큰 생략 4\d,\d{3}자\(앞선 대화\(발언\)\)")
+        # 본문 안의 `---` 줄은 조각을 가르지 않는다 — 뒷부분의 중략도 그 메일의 것이다
+        self._set("e1", self._OWN)
+        self._set("e2", "위 문단입니다.\n---\n" + "가나다라마바사아자차 " * 7000)
+        ps = bench._pieces(self._blob()[1])
+        self.assertEqual([p["kind"] for p in ps], ["메일", "메일"])
+        self.assertGreater(ps[1]["cut"], 15_000)
+        # 잘린 것이 없으면 그렇게 말한다
+        self._set("e2", self._MINE)
+        self.assertIn("잘린 조각 없음", self._out(bench._cuts, self.store, [self.tid]))
+
+    def test_measuring_tool_prints_numbers_only(self):
+        # 회사 PC 에서 돌려 숫자만 가져오는 도구 — 메일 내용이 새면 안 된다
+        bench = self._bench()
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             self.assertEqual(bench._earlier(self.store), 0)

@@ -1785,11 +1785,39 @@ _DIAG_MSGS = 40            # 재료로 읽는 최근 메시지 수
 # 고정이었는데, 회사 실측에서 "인용 포함 원문이 우리 재료가 놓친 구체 사실(인명·
 # 수량)을 잡았다"가 나왔다 — 인용 제거가 아니라 **이 절단**이 유력한 범인이다
 # (실제 업무 메일은 통당 1~2천 자가 흔한데 800자면 절반 넘게 버린다).
-# 진단은 스레드 하나에 1콜이라 예산을 크게 잡아도 감당된다. 상·하한을 둬서
-# 짧은 스레드가 통당 예산을 무한정 가져가지 않게 한다.
+# 진단은 스레드 하나에 1콜이라 예산을 크게 잡아도 감당된다.
+#
+# **통당 상한(3,000자)은 없앴다**(2026-11-19, 사용자 결정). "짧은 스레드가 통당
+# 예산을 무한정 가져가지 않게" 둔 것인데, 그 상한이 **총예산보다 먼저 걸렸다** —
+# 3통짜리 스레드는 60,000자 중 9,000자까지만 쓸 수 있었다. 회사 PC 에서 브리핑이
+# "생략된 본문 48,605자에 …" 라고 신고했고, 합성 스레드(3통, 한 통이 51,581자)로
+# 같은 숫자가 났다: 예산 60,000자 중 3,012자만 쓰고 48,605자를 버리고 있었다.
+# 지금은 총예산을 물 채우듯 나눈다(_body_share) — 짧은 메일이 안 쓴 자리를 긴
+# 메일이 쓴다. 총량의 천장은 그대로다(긴 스레드가 이미 쓰던 60,000자).
+# 잃는 것: 긴 메일이 든 짧은 스레드의 재료가 커져 그 콜의 시간·토큰이 는다.
 _DIAG_TOTAL = 60_000       # 스레드 전체 본문 예산 (자)
+# 바닥 — 지금 값에서는 닿지 않는다(40통이 전부 길어도 통당 1,500자). 총예산이나
+# 통수 창을 고쳤을 때 한 통이 몇 백 자로 쪼그라드는 것을 막는 안전판이다.
 _DIAG_BODY_MIN = 800
-_DIAG_BODY_MAX = 3_000
+
+
+def _body_share(lens: list[int], total: int = _DIAG_TOTAL) -> int:
+    """메일 한 통에 줄 자수 — `Σ min(길이, 몫) ≤ total` 인 가장 큰 몫(물 채우기).
+
+    다 들어가면 가장 긴 메일의 길이를 돌려준다(아무것도 안 잘린다). 넘치면 짧은
+    메일은 통째로 두고, 남은 자리를 긴 메일끼리 **똑같이** 나눈다 — 어느 통이 더
+    중요한지 길이로는 알 수 없다(종전의 통수 균등 분배와 같은 태도).
+    """
+    if sum(lens) <= total:
+        return max(lens, default=0)
+    rest, n = total, len(lens)
+    for size in sorted(lens):
+        if size * n <= rest:        # 이 통은 통째로 — 남은 것을 나머지가 나눈다
+            rest -= size
+            n -= 1
+        else:
+            break
+    return max(_DIAG_BODY_MIN, rest // max(1, n))
 
 # ── 앞선 대화 — 내가 받기 전의 발언을 재료에 (2026-11-19) ─────────────────
 # 왜: 중간에 참조로 들어온 스레드(mid-join)는 발단과 이미 정해진 것이 **메시지 행
@@ -1991,7 +2019,8 @@ def _diagnosis_material(store: Store, tid: int) -> tuple[str, str, int]:
 
     버튼을 누른 순간 전체를 보는 것이 가장 정확하고, 콜 하나의 고정비(실측
     5.3k 토큰)를 생각하면 증분 여러 콜보다 싸다. 긴 스레드는 최근 N통으로
-    자르되 통당 본문은 smart_truncate 로 앞뒤를 나눠 담는다(결론이 뒤에 있다).
+    자르되, 본문 합이 총예산을 넘을 때만 긴 통을 smart_truncate 로 앞뒤를 나눠
+    담는다(결론이 뒤에 있다). 총예산 안이면 전문이다(_body_share).
     내가 받기 전의 대화(보존 인용)는 발언별로 갈라 그 메일 앞에 싣는다
     (`_earlier_blocks`) — 통수(반환값)는 메일 행만 센다.
     """
@@ -2015,11 +2044,11 @@ def _diagnosis_material(store: Store, tid: int) -> tuple[str, str, int]:
     if len(msgs) > len(window):
         blocks.append(f"(앞선 {len(msgs) - len(window)}통 생략 — 최근 "
                       f"{len(window)}통만 실었다)")
-    per = max(_DIAG_BODY_MIN,
-              min(_DIAG_BODY_MAX, _DIAG_TOTAL // max(1, len(window))))
+    own = [strip_preserved(m["new_content"] or "") for m in window]
+    per = _body_share([len(x) for x in own])
     got_body = False
     room = _DIAG_PRE_TOTAL
-    for m in window:
+    for m, text in zip(window, own):
         # 앞선 대화는 **실어 온 메일 바로 앞**에 둔다 — 시간순이 그렇다. 보통은 첫
         # 메일이지만, 옛 메일이 뒤늦게 수집되면 실어 온 메일이 첫 줄이 아니다.
         if PRESERVED_MARK in (m["new_content"] or ""):
@@ -2029,7 +2058,7 @@ def _diagnosis_material(store: Store, tid: int) -> tuple[str, str, int]:
             # 본문 없이 전달만 한 메일("FYI")도 실어 온 대화가 있으면 재료다
             got_body = got_body or used > 0
         who = "나" if m["is_sent"] else (m["sender_name"] or m["sender_addr"])
-        body = smart_truncate(strip_preserved(m["new_content"] or ""), per)
+        body = smart_truncate(text, per)
         got_body = got_body or bool(body.strip())
         blocks.append(f"[{(m['sent_on'] or '')[:16]} {who}]\n{body}")
     # 본문이 한 글자도 없으면 재료가 아니다 — 헤더·경과일 줄만으로 콜을 쓰지
