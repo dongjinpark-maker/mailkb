@@ -21,8 +21,12 @@ messages.raw_chars(원본 길이)와 new_content 길이를 비교하므로 실�
 
 `--earlier` 는 **앞선 대화**(내가 받기 전에 오간 발언 — 보존 인용)가 브리핑 재료에
 얼마나 실리는지를 잰다 — **AI 호출 0, 숫자만 찍는다(메일 내용·제목·이름 없음)**.
-상한(`review._DIAG_PRE_TOTAL`·`_DIAG_PRE_TURN`)은 데모의 한 건으로 정한 추측값이라
-실환경의 분포를 봐야 고칠 수 있다.
+앞선 대화의 발언은 받은 메일과 같은 규칙으로 실린다(최근 40건 · 합쳐서 60,000자).
+스레드 번호를 주면 그 스레드의 **인용이 어떤 모양인지**를 찍는다: 발언을 몇 개로
+갈랐고 각각 몇 자인지, 발언 안에 가르지 못한 경계(구분선·귀속줄·`>` 줄)가 몇 줄
+있는지, 머리 낱말은 있는데 머리로 못 읽은 줄이 **어떤 꼴인지**. 꼴은 글자를 전부
+가리고(한글 가 · 영문 x · 숫자 9) 라벨 낱말과 문장부호만 남긴다 — 회사 메일의
+인용 형식을 개발 쪽에서 볼 수 없어서, 형식만 건네받기 위한 것이다.
 
 `--cuts` 는 **재료에서 잘려 나간 양**을 잰다 — 역시 AI 호출 0, 숫자만. 브리핑이
 "생략된 본문 48,605자에 무엇이 있는지 확인 필요" 라고 신고했을 때, 그것이 어느
@@ -35,6 +39,7 @@ messages.raw_chars(원본 길이)와 new_content 길이를 비교하므로 실�
     python -m tools.bench_diagnose --home data 26080536001 26081240001
     python tools/bench_diagnose.py --model sonnet --out bench.md 26080536001
     python tools/bench_diagnose.py --home data --earlier
+    python tools/bench_diagnose.py --home data --earlier 26080536001
     python tools/bench_diagnose.py --home data --cuts 26080536001
     python tools/bench_diagnose.py --home data --cuts
 
@@ -161,10 +166,11 @@ def _spread(vals: list[int]) -> str:
 def _earlier(store: Store) -> int:
     """AI 없이 — 앞선 대화(보존 인용)가 브리핑 재료에 실리는 양의 분포.
 
-    **재료 조립과 같은 함수를 부른다**(`review.earlier_turns`·`_earlier_blocks`).
-    따로 세면 상한을 고친 뒤 이 숫자와 실제 재료가 어긋난다.
+    **실제 재료를 읽는다**(`review._diagnosis_material` → `_pieces`). 조립을 흉내
+    내면 규칙을 고친 뒤 이 숫자와 실제 재료가 어긋난다 — 이틀 사이에 규칙이 세 번
+    바뀌었다.
     """
-    from mailkb.clean import (PRESERVED_MARK, parse_preserved, strip_preserved,
+    from mailkb.clean import (PRESERVED_MARK, attributed_turns, strip_preserved,
                               take_preserved)
 
     total = store.db.execute(
@@ -173,36 +179,36 @@ def _earlier(store: Store) -> int:
         "SELECT DISTINCT thread_id FROM messages WHERE new_content LIKE ? "
         "ORDER BY thread_id", (f"%{PRESERVED_MARK}%",))]
     raw_len, put_len, n_turns, longest = [], [], [], []
-    parsed = unparsed = all_dup = only_earlier = outside = 0
-    over_total = cut_turns = dropped = dup = turns_all = 0
+    parsed = unparsed = all_dup = only_earlier = with_rest = 0
+    gone_threads = gone = cut_turns = cut_raw = dup = turns_all = 0
     for tid in tids:
         msgs = store.thread_messages(tid)
-        seen = {m["id"] for m in msgs[-review._DIAG_MSGS:]}
-        inside = [m for m in msgs if m["id"] in seen
-                  and PRESERVED_MARK in (m["new_content"] or "")]
-        if not inside:
-            outside += 1
-            continue
-        room = review._DIAG_PRE_TOTAL
-        t_raw = t_put = t_n = t_skip = 0
-        t_long = 0
-        any_raw = False
-        for m in inside:
-            before = parse_preserved(m["new_content"] or "")
+        t_raw = t_n = t_long = n_raw = 0
+        any_raw = any_rest = False
+        for m in msgs:
+            if PRESERVED_MARK not in (m["new_content"] or ""):
+                continue
+            before = attributed_turns(m["new_content"] or "")[0]
             turns, raw = review.earlier_turns(msgs, m)
-            dup += sum(1 for t in before if t["body"].strip()) - len(turns)
-            any_raw = any_raw or bool(raw)
+            dup += len(before) - len(turns)
+            # 못 가른 것 둘: 통째로(발언 0개) / 발언 안쪽의 나머지(발언은 있다)
+            any_raw = any_raw or bool(raw and not before)
+            any_rest = any_rest or bool(raw and before)
+            n_raw += bool(raw)
             t_raw += len(take_preserved(m["new_content"] or ""))
-            blocks, used = review._earlier_blocks(msgs, m, room)
-            room -= used
-            t_put += used
+            t_n += len(turns)
             if turns:
-                shown = max(0, len(blocks) - 1) if used else 0
-                t_n += len(turns)
-                t_skip += len(turns) - shown
                 t_long = max(t_long, max(len(t["body"]) for t in turns))
-                cut_turns += sum(1 for t in turns
-                                 if len(t["body"]) > review._DIAG_PRE_TURN)
+        ps = [p for p in _pieces(review._diagnosis_material(store, tid)[1])
+              if p["kind"] != "메일"]
+        said = [p for p in ps if p["kind"] == _K_TURN]
+        t_put = sum(p["put"] for p in ps)
+        cut_turns += sum(1 for p in said if p["cut"])
+        cut_raw += sum(1 for p in ps if p["kind"] == _K_RAW and p["cut"])
+        hidden = (t_n + n_raw) - len(ps)
+        if hidden > 0:
+            gone_threads += 1
+            gone += hidden
         turns_all += t_n
         if any_raw:
             unparsed += 1
@@ -210,12 +216,11 @@ def _earlier(store: Store) -> int:
             parsed += 1
         else:
             all_dup += 1
+        if any_rest:
+            with_rest += 1
         if t_put and not any(strip_preserved(m["new_content"] or "").strip()
                              for m in msgs):
             only_earlier += 1
-        if t_skip:
-            over_total += 1
-            dropped += t_skip
         raw_len.append(t_raw)
         if t_put:
             put_len.append(t_put)
@@ -227,30 +232,195 @@ def _earlier(store: Store) -> int:
     print(f"앞선 대화(보존 인용)가 브리핑 재료에 실리는 양 — AI 호출 0, 숫자만\n")
     print(f"스레드 {total:,} · 인용이 실려 온 스레드 {len(tids):,} ({pct})")
     print(f"  발언을 가른 스레드 {parsed:,} · 못 가른 스레드 {unparsed:,} "
-          f"(원문 그대로 싣고 근거로는 안 받는다)")
+          f"(원문 그대로 싣는다 — 근거의 출처에 이름이 안 붙는다)")
+    print(f"  발언 안쪽에 가르지 못한 더 앞선 인용이 남은 스레드 {with_rest:,} "
+          f"(그 부분만 원문으로 싣는다)")
     print(f"  발언이 전부 실제 메일과 겹쳐 실을 것이 없는 스레드 {all_dup:,}")
     print(f"  받은 본문은 없고 앞선 대화만 있는 스레드 {only_earlier:,} "
-          f"(지금까지 브리핑을 못 만들던 것)")
-    print(f"  실어 온 메일이 재료 창(최근 {review._DIAG_MSGS}통) 밖이라 "
-          f"안 실리는 스레드 {outside:,}\n")
+          f"(지금까지 브리핑을 못 만들던 것)\n")
     print("| 스레드당 | 중앙 | 90% | 최대 |")
     print("|---|---|---|---|")
     print(f"| 인용 원문(자) | {_spread(raw_len)} |")
     print(f"| 재료에 실리는 양(자) | {_spread(put_len)} |")
     print(f"| 발언 수(턴) | {_spread(n_turns)} |")
     print(f"| 가장 긴 발언(자) | {_spread(longest)} |")
-    print(f"\n상한에 걸리는 것 — 지금 값: 전체 {review._DIAG_PRE_TOTAL:,}자 · "
-          f"발언 {review._DIAG_PRE_TURN:,}자")
-    print(f"  전체 상한을 넘어 오래된 발언이 빠지는 스레드 {over_total:,} "
-          f"(빠지는 발언 {dropped:,})")
-    print(f"  발언 상한을 넘어 중략되는 발언 {cut_turns:,} / {turns_all:,}")
+    print(f"\n받은 메일과 같은 규칙이다 — 최근 {review._DIAG_MSGS}건 · "
+          f"합쳐서 {review._DIAG_TOTAL:,}자")
+    print(f"  최근 {review._DIAG_MSGS}건 밖이라 안 실리는 앞선 대화 {gone:,}건 "
+          f"(스레드 {gone_threads:,}개)")
+    print(f"  가운데가 잘리는 발언 {cut_turns:,} / {turns_all:,} · "
+          f"잘리는 원문 덩어리 {cut_raw:,}")
     print(f"  실제 메일과 겹쳐 뺀 발언 {dup:,}")
+    print("\n스레드 하나의 인용이 어떤 모양인지 보려면 --earlier <번호>.")
     return 0
+
+
+# 머리 낱말 — 턴 파서가 아는 것보다 **넓게** 잡는다. 못 읽은 머리를 찾는 그물이라
+# 넓어야 하고, 오탐은 꼴을 보고 사람이 거른다. 절단기의 라벨(clean._HDR_FIRST·
+# _HDR_FOLLOW)에 흔한 변형을 더했다.
+_LABELS = (r"보낸\s*사람|보낸\s*이|발신자|발신인|발신|송신자|작성자|보낸\s*날짜|보낸\s*시간"
+           r"|날짜|일시|받는\s*사람|받는\s*이|수신자|수신인|수신|참조|제목"
+           r"|From|Sender|Sent|Date|To|Cc|Bcc|Subject|Title"
+           r"|De|Von|Da|Van|Envoyé|Objet|Gesendet|Datum|Betreff|An"
+           r"|发件人|寄件者|差出人|送信日時|件名|宛先|收件人|主题|发送时间")
+_LABEL_LINE = re.compile(rf"^(?P<pre>[^\w가-힣]{{0,12}})(?P<lab>{_LABELS})"
+                         rf"(?P<mid>[^\w가-힣:：]{{0,6}})[:：]", re.IGNORECASE)
+
+
+def _shape(line: str) -> str:
+    """머리 꼴 — 라벨 낱말과 문장부호만 남기고 **글자를 전부 가린다**.
+
+    한글 → 가 · 영문 → x · 숫자 → 9, 같은 것이 이어지면 하나로 줄인다. 이름·주소·
+    제목이 무엇이었는지는 남지 않고, 줄이 어떤 문법인지만 남는다."""
+    m = _LABEL_LINE.match(line)
+    if not m:
+        return ""
+    lab = " ".join(m.group("lab").split())
+    rest = line[m.end():]
+    rest = re.sub(r"[가-힣]+", "가", rest)
+    rest = re.sub(r"[A-Za-z]+", "x", rest)
+    rest = re.sub(r"\d+", "9", rest)
+    rest = re.sub(r"[^\x00-\x7f가]+", "?", rest)        # 그 밖의 문자(한자·기호)
+    return (m.group("pre") + lab + m.group("mid") + ":" + rest)[:90]
+
+
+def _mask_all(line: str) -> str:
+    """라벨을 모르는 줄의 꼴 — **전부 가린다.** 콜론 앞 낱말은 길이만 남긴다.
+
+    `보내는분 : 한바다 <a@b.c>` → `가가가가 : 가 <x@x.x>`. 낱말이 무엇인지는 안
+    나가고 "콜론 앞에 한글 네 글자짜리 라벨이 있다"만 나간다 — 그러면 그 라벨이
+    무엇인지 사용자에게 물어볼 수 있다."""
+    def blur(text: str, squeeze: bool) -> str:
+        plus = "+" if squeeze else ""
+        text = re.sub(rf"[가-힣]{plus}", "가", text)
+        text = re.sub(rf"[A-Za-z]{plus}", "x", text)
+        text = re.sub(rf"\d{plus}", "9", text)
+        return re.sub(r"[^\x00-\x7f가]+", "?", text)
+
+    m = re.match(r"^([^:：]{1,14})([:：])(.*)$", line)
+    if m:
+        return (blur(m.group(1), False) + m.group(2) + blur(m.group(3), True))[:90]
+    return blur(line, True)[:90]
+
+
+def _after_labels(lines: list[str]) -> dict[str, int]:
+    """인용 라벨 줄(`Original Message` 류) 바로 아래 줄들의 꼴 — 머리 블록의 문법.
+
+    아는 라벨이면 낱말을 남기고(_shape), 모르면 전부 가린다(_mask_all). 턴 파서가
+    머리를 못 읽을 때 **무엇이 적혀 있었는지**를 볼 유일한 자리다."""
+    from mailkb import clean
+
+    out: dict[str, int] = {}
+    for i, ln in enumerate(lines):
+        if not clean._pres_label(ln.strip()):
+            continue
+        got = 0
+        for nxt in lines[i + 1:i + 12]:
+            t = nxt.strip()
+            if not t:
+                if got:
+                    break
+                continue
+            if clean._pres_label(t) or got >= 6:
+                break
+            got += 1
+            sh = _shape(t) or _mask_all(t)
+            out[sh] = out.get(sh, 0) + 1
+    return out
+
+
+def _inner(lines: list[str]) -> dict:
+    """본문 줄들의 속 — 가르지 못한 경계로 보이는 줄의 수와, 못 읽은 머리의 꼴."""
+    from mailkb import clean
+
+    out = {"lines": len(lines), "table": 0, "gt": 0, "rule": 0, "attrib": 0,
+           "labels": 0, "shapes": {}}
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            continue
+        if s.startswith("|"):
+            out["table"] += 1
+        if s.startswith(">"):
+            out["gt"] += 1
+        if any(rx.search(s) for rx in clean._CUT_LINE_RES):
+            out["rule"] += 1
+        if any(rx.search(s) for rx in clean._ATTRIB_RES):
+            out["attrib"] += 1
+        sh = _shape(s)
+        if sh:
+            out["labels"] += 1
+            out["shapes"][sh] = out["shapes"].get(sh, 0) + 1
+    return out
+
+
+def _earlier_shape(store: Store, tid: int) -> None:
+    """한 스레드의 인용이 어떤 모양인가 — 숫자와 가린 꼴만 찍는다."""
+    from mailkb import clean
+    from mailkb.clean import (PRESERVED_MARK, attributed_turns, parse_preserved,
+                              take_preserved)
+
+    msgs = store.thread_messages(tid)
+    carriers = [(i, m) for i, m in enumerate(msgs, 1)
+                if PRESERVED_MARK in (m["new_content"] or "")]
+    print(f"\n#{tid} — 메일 {len(msgs)}통 · 인용을 실어 온 메일 {len(carriers)}통")
+    for i, m in carriers:
+        text = m["new_content"] or ""
+        raw = take_preserved(text)
+        lines = raw.splitlines()
+        seen = parse_preserved(text)                  # 화면이 쓰는 턴(안쪽 사슬 포함)
+        said, rest = attributed_turns(text)           # 화자를 댈 수 있는 부분만
+        kept, _ = review.earlier_turns(msgs, m)
+        starts = clean._pres_starts(lines)
+        n_label = sum(1 for k in starts if clean._pres_label(lines[k].strip()))
+        print(f"\n{i}번째 메일({(m['sent_on'] or '')[5:10]}) — 인용 원문 {len(raw):,}자 · "
+              f"{len(lines):,}줄")
+        print(f"  발언을 여는 줄 {len(starts)}개 — 인용 라벨 줄(Original Message 류) "
+              f"{n_label} · 발신인 머리 줄 {len(starts) - n_label}")
+        if not seen:
+            print("  발언을 하나도 가르지 못했다 — 라벨 줄도 발신인 머리 줄도 못 읽었다")
+            body = lines
+        else:
+            sizes = [len(t["body"]) for t in seen]
+            head = " · ".join(f"{x:,}" for x in sizes[:30]) + (" …" if len(sizes) > 30 else "")
+            print(f"  가른 발언 {len(seen)}개(오래된 것부터, 자): {head}")
+            print(f"  이름을 읽은 발언 {sum(1 for t in seen if t['who'])}개 · "
+                  f"시각을 읽은 발언 {sum(1 for t in seen if t['when'])}개 · "
+                  f"가장 긴 발언 {max(sizes):,}자")
+            print(f"  발언 안쪽의 가르지 못한 나머지 {len(rest):,}자 · "
+                  f"실제 메일과 겹쳐 뺀 발언 {len(said) - len(kept)}개")
+            body = [ln for t in seen for ln in t["body"].splitlines()]
+        inner = _inner(body)
+        print(f"  {'원문' if not seen else '발언 본문'}의 속 — {inner['lines']:,}줄 · "
+              f"표 줄 {inner['table']:,} · `>` 로 시작하는 줄 {inner['gt']:,} · "
+              f"구분선 {inner['rule']:,} · 귀속줄 {inner['attrib']:,} · "
+              f"머리 낱말이 있는 줄 {inner['labels']:,}")
+        note = "(글자는 가림: 한글 가 · 영문 x · 숫자 9)"
+        if inner["shapes"]:
+            print(f"  본문에 남은 머리 낱말 줄의 꼴 — 머리로 못 읽은 것 {note}:")
+            for sh, n in sorted(inner["shapes"].items(), key=lambda kv: -kv[1])[:12]:
+                print(f"    {n:>4}× `{sh}`")
+        after = _after_labels(lines)
+        if after:
+            print(f"  인용 라벨 줄 바로 아래 줄들의 꼴 {note}:")
+            for sh, n in sorted(after.items(), key=lambda kv: -kv[1])[:12]:
+                print(f"    {n:>4}× `{sh}`")
+        # 발신인 머리로 읽은 줄의 꼴 — 읽은 것과 못 읽은 것을 나란히 봐야 차이가 보인다
+        heads: dict[str, int] = {}
+        for k in range(len(lines)):
+            if lines[k].strip() and clean._pres_is_who(lines, k):
+                sh = _shape(lines[k].strip()) or _mask_all(lines[k].strip())
+                heads[sh] = heads.get(sh, 0) + 1
+        if heads:
+            print(f"  발신인 머리로 읽은 줄의 꼴 {note}:")
+            for sh, n in sorted(heads.items(), key=lambda kv: -kv[1])[:6]:
+                print(f"    {n:>4}× `{sh}`")
 
 
 # 2026-11-19 까지의 통당 상한 — 지금은 없다(review._body_share). 고치기 전과 견줘
 # "몇 개가 이제 전문이 실리고 재료는 얼마나 커졌나"를 찍는 데만 쓴다.
 _OLD_BODY_MAX = 3_000
+_K_TURN, _K_RAW = "앞선 대화(발언)", "앞선 대화(못 가른 원문)"
 _CUT_RX = re.compile(r"…\(중략 — ([\d,]+)자\)…")
 _HEAD_RX = re.compile(r"^\[(?:(\d{4}-\d{2}-\d{2})T\d{2}:\d{2}|시각 미상) .+\]$")
 _RAW_HEAD = f"[{review.EARLIER_TAG} · 인용 원문]"
@@ -267,8 +437,8 @@ def _pieces(blob: str) -> list[dict]:
         head, _, body = blk.partition("\n")
         m = _HEAD_RX.match(head)
         if head == _RAW_HEAD or m:
-            kind = ("앞선 대화(못 가른 원문)" if head == _RAW_HEAD
-                    else "앞선 대화(발언)" if head.endswith(f"· {review.EARLIER_TAG}]")
+            kind = (_K_RAW if head == _RAW_HEAD
+                    else _K_TURN if head.endswith(f"· {review.EARLIER_TAG}]")
                     else "메일")
             out.append({"kind": kind, "day": (m.group(1) or "")[5:] if m else "",
                         "put": 0, "cut": 0, "rows": 0})
@@ -288,17 +458,12 @@ def _cuts_thread(store: Store, tid: int) -> None:
     if not blob:
         print(f"#{tid}: 재료 없음")
         return
-    from mailkb.clean import strip_preserved
-
-    seen = min(n, review._DIAG_MSGS)
-    lens = [len(strip_preserved(m["new_content"] or ""))
-            for m in store.thread_messages(tid)[-review._DIAG_MSGS:]]
     ps = _pieces(blob)
-    mail_put = sum(p["put"] for p in ps if p["kind"] == "메일")
-    share = ("본문 합이 총예산 안이라 전문" if sum(lens) <= review._DIAG_TOTAL
-             else f"한 통의 몫 {review._body_share(lens):,}자")
-    print(f"\n#{tid} — 메일 {n}통 중 {seen}통 · {share} · "
-          f"메일 예산 {review._DIAG_TOTAL:,}자 중 {mail_put:,}자 사용")
+    count = lambda k: sum(1 for p in ps if p["kind"] == k)
+    put = sum(p["put"] for p in ps)
+    print(f"\n#{tid} — 메일 {n}통 · 재료 조각 {len(ps)}개(받은 메일 {count('메일')} · "
+          f"앞선 대화의 발언 {count(_K_TURN)} · 못 가른 원문 {count(_K_RAW)}) · "
+          f"예산 {review._DIAG_TOTAL:,}자 중 {put:,}자 사용")
     print("| 조각 | 종류 | 날짜 | 실린 자수 | 생략 자수 | 표 잘림 |")
     print("|---|---|---|---|---|---|")
     for i, p in enumerate(ps, 1):
@@ -310,9 +475,8 @@ def _cuts_thread(store: Store, tid: int) -> None:
         print("| - | 잘린 조각 없음 | | | | |")
         return
     worst = max(cut, key=lambda p: p["cut"])
-    spare = review._DIAG_TOTAL - mail_put
     print(f"조각 {len(ps)}개 중 {len(cut)}개가 잘렸다 · 가장 큰 생략 {worst['cut']:,}자"
-          f"({worst['kind']}) · 메일 예산의 남은 자리 {spare:,}자")
+          f"({worst['kind']}) · 예산의 남은 자리 {max(0, review._DIAG_TOTAL - put):,}자")
 
 
 def _cuts(store: Store, tids: list[int]) -> int:
@@ -327,13 +491,17 @@ def _cuts(store: Store, tids: list[int]) -> int:
     # 길이만 읽는다 — 본문을 올리지 않으므로 큰 DB 에서도 금방 끝난다.
     # INSTR 은 1부터 센다: 표식이 k 번째 글자에서 시작하면 신규 작성분은 k-1 자다.
     rows = store.db.execute(
-        "SELECT thread_id, CASE WHEN INSTR(new_content, ?) > 0 "
+        "SELECT thread_id, INSTR(new_content, ?) > 0 AS pre, "
+        "CASE WHEN INSTR(new_content, ?) > 0 "
         "THEN INSTR(new_content, ?) - 1 ELSE LENGTH(new_content) END AS own "
         "FROM messages ORDER BY thread_id, sent_on, id",
-        (PRESERVED_MARK, PRESERVED_MARK)).fetchall()
+        (PRESERVED_MARK, PRESERVED_MARK, PRESERVED_MARK)).fetchall()
     by: dict[int, list[int]] = {}
+    carried: set[int] = set()           # 앞선 대화가 실려 온 스레드 — 같은 예산을 나눠 쓴다
     for r in rows:
         by.setdefault(r["thread_id"], []).append(r["own"] or 0)
+        if r["pre"]:
+            carried.add(r["thread_id"])
     n_all = len(rows)
     over = [sum(1 for r in rows if (r["own"] or 0) > k)
             for k in (_OLD_BODY_MAX, 10_000, 30_000)]
@@ -348,16 +516,22 @@ def _cuts(store: Store, tids: list[int]) -> int:
         lost_was = sum(max(0, size - was) for size in win)
         if not lost_was:
             continue                    # 옛 규칙으로도 전문이던 스레드 — 달라진 것이 없다
-        now = review._body_share(win)
-        lost = sum(max(0, size - now) for size in win)
+        if tid in carried:              # 앞선 대화까지 넣은 실제 재료로 센다
+            ps = _pieces(review._diagnosis_material(store, tid)[1])
+            lost = sum(p["cut"] for p in ps)
+            put = sum(p["put"] for p in ps)
+        else:
+            now = review._body_share(win)
+            lost = sum(max(0, size - now) for size in win)
+            put = sum(win) - lost
         old_hit += 1
         old_lost += lost_was
         old_put.append(sum(win) - lost_was)
-        now_put.append(sum(win) - lost)
+        now_put.append(put)
         if lost:
             now_hit += 1
             now_lost += lost
-        top.append((max(win), tid, len(lens), lost_was, lost, sum(win) - lost))
+        top.append((max(win), tid, len(lens), lost_was, lost, put))
     pc = f"{over[0] / n_all * 100:.1f}%" if n_all else "-"
     print(f"\n메일 {n_all:,}통 · 스레드 {len(by):,}개")
     print(f"  신규 본문이 {_OLD_BODY_MAX:,}자 넘는 메일 {over[0]:,}통({pc}) · "
@@ -377,12 +551,33 @@ def _cuts(store: Store, tids: list[int]) -> int:
         print("|---|---|---|---|---|---|")
         for big, tid, n, lost_was, lost, put in sorted(top, reverse=True)[:10]:
             print(f"| {big:,} | #{tid} | {n} | {lost_was:,} | {lost:,} | {put:,} |")
-    print("\n길이는 SQL 로만 읽은 근사다(몇 자 차이가 난다). 스레드 하나를 정확히 "
-          "보려면 --cuts <번호>, 앞선 대화(보존 인용) 쪽은 --earlier.")
+    print("\n길이는 SQL 로만 읽은 근사다(몇 자 차이가 난다). 앞선 대화가 실려 온 "
+          "스레드의 '지금'은 실제 재료로 셌다.\n스레드 하나를 정확히 보려면 "
+          "--cuts <번호>, 앞선 대화(보존 인용) 쪽은 --earlier.")
     return 0
 
 
+def _safe_console() -> None:
+    """출력을 파일로 돌린 Windows(cp949)에서 `—` 한 글자로 죽지 않게 한다.
+
+    콘솔에 바로 찍을 때는 파이썬이 유니코드로 쓰지만, `> 결과.txt` 로 돌리면 코드
+    페이지로 내려가 긴줄표에서 UnicodeEncodeError 가 난다 — 숫자를 받아 적으려던
+    바로 그 순간이다. cli.main 과 같은 장치를 쓴다."""
+    from mailkb import cli
+
+    cli._install_console_fallback()
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="mailkb")
+        except (AttributeError, ValueError, OSError):
+            try:
+                stream.reconfigure(errors="replace")
+            except (AttributeError, ValueError, OSError):
+                pass
+
+
 def main() -> int:
+    _safe_console()
     ap = argparse.ArgumentParser(description="Minerva 재료 vs 원문 재료 진단 비교")
     ap.add_argument("threads", nargs="*", type=int,
                     help="스레드 번호 (--sizes 는 생략 시 전체)")
@@ -392,7 +587,8 @@ def main() -> int:
     ap.add_argument("--sizes", action="store_true",
                     help="AI 없이 크기만 비교 (raw_chars 기반 — 실환경 권장)")
     ap.add_argument("--earlier", action="store_true",
-                    help="AI 없이 — 앞선 대화(보존 인용)가 재료에 실리는 양의 분포")
+                    help="AI 없이 — 앞선 대화(보존 인용)가 재료에 실리는 양의 분포 "
+                         "(번호를 주면 그 스레드의 인용이 어떤 모양인지)")
     ap.add_argument("--cuts", action="store_true",
                     help="AI 없이 — 재료에서 잘려 나간 양 (번호를 주면 조각별, 생략 시 전체)")
     args = ap.parse_args()
@@ -405,6 +601,11 @@ def main() -> int:
         try:
             if args.cuts:
                 return _cuts(store, args.threads)
+            if args.earlier and args.threads:
+                print("앞선 대화(보존 인용)의 모양 — AI 호출 0, 숫자와 가린 꼴만")
+                for tid in args.threads:
+                    _earlier_shape(store, int(tid))
+                return 0
             return (_earlier(store) if args.earlier
                     else _sizes(store, args.threads))
         finally:

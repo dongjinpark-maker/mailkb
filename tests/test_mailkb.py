@@ -3464,6 +3464,142 @@ class TestPreservedTurns(unittest.TestCase):
         self.assertIn("[1통]", web.render_threads(store, cfg))
 
 
+class TestPreservedTurnsByLabel(unittest.TestCase):
+    """인용 라벨 줄로도 발언을 가른다 (2026-11-20).
+
+    종전에는 `보낸 사람:`·`From:` 줄만 발언의 시작으로 봤다. 회사 메일의 인용 사슬은
+    `--------- Original Message ---------` 아래에 `Sender :`·`Date :`·`Title :` 이
+    오는 형식이라 **한 줄도 못 갈랐고**, 5만 자가 한 덩어리로 남았다(브리핑 재료에서
+    48,605자가 잘린 사고의 뿌리). 라벨이 메일의 경계이므로 이름을 못 읽어도 가른다.
+    """
+
+    @staticmethod
+    def _t(body):
+        from mailkb.clean import parse_preserved
+        return parse_preserved("참조 추가드립니다.\n\n" + PRESERVED_MARK + "\n" + body)
+
+    _WEBMAIL = (
+        "--------- Original Message ---------\n"
+        "Sender : 오태양 <taeyang.oh@corp.example> 책임/SoC개발팀/누리소프트\n"
+        "Date : 2026-07-21 14:00 (GMT+9)\n"
+        "Title : RE: DMA 캐시 정합성\n"
+        "To : 강미래 <mirae.kang@corp.example>\n"
+        "CC : 김도현 <dohyun.kim@corp.example>,\n"
+        " 한바다 <bada.han@corp.example>\n"
+        "\n"
+        "드라이버 쪽 확인했습니다. sync_for_cpu 훅 호출은 UMD 책임입니다.\n"
+        "\n"
+        "--------- Original Message ---------\n"
+        "Sender : 강미래 <mirae.kang@corp.example> 선임/SoC개발팀/누리소프트\n"
+        "Date : 2026-07-20 10:00 (GMT+9)\n"
+        "Title : DMA 캐시 정합성\n"
+        "\n"
+        "런타임에서 출력 텐서 캐시 미스매치가 간헐 재현됩니다.\n")
+
+    def test_webmail_label_with_sender_date_title(self):
+        got = self._t(self._WEBMAIL)
+        self.assertEqual([(t["who"], t["addr"], t["when"], t["subject"]) for t in got], [
+            ("강미래", "mirae.kang@corp.example", "2026-07-20 10:00", "DMA 캐시 정합성"),
+            ("오태양", "taeyang.oh@corp.example", "2026-07-21 14:00", "RE: DMA 캐시 정합성")])
+        # 이름은 주소 앞까지다 — 뒤의 직급·부서는 이름이 아니다
+        self.assertEqual(got[0]["body"], "런타임에서 출력 텐서 캐시 미스매치가 간헐 재현됩니다.")
+        # 수신인 목록이 다음 줄로 이어져도 본문에 섞이지 않는다. 라벨 줄도 안 남는다
+        self.assertEqual(got[1]["body"],
+                         "드라이버 쪽 확인했습니다. sync_for_cpu 훅 호출은 UMD 책임입니다.")
+
+    def test_bold_markdown_form_is_the_same(self):
+        # html_to_markdown 이 <b> 를 ** 로 바꾼다 — 라벨도 머리 낱말도 굵게 올 수 있다
+        md = (self._WEBMAIL.replace("Original Message", "**Original Message**")
+              .replace("Sender :", "**Sender** :").replace("Date :", "**Date :**")
+              .replace("Title :", "**Title** :"))
+        self.assertEqual([(t["who"], t["when"]) for t in self._t(md)],
+                         [("강미래", "2026-07-20 10:00"), ("오태양", "2026-07-21 14:00")])
+
+    def test_label_without_any_header_still_splits(self):
+        # 누가 썼는지는 몰라도 **어디서 메일이 바뀌는지는 안다** — 한 덩어리로 두지 않는다
+        got = self._t("--------- Original Message ---------\n둘째 발언 본문입니다.\n\n"
+                      "-----원본 메시지-----\n첫째 발언 본문입니다.\n")
+        self.assertEqual([(t["who"], t["body"]) for t in got],
+                         [("", "첫째 발언 본문입니다."), ("", "둘째 발언 본문입니다.")])
+
+    def test_label_split_over_lines_and_plain_from(self):
+        got = self._t("---------\n**Original Message**\n---------\n"
+                      "From: 김도현\n이전 인용 내용입니다.\n")
+        self.assertEqual([(t["who"], t["body"]) for t in got],
+                         [("김도현", "이전 인용 내용입니다.")])
+
+    def test_english_outlook_dates_put_turns_in_order(self):
+        got = self._t("-----Original Message-----\n"
+                      "From: Kang Mirae <mirae.kang@corp.example>\n"
+                      "Sent: Monday, July 20, 2026 10:00 AM\nSubject: DMA\n\nfirst\n\n"
+                      "-----Original Message-----\n"
+                      "From: Oh Taeyang <taeyang.oh@corp.example>\n"
+                      "Sent: Tuesday, July 21, 2026 2:00 PM\nSubject: RE: DMA\n\nsecond\n")
+        # 인용 순서가 뒤집혀 있어도(오래된 것이 위) 시각으로 바로잡는다
+        self.assertEqual([(t["who"], t["when"], t["body"]) for t in got],
+                         [("Kang Mirae", "2026-07-20 10:00", "first"),
+                          ("Oh Taeyang", "2026-07-21 14:00", "second")])
+
+    def test_loose_sender_words_do_not_split_ordinary_text(self):
+        # `Sender`·`발신`·`작성자` 는 본문에도 흔하다 — 주소나 다른 머리 필드가 따라올 때만
+        body = ("보낸 사람: 강미래 <mirae.kang@corp.example>\n"
+                "보낸 날짜: 2026-07-20 10:00\n\n"
+                "문서 정보입니다.\n작성자: 홍길동\n버전 1.2 입니다.\n"
+                "Sender: 장비 A 로그\nOriginal Message 항목을 참고해 주세요.\n")
+        got = self._t(body)
+        self.assertEqual(len(got), 1)
+        for mark in ("작성자: 홍길동", "Sender: 장비 A 로그", "Original Message 항목"):
+            self.assertIn(mark, got[0]["body"])
+        # 머리 필드가 따라오면 발언이다(모바일 클라이언트의 `발신:` 형식)
+        got = self._t("발신: 한바다 <bada.han@corp.example>\n날짜: 2026-07-19 09:00\n"
+                      "제목: 일정 건\n\n본문입니다.\n")
+        self.assertEqual([(t["who"], t["when"], t["subject"], t["body"]) for t in got],
+                         [("한바다", "2026-07-19 09:00", "일정 건", "본문입니다.")])
+
+    def test_mixed_chain_of_label_and_header_forms(self):
+        # 한 사슬에 클라이언트가 섞인다 — 웹메일 답장 아래 Outlook 답장
+        got = self._t(self._WEBMAIL + "\n________________________________\n"
+                      "보낸 사람: 한바다 책임 <bada.han@corp.example>\n"
+                      "보낸 날짜: 2026년 07월 19일 Sunday AM 09:00\n제목: 사전 공유\n\n"
+                      "사전 공유드립니다.\n")
+        self.assertEqual([t["who"] for t in got], ["한바다 책임", "강미래", "오태양"])
+        self.assertNotIn("____", got[1]["body"])
+
+    def test_stored_mail_goes_through_the_whole_pipeline(self):
+        # 수집 → 보존 → 가르기 → 화면. HTML 본문이 마크다운을 거쳐 저장되는 실제 경로다
+        from mailkb.clean import html_to_markdown, parse_preserved
+        html = ("<div>참조 추가드립니다. 아래 히스토리 참고 부탁드립니다.</div><div>&nbsp;</div>"
+                "<div>--------- <b>Original Message</b> ---------</div>"
+                "<div><b>Sender</b> : 오태양 &lt;taeyang.oh@corp.example&gt; 책임/SoC개발팀</div>"
+                "<div><b>Date</b> : 2026-07-21 14:00 (GMT+9)</div>"
+                "<div><b>Title</b> : RE: DMA 캐시 정합성</div><div>&nbsp;</div>"
+                "<div>sync_for_cpu 훅 호출은 UMD 책임입니다.</div><div>&nbsp;</div>"
+                "<div>--------- <b>Original Message</b> ---------</div>"
+                "<div><b>Sender</b> : 강미래 &lt;mirae.kang@corp.example&gt; 선임/SoC개발팀</div>"
+                "<div><b>Date</b> : 2026-07-20 10:00 (GMT+9)</div>"
+                "<div><b>Title</b> : DMA 캐시 정합성</div><div>&nbsp;</div>"
+                "<div>출력 텐서 캐시 미스매치가 간헐 재현됩니다.</div>")
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = Config(home=Path(tmp.name), my_addresses=[ME])
+        store = Store(Path(tmp.name) / "t.sqlite", [ME], noise=cfg)
+        self.addCleanup(store.close)
+        rec = _rec("wm", "mirae.kang@corp.example", [ME], "RE: DMA 캐시 정합성",
+                   "2026-07-22T09:00:00", body=html_to_markdown(html))
+        rec.body_html = html
+        store.ingest([rec])
+        row = _nth(store, 1)
+        self.assertIn(PRESERVED_MARK, row["new_content"])
+        turns = parse_preserved(row["new_content"])
+        self.assertEqual([(t["who"], t["when"]) for t in turns],
+                         [("강미래", "2026-07-20 10:00"), ("오태양", "2026-07-21 14:00")])
+        page = web.render_thread(store, cfg, row["thread_id"])
+        self.assertIn("앞선 대화 2턴 — 강미래 → 오태양 · 07-20 ~ 07-21", page)
+        _s, blob, _n = review._diagnosis_material(store, row["thread_id"])
+        self.assertIn("[2026-07-21T14:00 오태양 · 앞선 대화]", blob)
+        self.assertNotIn("인용 원문", blob)
+
+
 class TestRelationBadge(unittest.TestCase):
     """관계 배지 — 발신자와의 왕래 기록에서 나오는 사실만 (2026-08-06).
 
@@ -4806,7 +4942,8 @@ class TestEarlierTalkInBriefing(unittest.TestCase):
         _, prompt = self._run("정리: 상황.")
         self.assertIn(self._OH_SAID, prompt)
         self.assertIn("머리의 이름이 그 말을 한 사람이다", prompt)
-        self.assertIn("`인용 원문` 이라 적힌 덩어리는 인용하지 마라", prompt)
+        self.assertIn("받은 메일과 똑같이 읽고 근거로 인용해도 된다", prompt)
+        self.assertIn("알 수 없으면 사람을 지목하지 마라", prompt)
         # 인물 브리핑은 그대로다 — 재료가 '그 사람 글 + 내 글'이라 제3자 발언이 낄 자리가 없다
         self.assertNotIn("앞선 대화", review.PERSON_DIAGNOSE)
         _who, pblob, _tids = review._person_material(self.store, self.cfg, self.KANG)
@@ -4817,7 +4954,7 @@ class TestEarlierTalkInBriefing(unittest.TestCase):
         self.store.ingest([_rec("p1", self.KANG, [ME], "다른 건",
                                 "2026-07-25T09:00:00", body="단순 확인 요청드립니다.")])
         tid = self._tid("p1")
-        with mock.patch.object(review, "parse_preserved",
+        with mock.patch.object(review, "attributed_turns",
                                side_effect=AssertionError("인용이 없는데 파서를 불렀다")):
             _s, blob, _n = self._blob(tid)
             msgs = self.store.thread_messages(tid)
@@ -4878,20 +5015,69 @@ class TestEarlierTalkInBriefing(unittest.TestCase):
                          f"발언{k}번 " + "가" * size + "\n")
         return "\n".join(parts)
 
-    def test_over_budget_drops_the_oldest_turns_and_says_so(self):
+    # 메일이 예산을 다 쓰게 하는 본문 — 그때 앞선 대화에 남는 것은 제 몫뿐이다
+    _FULL = "메일머리표식 " + "가나다라마바사아자차 " * 6_000 + "메일꼬리표식"
+
+    def test_earlier_talk_shares_the_budget_like_received_mail(self):
+        # 회사 PC(2026-11-20): 메일 예산이 59,538자 남았는데 앞선 대화 48,605자가
+        # 잘렸다 — 받은 본문은 안내 한 줄이고 대부분이 인용 사슬인 메일이다. 따로
+        # 준 작은 자리(6,000자)에 묶여 있었다. 사용자 결정: "이전 대화 내용은 기존
+        # 대화처럼 모두 사용하자" — 발언 하나가 메일 한 통이다.
+        for gone in ("_DIAG_PRE_TOTAL", "_DIAG_PRE_TURN", "_earlier_room"):
+            self.assertFalse(hasattr(review, gone))     # 따로 둔 숫자는 없다
+        # 발언 하나가 5만 자 — 전문이 실린다
+        self._set("e1", self._OWN + "\n\n" + PRESERVED_MARK + "\n"
+                  + self._many_turns(1, 50_000))
+        _s, blob, _n = self._blob()
+        self.assertNotIn("중략", blob)
+        self.assertGreater(len(blob), 50_000)
+        # 못 가른 원문 5만 자도
+        self._set("e1", self._OWN + "\n\n" + PRESERVED_MARK + "\n"
+                  + "> 앞사람 글 " + "가나다라마바사아자차 " * 4_700 + "원문꼬리표식")
+        _s, blob, _n = self._blob()
+        self.assertNotIn("중략", blob)
+        self.assertIn("원문꼬리표식", blob)
+        self.assertIn("[앞선 대화 · 인용 원문]", blob)
+        # 여러 발언 — 하나도 안 빠진다(따로 자리를 줄 때는 6턴만 싣고 3턴을 뺐다)
         self._set("e1", self._OWN + "\n\n" + PRESERVED_MARK + "\n"
                   + self._many_turns(9, 990))
         _s, blob, _n = self._blob()
-        kept = review._DIAG_PRE_TOTAL // 996            # '발언k번 ' + 990자
-        self.assertGreater(9, kept)                     # 이 픽스처는 정말 넘친다
-        for k in range(9, 9 - kept, -1):
-            self.assertIn(f"발언{k}번", blob)           # 내가 들어온 시점에 가까운 쪽
-        for k in range(9 - kept, 0, -1):
-            self.assertNotIn(f"발언{k}번", blob)
-        self.assertIn(f"아래 {kept}턴은", blob)
-        self.assertIn(f"그보다 앞선 {9 - kept}턴은 생략했다", blob)
-        # 앞선 대화가 아무리 길어도 받은 메일의 몫은 그대로다 — 예산이 따로다
-        self.assertIn(self._OWN, blob)
+        for k in range(1, 10):
+            self.assertIn(f"발언{k}번", blob)
+        self.assertIn("아래 9턴은", blob)
+        self.assertNotIn("생략", blob)
+        # 합이 총예산을 넘으면 **같이** 줄어든다 — 긴 발언과 긴 메일이 같은 몫을 받는다
+        self._set("e1", self._OWN + "\n\n" + PRESERVED_MARK + "\n"
+                  + self._many_turns(1, 200_000))
+        self._set("e2", "메일머리표식 " + "가나다라마바사아자차 " * 4_000 + "메일꼬리표식")
+        _s, blob, _n = self._blob()
+        mine = blob.index("[2026-07-22T15:00 나]")
+        turn = blob[blob.index("· 앞선 대화]"):blob.index("[2026-07-22T09:00 kang]")]
+        mail = blob[mine:]
+        for seg in (turn, mail):
+            self.assertIn("…(중략", seg)                # 조각을 전문으로 믿지 않게
+        self.assertIn("메일꼬리표식", mail)             # 앞뒤를 나눠 담는다 — 결론이 뒤에 있다
+        self.assertLess(abs(len(turn) - len(mail)), 200)
+        # 전체 천장은 받은 메일만 있을 때와 같다
+        self.assertLessEqual(len(blob), review._DIAG_TOTAL + 600)
+        self.assertGreater(len(blob), review._DIAG_TOTAL - 600)
+
+    def test_window_drops_the_oldest_turns_and_says_so(self):
+        # 발언도 통수 창(최근 40건)에 든다 — 받은 메일 45통짜리 스레드가 앞의 5통을
+        # 빼는 것과 같은 규칙이다. 내가 들어온 시점에 가까운 발언이 남는다.
+        self._set("e1", self._OWN + "\n\n" + PRESERVED_MARK + "\n"
+                  + self._many_turns(45, 30))
+        _s, blob, total = self._blob()
+        self.assertEqual(total, 2)
+        gone = 45 + 2 - review._DIAG_MSGS               # 발언 45 + 메일 2 − 창 40
+        for k in range(1, gone + 1):
+            self.assertNotIn(f"발언{k}번 ", blob)
+        for k in range(gone + 1, 46):
+            self.assertIn(f"발언{k}번 ", blob)
+        self.assertIn(f"(인용 속의 앞선 대화 {gone}건 생략 — 최근 "
+                      f"{review._DIAG_MSGS}건만 실었다)", blob)
+        self.assertIn(f"아래 {45 - gone}턴은", blob)
+        self.assertIn(self._OWN, blob)                  # 받은 메일은 창 안이다
         self.assertIn(self._MINE, blob)
         # 근거 검사는 안 실린 발언까지 본다(모델은 본 것만 인용하므로 넓어도 무해하다)
         self.assertTrue(distill._QuoteChecker(self.store, preserved=True)
@@ -4917,28 +5103,147 @@ class TestEarlierTalkInBriefing(unittest.TestCase):
                          "위 문단입니다.\n-----\n아래 문단입니다.")
 
     def test_one_long_turn_is_cut_in_the_middle_with_a_mark(self):
+        # 자리가 모자랄 때만이다 — 그때는 긴 조각끼리 남은 자리를 똑같이 나눈다
         self._set("e1", self._OWN + "\n\n" + PRESERVED_MARK + "\n"
-                  + self._many_turns(1, 5000))
+                  + self._many_turns(1, 50_000))
+        self._set("e2", self._FULL)
         _s, blob, _n = self._blob()
         self.assertIn("발언1번", blob)
-        self.assertIn("…(중략", blob)                   # 조각을 전문으로 믿지 않게
         seg = blob[blob.index("· 앞선 대화]"):blob.index("[2026-07-22T09:00 kang]")]
-        self.assertLessEqual(len(seg), review._DIAG_PRE_TURN + 40)
+        self.assertIn("…(중략", seg)                    # 조각을 전문으로 믿지 않게
+        share = review._body_share([50_006, len(self._OWN), len(self._FULL)])
+        self.assertLessEqual(len(seg), share + 40)
+        self.assertGreater(share, 29_000)               # 총예산의 절반쯤 — 따로 준 6,000자가 아니다
+        self.assertIn("메일머리표식", blob)
+        self.assertIn("메일꼬리표식", blob)
 
-    def test_chain_that_cannot_be_split_is_context_only(self):
+    # 인용된 메일이 제 인용 사슬을 달고 있다 — 안쪽 머리는 턴 파서가 모르는 귀속줄이다
+    _NESTED = ("________________________________\n"
+               "보낸 사람: 오태양 책임 <oh@corp.example>\n"
+               "보낸 날짜: 2026년 07월 21일 Tuesday PM 02:00\n"
+               "제목: RE: DMA 캐시 정합성\n\n"
+               "드라이버 쪽 확인했습니다. sync_for_cpu 훅 호출은 UMD 책임입니다.\n\n"
+               "2026년 7월 20일 (월) 오전 10:00, 한바다 <han@corp.example>님이 작성:\n"
+               "> 안쪽사람표식 릴리스는 8월 말로 미루기로 했습니다.\n"
+               "> 일정표는 따로 공유하겠습니다.\n")
+
+    def test_inner_chain_of_a_turn_is_not_that_speakers_words(self):
+        # 5만 자짜리 '발언'의 정체일 수 있는 것 — 여러 사람의 메일이 한 사람의 발언으로
+        # 뭉친다. 절단기는 안쪽 경계를 안다: 그 앞까지만 그 사람의 말로 친다.
+        from mailkb.clean import attributed_turns, parse_preserved
+        text = self._OWN + "\n\n" + PRESERVED_MARK + "\n" + self._NESTED
+        inner = "릴리스는 8월 말로 미루기로 했습니다"
+        seen = parse_preserved(text)
+        self.assertEqual(len(seen), 1)
+        self.assertIn(inner, seen[0]["body"])           # 화면이 쓰는 턴은 그대로다
+        said, rest = attributed_turns(text)
+        self.assertEqual([t["who"] for t in said], ["오태양 책임"])
+        self.assertIn(self._OH_SAID, said[0]["body"])
+        self.assertNotIn(inner, said[0]["body"])
+        self.assertIn(inner, rest)
+        self.assertIn("님이 작성:", rest)               # 경계 줄부터가 나머지다
+        # 안쪽 인용이 없으면 아무것도 안 바뀐다
+        plain = self._OWN + "\n\n" + PRESERVED_MARK + "\n" + self._CHAIN
+        said2, rest2 = attributed_turns(plain)
+        self.assertEqual([t["body"] for t in said2],
+                         [t["body"] for t in parse_preserved(plain)])
+        self.assertEqual(rest2, "")
+        # 재료 — 오태양의 말은 오태양 머리 아래, 나머지는 '누가 썼는지 모르는 원문'으로
+        self._set("e1", text)
+        _s, blob, _n = self._blob()
+        oh = "[2026-07-21T14:00 오태양 책임 · 앞선 대화]"
+        rawh = "[앞선 대화 · 인용 원문]"
+        self.assertIn("발언으로 가르지 못한 **더 앞선** 원문이다", blob)
+        self.assertIn("누가 쓴 말인지는 그 안의 머리 줄을 보고 판단하라", blob)
+        self.assertLess(blob.index(rawh), blob.index(oh))       # 더 오래된 쪽이 앞이다
+        self.assertIn(inner, blob[blob.index(rawh):blob.index(oh)])
+        self.assertNotIn(inner, blob[blob.index(oh):])
+        # 근거 — 안쪽 문장도 받은 메일처럼 근거가 된다. **오태양의 이름은 붙지 않는다**
+        chk = distill._QuoteChecker(self.store, preserved=True)
+        self.assertTrue(chk.ok(self.tid, self._OH_SAID))
+        self.assertTrue(chk.ok(self.tid, inner))
+        owners = {(r[1], r[2]) for r in chk._bodies(self.tid)
+                  if distill._norm_ws(inner) in r[0]}
+        self.assertEqual(owners, {("", "")})            # 주인을 댈 수 없는 행에만 있다
+        msgs = self.store.thread_messages(self.tid)
+        self.assertEqual(review.quote_origin(msgs, self._OH_SAID),
+                         "앞선 대화 · 07-21 오태양 책임")
+        self.assertEqual(review.quote_origin(msgs, inner), "앞선 대화")
+        got, _ = self._run(f'정리: 상황.\n배경: 릴리스가 미뤄졌다 | 근거: "{inner}"\n'
+                           f'배경: 훅 호출은 UMD 책임이다 | 근거: "{self._OH_SAID}"')
+        self.assertIn("릴리스가 미뤄졌다", got)
+        self.assertIn("훅 호출은 UMD 책임이다", got)
+        self.assertEqual(review.diagnose_thread.last_dropped, 0)
+        html = web.render_thread(self.store, self.cfg, self.tid)
+        self.assertIn("근거(앞선 대화): " + inner, html)
+        self.assertIn("근거(앞선 대화 · 07-21 오태양 책임): " + self._OH_SAID, html)
+        # 스레드 화면의 접힌 인용에는 안쪽 사슬이 그대로 보인다
+        self.assertIn("안쪽사람표식", html)
+
+    def test_shape_tool_shows_the_format_not_the_content(self):
+        # 회사 메일의 인용 형식을 개발 쪽에서 볼 수 없다 — 글자를 전부 가린 꼴만 건네받는다
+        bench = self._bench()
+        self._set("e1", self._OWN + "\n\n" + PRESERVED_MARK + "\n" + self._NESTED
+                  + "\n--------- Original Message ---------\n"
+                    "보내는분 : 한바다 <han@corp.example>\n시각 : 2026-07-19 09:00\n\n"
+                    "더안쪽표식 본문입니다.\n제목: 일정 건 참고\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            bench._earlier_shape(self.store, self.tid)
+        out = buf.getvalue()
+        self.assertIn("인용을 실어 온 메일 1통", out)
+        self.assertIn("발언을 여는 줄 2개 — 인용 라벨 줄(Original Message 류) 1 · "
+                      "발신인 머리 줄 1", out)
+        self.assertIn("가른 발언 2개", out)
+        self.assertIn("이름을 읽은 발언 1개 · 시각을 읽은 발언 1개", out)
+        self.assertIn("귀속줄 1", out)
+        self.assertIn("`>` 로 시작하는 줄 2", out)
+        self.assertRegex(out, r"발언 안쪽의 가르지 못한 나머지 \d{2,3}자")
+        # 라벨 아래의 **모르는 머리**는 전부 가린다 — 콜론 앞 낱말은 길이만 남는다
+        self.assertIn("인용 라벨 줄 바로 아래 줄들의 꼴", out)
+        self.assertIn("`가가가가 : 가 <x@x.x>`", out)
+        self.assertIn("`가가 : 9-9-9 9:9`", out)
+        # 본문에 남은 머리 낱말 줄 — 아는 라벨은 낱말을 남긴다
+        self.assertIn("`제목: 가 가 가`", out)
+        self.assertIn("발신인 머리로 읽은 줄의 꼴", out)
+        self.assertIn("`보낸 사람: 가 가 <x@x.x>`", out)
+        for leak in ("오태양", "한바다", "보내는분", "시각 :", "han@", "oh@", "corp", "DMA",
+                     "UMD", "일정", "안쪽사람표식", "더안쪽표식", "릴리스"):
+            self.assertNotIn(leak, out)
+        self.assertEqual(bench._shape("보낸 사람: 김도현 책임 <dh.kim@nurisoft.co.kr>"),
+                         "보낸 사람: 가 가 <x.x@x.x.x>")
+        self.assertEqual(bench._shape("> **From:** Kim Dohyun [mailto:a@b.com]"),
+                         "> **From:** x x [x:x@x.x]")
+        self.assertEqual(bench._shape("그냥 본문 문장입니다."), "")
+        self.assertEqual(bench._mask_all("김도현님: 확인 부탁드립니다 3건"), "가가가가: 가 가 9가")
+        self.assertEqual(bench._mask_all("콜론 없는 줄 abc 123"), "가 가 가 x 9")
+        # 하나도 못 가른 덩어리도 같은 방식으로 본다
+        self._set("e1", self._OWN + "\n\n" + PRESERVED_MARK + "\n"
+                  + "> 한바다 님이 쓴 글입니다.\n> 제목: 일정 건\n> 본문입니다.\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            bench._earlier_shape(self.store, self.tid)
+        self.assertIn("발언을 하나도 가르지 못했다", buf.getvalue())
+        self.assertIn("`> 제목: 가 가`", buf.getvalue())
+        self.assertNotIn("한바다", buf.getvalue())
+
+    def test_chain_that_cannot_be_split_is_used_without_a_name(self):
         said = "일정은 8월 말로 정했습니다"
         self._set("e1", self._OWN + "\n\n" + PRESERVED_MARK + "\n"
                   + f"> 앞사람이 쓴 글입니다. {said}.\n> 그렇게 하시죠.")
         _s, blob, _n = self._blob()
         self.assertIn("[앞선 대화 · 인용 원문]", blob)
         self.assertIn(said, blob)
-        self.assertIn("누가 쓴 문장인지 확실하지 않다", blob)
-        # 화자를 댈 수 없는 문장은 근거가 못 된다 — 줄이 탈락한다
+        self.assertIn("발언을 가르지 못해 원문 그대로 실었다", blob)
+        self.assertIn("누가 쓴 말인지는 그 안의 머리 줄을 보고 판단하라", blob)
+        # 받은 메일처럼 근거가 된다 — 다만 화자를 댈 수 없으니 출처에 이름이 없다
         got, _ = self._run(f'정리: 상황.\n배경: 일정이 정해졌다 | 근거: "{said}"')
-        self.assertNotIn("배경:", got)
-        self.assertEqual(review.diagnose_thread.last_dropped, 1)
+        self.assertIn("배경: 일정이 정해졌다", got)
+        self.assertEqual(review.diagnose_thread.last_dropped, 0)
         self.assertEqual(review.quote_origin(
-            self.store.thread_messages(self.tid), said), "")
+            self.store.thread_messages(self.tid), said), "앞선 대화")
+        # 수확·인물 쪽 검사기는 여전히 받지 않는다
+        self.assertFalse(distill._QuoteChecker(self.store).ok(self.tid, said))
 
     # ------------------------------------------------------------- 근거
     def test_earlier_turn_is_evidence_for_the_thread_briefing(self):
@@ -4962,7 +5267,9 @@ class TestEarlierTalkInBriefing(unittest.TestCase):
         # 발언의 주인은 실어 온 사람이 아니다 — 검사기 행에도 그렇게 남는다
         rows = distill._QuoteChecker(self.store, preserved=True)._bodies(self.tid)
         owner = [r for r in rows if distill._norm_ws(self._OH_SAID) in r[0]]
-        self.assertEqual([(r[1], r[2]) for r in owner], [("오태양 책임", self.OH)])
+        # (인용 전체를 담은 행은 주인이 비어 있다 — 발언으로 못 가른 부분의 자리다)
+        self.assertEqual(sorted((r[1], r[2]) for r in owner),
+                         [("", ""), ("오태양 책임", self.OH)])
         # 인물 브리핑은 같은 문장을 근거로 받지 않는다
         with mock.patch.object(review, "ai_run", return_value=(
                 f'정리: 상황.\n배경: 훅 호출은 UMD 책임이다 | 근거: "{self._OH_SAID}"')):
@@ -5032,7 +5339,8 @@ class TestEarlierTalkInBriefing(unittest.TestCase):
         # 5만 자 남짓 — 통당 상한이 있던 때는 48,000자쯤 버렸다. 지금은 전문이다
         self._set("e2", "비밀낱말 " + "가나다라마바사아자차 " * 4700)
         out = self._out(bench._cuts, self.store, [self.tid])
-        self.assertIn("본문 합이 총예산 안이라 전문", out)
+        self.assertRegex(out, r"받은 메일 2 · 앞선 대화의 발언 2 · 못 가른 원문 0\) · "
+                              r"예산 60,000자 중 5\d,\d{3}자 사용")
         self.assertIn("잘린 조각 없음", out)
         whole = self._out(bench._cuts, self.store, [])
         self.assertIn("신규 본문이 3,000자 넘는 메일 1통", whole)
@@ -5051,12 +5359,10 @@ class TestEarlierTalkInBriefing(unittest.TestCase):
                    for x in re.findall(r"중략 — ([\d,]+)자", blob))
         self.assertGreater(want, 40_000)
         out = self._out(bench._cuts, self.store, [self.tid])
-        share = review._body_share([len(self._OWN), 103_405])
-        self.assertIn(f"한 통의 몫 {share:,}자", out)
         self.assertIn("| 메일 | 07-22 | ", out)
         self.assertIn(f"| {want:,} | - |", out)
         self.assertIn(f"가장 큰 생략 {want:,}자(메일)", out)
-        self.assertRegex(out, r"메일 예산의 남은 자리 \d{1,2}자")   # 남기지 않고 다 쓴다
+        self.assertRegex(out, r"· 예산의 남은 자리 \d{1,2}자")      # 남기지 않고 다 쓴다
         whole = self._out(bench._cuts, self.store, [])
         self.assertIn("지금 규칙(총예산 60,000자를 나눠 씀)으로 잘리는 스레드 1개", whole)
         self.assertIn("→ 0개는 이제 전문이 실린다", whole)
@@ -5070,18 +5376,22 @@ class TestEarlierTalkInBriefing(unittest.TestCase):
 
     def test_cut_tool_tells_earlier_talk_from_mail(self):
         bench = self._bench()
-        # 못 가른 인용 원문 5만 자 — 상한(전체 6,000자)에 맞춰 잘린다
+        # 못 가른 인용 원문 12만 자 — 총예산을 넘는다
         self._set("e1", self._OWN + "\n\n" + PRESERVED_MARK + "\n"
-                  + "> 앞사람 글 " + "가나다라마바사아자차 " * 4700)
+                  + "> 앞사람 글 " + "가나다라마바사아자차 " * 11_000)
         out = self._out(bench._cuts, self.store, [self.tid])
         self.assertIn("| 앞선 대화(못 가른 원문) | - |", out)
-        self.assertRegex(out, r"가장 큰 생략 4\d,\d{3}자\(앞선 대화\(못 가른 원문\)\)")
-        # 발언 하나가 5만 자 — 발언 상한(1,200자)에 걸린다
+        self.assertRegex(out, r"가장 큰 생략 6\d,\d{3}자\(앞선 대화\(못 가른 원문\)\)")
+        # 예산을 받은 메일과 함께 다 쓴다 — 회사 PC 에서는 "메일 예산의 남은 자리
+        # 59,538자" 가 나왔고, 그 자리를 앞선 대화가 못 쓰고 있었다
+        self.assertIn("받은 메일 2 · 앞선 대화의 발언 0 · 못 가른 원문 1", out)
+        self.assertRegex(out, r"· 예산의 남은 자리 \d{1,2}자")
+        # 발언 하나가 12만 자
         self._set("e1", self._OWN + "\n\n" + PRESERVED_MARK + "\n"
-                  + self._many_turns(1, 50_000))
+                  + self._many_turns(1, 120_000))
         out = self._out(bench._cuts, self.store, [self.tid])
         self.assertIn("| 앞선 대화(발언) | 07-01 |", out)
-        self.assertRegex(out, r"가장 큰 생략 4\d,\d{3}자\(앞선 대화\(발언\)\)")
+        self.assertRegex(out, r"가장 큰 생략 6\d,\d{3}자\(앞선 대화\(발언\)\)")
         # 본문 안의 `---` 줄은 조각을 가르지 않는다 — 뒷부분의 중략도 그 메일의 것이다
         self._set("e1", self._OWN)
         self._set("e2", "위 문단입니다.\n---\n" + "가나다라마바사아자차 " * 7000)
@@ -5091,6 +5401,25 @@ class TestEarlierTalkInBriefing(unittest.TestCase):
         # 잘린 것이 없으면 그렇게 말한다
         self._set("e2", self._MINE)
         self.assertIn("잘린 조각 없음", self._out(bench._cuts, self.store, [self.tid]))
+
+    def test_measuring_tool_survives_a_redirected_korean_console(self):
+        # 회사 PC 에서 결과를 파일로 받아 적으려고 `> 결과.txt` 를 붙이면 출력이 코드
+        # 페이지(cp949)로 내려간다. 긴줄표(—) 한 글자가 cp949 에 없어 첫 줄에서 죽었다
+        # (2026-11-20 검증 중 발견 — 콘솔에 바로 찍을 때는 안 드러난다).
+        import subprocess
+        tool = Path(__file__).resolve().parent.parent / "tools" / "bench_diagnose.py"
+        self.store.db.commit()
+        (self.home / "config.toml").write_text(
+            'my_addresses = ["%s"]\n' % ME, encoding="utf-8")
+        env = dict(os.environ, PYTHONIOENCODING="cp949")
+        for mode in (["--cuts"], ["--cuts", str(self.tid)], ["--earlier"],
+                     ["--earlier", str(self.tid)]):
+            r = subprocess.run([sys.executable, str(tool), "--home", str(self.home), *mode],
+                               capture_output=True, env=env, timeout=60)
+            out = r.stdout.decode("cp949")
+            self.assertEqual(r.returncode, 0, r.stderr.decode("cp949", "replace")[-300:])
+            self.assertIn("AI 호출 0", out)
+            self.assertNotIn("Traceback", out + r.stderr.decode("cp949", "replace"))
 
     def test_measuring_tool_prints_numbers_only(self):
         # 회사 PC 에서 돌려 숫자만 가져오는 도구 — 메일 내용이 새면 안 된다
@@ -5102,7 +5431,10 @@ class TestEarlierTalkInBriefing(unittest.TestCase):
         self.assertIn("인용이 실려 온 스레드 1", out)
         self.assertIn("발언을 가른 스레드 1 · 못 가른 스레드 0", out)
         self.assertIn("| 발언 수(턴) | 2 | 2 | 2 |", out)
-        self.assertIn(f"전체 {review._DIAG_PRE_TOTAL:,}자", out)
+        self.assertIn(f"받은 메일과 같은 규칙이다 — 최근 {review._DIAG_MSGS}건 · "
+                      f"합쳐서 {review._DIAG_TOTAL:,}자", out)
+        self.assertIn("밖이라 안 실리는 앞선 대화 0건", out)
+        self.assertIn("가운데가 잘리는 발언 0 / 2 · 잘리는 원문 덩어리 0", out)
         for leak in ("오태양", "강미래", "kang", "DMA", "UMD", "corp.example"):
             self.assertNotIn(leak, out)
         # 재료 조립과 같은 함수로 센다 — 실리는 양이 실제 재료의 발언 본문 합과 같다

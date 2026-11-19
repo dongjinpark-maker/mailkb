@@ -21,7 +21,8 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from . import review
-from .clean import parse_preserved, smart_truncate, strip_preserved
+from .clean import (attributed_turns, smart_truncate, strip_preserved,
+                    take_preserved)
 from .config import Config
 from .store import DOSSIER_VALIDATOR_VERSION, Store
 
@@ -136,9 +137,11 @@ class _QuoteChecker:
 
     **예외는 `preserved=True` 하나**(2026-11-19, 스레드 현안 브리핑 전용). 그 산출은
     `배경: 서술 | 근거: "문장"` 꼴이라 **화자를 기록하지 않는다** — 위 사고가 날
-    자리가 없다. 그래서 내가 받기 전에 오간 발언도 근거로 받는데, **발언별로 가른
-    것만**이다(`clean.parse_preserved`). 못 가른 덩어리는 누가 쓴 문장인지 댈 수
-    없어 여전히 뺀다. 화자를 기록하는 산출(수확·인물 프로필·위키)은 켜지 않는다.
+    자리가 없다. 그래서 내가 받기 전에 오간 대화도 받은 메일과 똑같이 근거로 받는다
+    (2026-11-20 — 발언으로 가르지 못한 원문까지. 중간에 들어온 스레드에서는 그 인용
+    사슬이 대화의 본체다). 화자는 **댈 수 있을 때만** 행에 남는다
+    (`clean.attributed_turns`). 화자를 기록하는 산출(수확·인물 프로필·위키)은 켜지
+    않는다.
     """
 
     def __init__(self, store: Store, addr: str | None = None,
@@ -163,10 +166,13 @@ class _QuoteChecker:
                                  bool(m["is_sent"])))
                 if self.preserved:
                     # 발언의 주인은 실어 온 사람(m)이 아니라 인용 머리의 사람이다
-                    for t in parse_preserved(m["new_content"] or ""):
-                        if t["body"].strip():
-                            rows.append((_norm_ws(t["body"]), t["who"],
-                                         t["addr"], False))
+                    for t in attributed_turns(m["new_content"] or "")[0]:
+                        rows.append((_norm_ws(t["body"]), t["who"],
+                                     t["addr"], False))
+                    # 인용 전체 — 발언으로 못 가른 부분도 근거다. 주인은 비워 둔다
+                    pre = _norm_ws(take_preserved(m["new_content"] or ""))
+                    if pre:
+                        rows.append((pre, "", "", False))
             self.cache[tid] = rows
         return self.cache[tid]
 

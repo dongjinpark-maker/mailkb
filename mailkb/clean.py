@@ -1118,11 +1118,19 @@ def _hdr_rx(*labels: str) -> re.Pattern:
 
 _PRES_HDR = {
     "who": _hdr_rx(r"보낸\s*사람", "발신자", "From"),
-    "when": _hdr_rx(r"보낸\s*날짜", r"보낸\s*시간", "Sent", "Date"),
-    "subject": _hdr_rx("제목", "Subject"),
-    "to": _hdr_rx(r"받는\s*사람", "수신자", "To", "Cc", "참조"),
+    "when": _hdr_rx(r"보낸\s*날짜", r"보낸\s*시간", "날짜", "일시", "Sent", "Date"),
+    "subject": _hdr_rx("제목", "Subject", "Title"),
+    "to": _hdr_rx(r"받는\s*사람", r"받는\s*이", "수신자", "수신인", "수신",
+                  "To", "Cc", "Bcc", "참조"),
 }
-_PRES_ADDR_RX = re.compile(r"<([^<>@\s]+@[^<>\s]+)>|\[mailto:([^\]\s]+)\]")
+# 느슨한 발신인 라벨 — **혼자서는 발언의 시작으로 보지 않는다.** `Sender :` 는 사내
+# 웹메일이 `Original Message` 라벨 아래에 찍는 머리이고(Sender/Date/Title),
+# `발신:`·`작성자:` 는 모바일 클라이언트가 쓴다. 그런데 이 낱말들은 본문에도 흔하다
+# ("작성자: 홍길동" 문서 머리, "Sender: 장비 A" 로그). 그래서 주소가 같은 줄에
+# 있거나 다른 머리 필드가 바로 따라올 때만 머리로 친다(_pres_is_who).
+_PRES_WHO_LOOSE = _hdr_rx("Sender", "발신인", "발신", "작성자", r"보낸\s*이")
+_PRES_ADDR_RX = re.compile(r"<([^<>@\s]+@[^<>\s]+)>|\[mailto:([^\]\s]+)\]"
+                           r"|\[[^\]\s]+@[^\]\s]+\]\(mailto:([^)\s]+)\)")
 # 2026년 08월 01일 Saturday PM 02:00 / 2026-08-01 14:00 / 2026/8/1 오후 2:00
 _PRES_DATE_RX = re.compile(r"(\d{4})\s*[년\-/.]\s*(\d{1,2})\s*[월\-/.]\s*(\d{1,2})")
 # 오전/오후 표시는 앞(한국어·Outlook 한글)에도 뒤(영문 `2:00 PM`)에도 온다.
@@ -1130,12 +1138,29 @@ _PRES_TIME_RX = re.compile(r"(AM|PM|오전|오후)?\s*(\d{1,2}):(\d{2})\s*(AM|PM
                            re.IGNORECASE)
 
 
+_PRES_MONTHS = {m: i for i, m in enumerate(
+    "jan feb mar apr may jun jul aug sep oct nov dec".split(), 1)}
+_MON = r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?"
+_PRES_EN_DATE_RX = re.compile(
+    rf"\b{_MON}\s+(\d{{1,2}}),?\s+(\d{{4}})|\b(\d{{1,2}})\s+{_MON}\s+(\d{{4}})",
+    re.IGNORECASE)
+
+
 def _pres_when(raw: str) -> str:
     """보낸 날짜 문자열 → 'YYYY-MM-DD HH:MM' (시각 못 읽으면 날짜만, 아니면 '')."""
-    d = _PRES_DATE_RX.search(raw or "")
-    if not d:
-        return ""
-    out = f"{int(d.group(1)):04d}-{int(d.group(2)):02d}-{int(d.group(3)):02d}"
+    raw = raw or ""
+    d = _PRES_DATE_RX.search(raw)
+    if d:
+        out = f"{int(d.group(1)):04d}-{int(d.group(2)):02d}-{int(d.group(3)):02d}"
+    else:
+        # 영문 Outlook — `Tuesday, July 21, 2026 2:00 PM` · `21 July 2026 14:00`.
+        # 못 읽으면 턴 순서를 '인용은 최신이 위'라는 가정에 맡기게 된다.
+        d = _PRES_EN_DATE_RX.search(raw)
+        if not d:
+            return ""
+        mon = _PRES_MONTHS[(d.group(1) or d.group(5))[:3].lower()]
+        day, year = (d.group(2) or d.group(4)), (d.group(3) or d.group(6))
+        out = f"{int(year):04d}-{mon:02d}-{int(day):02d}"
     t = _PRES_TIME_RX.search(raw[d.end():])
     if not t:
         return out
@@ -1154,17 +1179,84 @@ def _pres_rule(line: str) -> bool:
     return bool((len(s) >= 3 and _DASH_ONLY_RX.match(s)) or _HTML_CUT_RX.match(s))
 
 
+def _pres_label(line: str) -> bool:
+    """인용 라벨 줄인가 — `-----Original Message-----` · `**원본 메시지**` 류.
+
+    절단기가 인용의 시작으로 치는 것과 같은 꼴만 받는다(대시나 강조가 있어야 한다).
+    본문 문장 "Original Message 항목을 참고하세요" 는 라벨이 아니다."""
+    return any(rx.search(line) for rx in _CUT_LINE_RES[:2])
+
+
+def _pres_field(s: str) -> tuple[str, str]:
+    """머리 줄 한 줄 → (필드, 값). 머리가 아니면 ('', '')."""
+    for key, rx in _PRES_HDR.items():
+        m = rx.match(s)
+        if m:
+            return key, m.group(1).strip().strip("*").strip()
+    m = _PRES_WHO_LOOSE.match(s)
+    if m:
+        return "who", m.group(1).strip().strip("*").strip()
+    return "", ""
+
+
+def _pres_is_who(lines: list[str], i: int) -> bool:
+    """i 번째 줄이 발언을 여는 발신인 머리인가."""
+    s = lines[i].strip()
+    if _PRES_HDR["who"].match(s):
+        return True
+    if not _PRES_WHO_LOOSE.match(s):
+        return False
+    if _ADDR_HINT.search(s):
+        return True
+    near = [ln.strip() for ln in lines[i + 1:i + 8] if ln.strip()][:4]
+    return any(_pres_field(x)[0] in ("when", "subject", "to") for x in near)
+
+
+def _pres_starts(lines: list[str]) -> list[int]:
+    """발언이 시작되는 줄 번호들.
+
+    발언을 여는 것은 둘이다: **인용 라벨 줄**(`Original Message` 류)과 **발신인 머리
+    줄**(`보낸 사람:`·`From:`·…). 라벨 바로 아래의 발신인 줄은 그 발언의 머리이지
+    새 발언이 아니다. 라벨만 있고 발신인 줄이 없어도 가른다 — 누가 썼는지는 몰라도
+    **어디서 메일이 바뀌는지는 안다**(2026-11-20: 회사 메일의 5만 자 인용 사슬이 한
+    덩어리로 남은 것이 이 경우였다. 종전에는 발신인 줄만 발언의 시작으로 봤다).
+    """
+    starts: list[int] = []
+    owned = -1                  # 라벨이 가져간 발신인 줄 — 새 발언을 열지 않는다
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if not s:
+            continue
+        if _pres_label(s):
+            starts.append(i)
+            seen = 0
+            for k in range(i + 1, min(len(lines), i + 10)):
+                t = lines[k].strip()
+                if not t or _pres_rule(t):
+                    continue
+                seen += 1
+                if _pres_is_who(lines, k):
+                    owned = k
+                    break
+                if seen >= 4 or not _pres_field(t)[0]:
+                    break       # 머리 블록이 끝났다 — 발신인 줄 없는 라벨이다
+        elif i != owned and _pres_is_who(lines, i):
+            starts.append(i)
+    return starts
+
+
 def parse_preserved(text: str) -> list[dict]:
     """보존 인용 블록을 대화 턴 목록으로 — 오래된 것부터.
 
     각 턴은 {"who", "addr", "when", "subject", "body"}. 인용 블록이 없거나
-    헤더를 못 찾으면 **빈 리스트**(호출측은 원문 표시로 폴백한다).
+    헤더를 못 찾으면 **빈 리스트**(호출측은 원문 표시로 폴백한다). 라벨 줄로만
+    갈린 턴은 who 가 빈 문자열일 수 있다 — 화면은 '발신자 미상'으로 그린다.
     """
     block = take_preserved(text)
     if not block:
         return []
     lines = block.splitlines()
-    starts = [i for i, ln in enumerate(lines) if _PRES_HDR["who"].match(ln.strip())]
+    starts = _pres_starts(lines)
     if not starts:
         return []
     turns = []
@@ -1172,35 +1264,40 @@ def parse_preserved(text: str) -> list[dict]:
         end = starts[n + 1] if n + 1 < len(starts) else len(lines)
         seg = lines[i:end]
         got = {"who": "", "addr": "", "when": "", "subject": ""}
-        body_at = 0
+        body_at = len(seg)
+        seen = False            # 머리 필드를 하나라도 읽었나
+        last = ""
         for j, ln in enumerate(seg):
             s = ln.strip()
+            if j == 0 and _pres_label(s):
+                continue
             if not s:                       # 빈 줄 = 헤더 끝
-                if got["who"]:
+                if seen:
                     body_at = j + 1
                     break
                 continue
-            hit = False
-            for key, rx in _PRES_HDR.items():
-                m = rx.match(s)
-                if not m:
-                    continue
-                hit = True
-                if key == "to":
-                    break                   # 수신자는 턴 표시에 안 쓴다
-                val = m.group(1).strip().strip("*").strip()
-                if key == "who":
+            if not seen and _pres_rule(s):  # 여러 줄로 갈라진 라벨의 대시 조각
+                continue
+            key, val = _pres_field(s)
+            if key:
+                seen, last = True, key
+                if key == "who" and not got["who"]:
                     a = _PRES_ADDR_RX.search(val)
-                    got["addr"] = (a.group(1) or a.group(2) or "").lower() if a else ""
-                    got["who"] = _PRES_ADDR_RX.sub("", val).strip().strip("\"'<>") or got["addr"]
-                elif key == "when":
+                    got["addr"] = (next((g for g in a.groups() if g), "").lower()
+                                   if a else "")
+                    # 주소 뒤에 직급·부서가 붙는 형식이 있다 — 이름은 주소 앞이다
+                    name = (val[:a.start()] if a else val).strip().strip("\"'<>")
+                    got["who"] = (name or _PRES_ADDR_RX.sub("", val).strip()
+                                  .strip("\"'<>") or got["addr"])
+                elif key == "when" and not got["when"]:
                     got["when"] = _pres_when(val)
-                else:
+                elif key == "subject" and not got["subject"]:
                     got["subject"] = val
-                break
-            if not hit and got["who"]:      # 헤더가 아닌 줄 = 본문 시작
-                body_at = j
-                break
+                continue
+            if last == "to" and (_ADDR_HINT.search(s) or s.endswith((",", ";"))):
+                continue                    # 수신인 목록이 다음 줄로 이어졌다
+            body_at = j                     # 헤더가 아닌 줄 = 본문 시작
+            break
         body = _strip_signature([ln for ln in seg[body_at:]])
         while body and not body[0].strip():
             body.pop(0)
@@ -1210,13 +1307,43 @@ def parse_preserved(text: str) -> list[dict]:
         # 서명 없는 발언에서만 남았다(2026-11-19 — 브리핑 재료에 실으며 발견).
         while body and (not body[-1].strip() or _pres_rule(body[-1])):
             body.pop()
-        turns.append({**got, "body": "\n".join(body).strip()})
+        text_body = "\n".join(body).strip()
+        if got["who"] or text_body:         # 라벨이 연달아 온 빈 구간은 턴이 아니다
+            turns.append({**got, "body": text_body})
     # 인용은 보통 최신이 위다. 시각을 읽었으면 그걸로, 아니면 역순으로 뒤집는다.
     if all(t["when"] for t in turns):
         turns.sort(key=lambda t: t["when"])
     else:
         turns.reverse()
     return turns
+
+
+def attributed_turns(text: str) -> tuple[list[dict], str]:
+    """보존 인용을 (화자를 댈 수 있는 발언들, 화자를 댈 수 없는 나머지)로 가른다.
+
+    parse_preserved 의 턴은 `보낸 사람:` 머리에서 다음 머리까지다. 그런데 인용된
+    메일도 **제 인용 사슬을 달고 있을 수 있고**, 그 안쪽 머리가 턴 파서가 모르는
+    형식이면(귀속줄 "…님이 작성:", 외국어 라벨, 머리 없는 `Original Message`) 그
+    사슬 전체가 앞 발언의 본문에 붙는다 — **여러 사람의 글이 한 사람의 발언이 된다.**
+    절단기(_find_cut)는 그 형식을 안다(그래서 이 블록이 보존됐다). 발언마다 절단기를
+    한 번 더 돌려 **안쪽 인용이 시작되는 줄 앞까지만** 그 사람의 말로 친다.
+
+    화면이 쓰는 parse_preserved 의 body 는 건드리지 않는다 — 접힌 인용은 그 사슬을
+    보여 주는 유일한 자리다. 여기서 가르는 것은 '누구의 말로 칠 것인가'뿐이고,
+    쓰는 곳은 브리핑 재료와 그 근거 대조다(2026-11-20).
+    """
+    out: list[dict] = []
+    rest: list[str] = []
+    for t in parse_preserved(text):
+        lines = t["body"].splitlines()
+        k = _find_cut(lines)
+        own = "\n".join(lines[:k]).strip()
+        tail = "\n".join(lines[k:]).strip()
+        if own:
+            out.append({**t, "body": own})
+        if tail:
+            rest.append(tail)
+    return out, "\n\n".join(rest)
 
 
 def preserved_label(turns: list[dict]) -> str:
