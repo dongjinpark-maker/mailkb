@@ -2088,6 +2088,9 @@ def format_detail(store, cfg, thread_id: int) -> dict:
                 _row_get(t, "summary_updated", "") or ""),
             "gap": max(0, gap),    # 마지막 메일 이후 경과일
             "diag": diag,          # [(슬롯, 서술, 근거)] — 빈 리스트면 옛 산문
+            # {근거: '앞선 대화 · 07-21 오태양 책임'} — 내가 받기 전의 발언에서 나온
+            # 근거만. 이미 든 msgs 로 계산한다(추가 질의 0, 쓰기 0).
+            "origins": review.diagnosis_origins(msgs, diag),
         }
 
     # 수신·참조 표시 이름은 스레드에 **딱 한 번** 조회한다 — person_name() 은
@@ -5416,7 +5419,7 @@ def render_thread(store, cfg, tid: int, qs=None) -> str:
                          f"aria-label='{esc(tip)}'>ⓘ</span>")
         out.append(f"<div{cls}>{line}</div>")
         if cls and diag:
-            out.append(_diagnosis_card(diag))
+            out.append(_diagnosis_card(diag, (smeta or {}).get("origins")))
     # 진단은 이 버튼에서만 만들어진다(2026-08-16 — 요지를 흡수).
     if t:
         deeper = (_thread_map_controls(store, tid, _thread_analyses(store, tid))
@@ -7508,12 +7511,16 @@ def _person_deep_card(store, addr: str) -> str:
             + body + f"<p class='dcap'>{cap}</p></div>")
 
 
-def _diagnosis_card(diag: list) -> str:
+def _diagnosis_card(diag: list, origins: dict | None = None) -> str:
     """스레드 진단 — `정리` 한 문단 + 나머지 슬롯(2026-08-16).
 
     **정리는 슬롯 행이 아니라 문단으로 그린다** — 라벨 열에 밀어 넣으면 두세
     문장이 좁은 칸에서 접혀 읽기가 나빠진다. 나머지는 라벨+본문 두 열.
     문제·배경의 근거 인용은 ⓘ 툴팁 관례(.ihint) — 전문을 깔면 카드가 길어진다.
+
+    origins: 근거가 **내가 받기 전의 발언**에서 나왔을 때의 출처 표기
+    (`review.diagnosis_origins`). 그 문장은 받은 메일 본문에 없고 접힌 인용 안에
+    있어서, 누가 언제 한 말인지를 여기서 대 주지 않으면 사용자가 찾을 수 없다.
     """
     lead = [b for k, b, _ in diag if k == "정리"]
     rows = []
@@ -7522,7 +7529,8 @@ def _diagnosis_card(diag: list) -> str:
             continue
         tip = ""
         if quote:
-            t = f"근거: {quote}"
+            src = (origins or {}).get(quote, "")
+            t = (f"근거({src}): {quote}" if src else f"근거: {quote}")
             tip = (f" <span class='ihint' title='{esc(t)}' "
                    f"aria-label='{esc(t)}'>ⓘ</span>")
         cls = " warn" if kind == "문제" else ""

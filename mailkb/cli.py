@@ -403,8 +403,11 @@ def cmd_thread(args) -> None:
         diag = review.parse_diagnosis(t["rolling_summary"])
         if diag:
             print("\n[현안 브리핑]")
+            src = review.diagnosis_origins(msgs, diag)
             for kind, body, quote in diag:
-                print(f"  {kind}: {body}" + (f'\n      근거: "{quote}"' if quote else ""))
+                print(f"  {kind}: {body}"
+                      + (f'\n      근거: "{quote}"' + _origin_tail(src, quote)
+                         if quote else ""))
             print()
         else:
             print(f"\n[누적 요약]\n{t['rolling_summary']}\n")
@@ -563,10 +566,21 @@ def cmd_thread_diag(args) -> None:
         if not text:
             print("  (현안 브리핑을 만들지 못했습니다)")
             continue
-        for kind, body, quote in review.parse_diagnosis(text):
+        diag = review.parse_diagnosis(text)
+        src = review.diagnosis_origins(msgs, diag)
+        for kind, body, quote in diag:
             print(f"  {kind}: {body}")
             if quote:
-                print(f'      근거: "{quote}"')
+                print(f'      근거: "{quote}"' + _origin_tail(src, quote))
+
+
+def _origin_tail(src: dict, quote: str) -> str:
+    """근거 뒤의 출처 — 내가 받기 전의 발언에서 나온 것만 `  ← 앞선 대화 · 07-21 이름`.
+
+    그 문장은 받은 메일 본문에 없어 `show`·`search` 로 찾아도 발신자가 다르게
+    나온다(인용을 실어 온 사람). 누가 한 말인지는 코드가 인용 머리에서 읽어 댄다."""
+    o = src.get(quote, "")
+    return f"  ← {o}" if o else ""
 
 
 def cmd_person_diag(args) -> None:

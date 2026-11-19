@@ -4670,6 +4670,337 @@ class TestThreadDiagnosis(unittest.TestCase):
         self.assertEqual(m.call_args[0][0][0], "O")
 
 
+class TestEarlierTalkInBriefing(unittest.TestCase):
+    """앞선 대화 — 내가 받기 전에 오간 발언을 스레드 현안 브리핑에 (2026-11-19).
+
+    중간에 참조로 들어온 스레드는 발단과 이미 정해진 것이 **메시지 행 없이 인용
+    안에만** 있다. 재료가 신규 작성분만 실어서, "아래 히스토리 참고 부탁드립니다"
+    만 읽고 히스토리 없이 브리핑을 쓰고 있었다.
+
+    계약: 발언별로 갈라 **쓴 사람을 머리에** 달아 싣는다(덩어리째 붙이면 실어 온
+    사람의 말로 읽힌다 — 2026-08-06 의 사고) · 그 발언은 **이 산출에서만** 근거가
+    된다(줄에 화자 칸이 없다) · 누가 한 말인지는 화면이 코드로 댄다 · 못 가른
+    덩어리는 이해용일 뿐 근거가 아니다 · 수확·인물 쪽 규칙은 그대로다.
+    """
+
+    KANG, OH = "kang@corp.example", "oh@corp.example"
+    _OH_SAID = "sync_for_cpu 훅 호출은 UMD 책임입니다"
+    _KANG_SAID = "출력 텐서 캐시 미스매치가 간헐 재현됩니다"
+    _CHAIN = ("________________________________\n"
+              "보낸 사람: 오태양 책임 <oh@corp.example>\n"
+              "보낸 날짜: 2026년 07월 21일 Tuesday PM 02:00\n"
+              "받는 사람: kang@corp.example\n"
+              "제목: RE: DMA 캐시 정합성\n\n"
+              "드라이버 쪽 확인했습니다. sync_for_cpu 훅 호출은 UMD 책임입니다.\n"
+              "--\n오태양 책임\nSoC개발팀 | 내선 1234\n\n"
+              "________________________________\n"
+              "보낸 사람: 강미래 선임 <kang@corp.example>\n"
+              "보낸 날짜: 2026년 07월 20일 Monday AM 10:00\n"
+              "받는 사람: oh@corp.example\n"
+              "제목: DMA 캐시 정합성\n\n"
+              "런타임에서 출력 텐서 캐시 미스매치가 간헐 재현됩니다.\n")
+    _OWN = "김도현 님, 런타임 쪽 확인이 필요해서 참조 추가드립니다. 아래 히스토리 참고 부탁드립니다."
+    _MINE = "확인했습니다. 핫픽스 브랜치로 내일까지 공유하겠습니다."
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.store = Store(self.home / "db.sqlite", [ME])
+        self.cfg = Config(home=self.home, my_addresses=[ME],
+                          internal_domains=["corp.example"], ai_default="internal",
+                          ai_backends={"internal": {"cmd": ["echo"]}})
+        self.store.ingest([
+            _rec("e1", self.KANG, [ME], "RE: DMA 캐시 정합성", "2026-07-22T09:00:00",
+                 body=self._OWN + "\n\n" + self._CHAIN),
+            _rec("e2", ME, [self.KANG], "RE: DMA 캐시 정합성", "2026-07-22T15:00:00",
+                 body=self._MINE, reply_to="e1"),
+        ])
+        self.tid = self._tid("e1")
+
+    def tearDown(self):
+        self.store.close()
+        shutil.rmtree(self.tmp.name, ignore_errors=True)
+
+    def _tid(self, mid):
+        return self.store.db.execute(
+            "SELECT thread_id FROM messages WHERE message_id=?",
+            (f"<{mid}@t>",)).fetchone()["thread_id"]
+
+    def _set(self, mid, text):
+        self.store.db.execute("UPDATE messages SET new_content=? WHERE message_id=?",
+                              (text, f"<{mid}@t>"))
+        self.store.db.commit()
+
+    def _blob(self, tid=None):
+        return review._diagnosis_material(self.store, tid or self.tid)
+
+    def _run(self, raw, tid=None):
+        with mock.patch.object(review, "ai_run", return_value=raw) as m:
+            got = review.diagnose_thread(self.store, self.cfg, tid or self.tid)
+        return got, (m.call_args[0][1] if m.call_args else "")
+
+    # ------------------------------------------------------------- 재료
+    def test_fixture_is_a_mid_join_thread(self):
+        # 이 클래스 전체의 전제 — 수집이 인용 사슬을 보존했고 두 통이 한 스레드다
+        self.assertEqual(self._tid("e2"), self.tid)
+        first = self.store.thread_messages(self.tid)[0]
+        self.assertIn(PRESERVED_MARK, first["new_content"])
+
+    def test_turns_are_in_the_material_under_their_own_speaker(self):
+        _subject, blob, total = self._blob()
+        self.assertEqual(total, 2)              # 통수는 메일 행만 — 발언은 안 센다
+        oh = "[2026-07-21T14:00 오태양 책임 · 앞선 대화]"
+        kang = "[2026-07-20T10:00 강미래 선임 · 앞선 대화]"
+        carrier = "[2026-07-22T09:00 kang]"
+        for mark in (oh, kang, carrier, self._OH_SAID, self._KANG_SAID):
+            self.assertIn(mark, blob)
+        # 시간순 — 앞선 대화(오래된 것부터) → 그것을 실어 온 메일 → 그 뒤의 메일
+        self.assertLess(blob.index(kang), blob.index(oh))
+        self.assertLess(blob.index(oh), blob.index(carrier))
+        # **오태양의 문장은 오태양 머리 아래**에 있다. 실어 온 메일의 본문에는 없다
+        after_oh = blob[blob.index(oh):blob.index(carrier)]
+        self.assertIn(self._OH_SAID, after_oh)
+        self.assertNotIn(self._OH_SAID, blob[blob.index(carrier):])
+        # 원문 덩어리의 서명·인용 머리는 싣지 않는다
+        self.assertNotIn("내선 1234", blob)
+        self.assertNotIn("받는 사람:", blob)
+        self.assertNotIn(PRESERVED_MARK, blob)
+        # 머리줄이 무엇인지 말한다 — 모델이 받은 메일과 구분하게
+        self.assertIn("아래 2턴은 **내가 이 스레드를 받기 전**", blob)
+        self.assertIn("07-22 kang 메일에 인용으로 실려 온", blob)
+
+    def test_prompt_tells_the_model_whose_words_they_are(self):
+        _, prompt = self._run("정리: 상황.")
+        self.assertIn(self._OH_SAID, prompt)
+        self.assertIn("머리의 이름이 그 말을 한 사람이다", prompt)
+        self.assertIn("`인용 원문` 이라 적힌 덩어리는 인용하지 마라", prompt)
+        # 인물 브리핑은 그대로다 — 재료가 '그 사람 글 + 내 글'이라 제3자 발언이 낄 자리가 없다
+        self.assertNotIn("앞선 대화", review.PERSON_DIAGNOSE)
+        _who, pblob, _tids = review._person_material(self.store, self.cfg, self.KANG)
+        self.assertIn("참조 추가드립니다", pblob)
+        self.assertNotIn(self._OH_SAID, pblob)
+
+    def test_thread_without_a_quote_is_untouched(self):
+        self.store.ingest([_rec("p1", self.KANG, [ME], "다른 건",
+                                "2026-07-25T09:00:00", body="단순 확인 요청드립니다.")])
+        tid = self._tid("p1")
+        with mock.patch.object(review, "parse_preserved",
+                               side_effect=AssertionError("인용이 없는데 파서를 불렀다")):
+            _s, blob, _n = self._blob(tid)
+            msgs = self.store.thread_messages(tid)
+            self.assertEqual(review.diagnosis_origins(
+                msgs, [("문제", "걸림", "단순 확인 요청드립니다")]), {})
+        self.assertNotIn("앞선 대화", blob)
+
+    def test_forward_without_a_word_of_its_own_is_material_now(self):
+        # "FYI" 도 없이 전달만 한 메일 — 종전에는 본문 0자라 브리핑을 만들지 못했다
+        self.store.ingest([_rec("w1", self.KANG, [ME], "FW: 별건", "2026-07-26T09:00:00",
+                                body=self._CHAIN)])
+        tid = self._tid("w1")
+        self.assertEqual(strip_preserved(
+            self.store.thread_messages(tid)[0]["new_content"]).strip(), "")
+        _s, blob, _n = self._blob(tid)
+        self.assertIn(self._OH_SAID, blob)
+        with mock.patch.object(review, "ai_run", return_value="정리: 전달받은 건.") as m:
+            self.assertIn("정리:", review.diagnose_thread(self.store, self.cfg, tid))
+        m.assert_called_once()
+
+    def test_turn_that_is_also_a_real_mail_is_not_repeated(self):
+        # 옛 메일이 뒤늦게 수집되면 같은 글이 메일 행과 인용 양쪽에 있다
+        self.store.ingest([_rec("e0", self.KANG, [ME], "RE: DMA 캐시 정합성",
+                                "2026-07-20T10:00:00", body="자리", reply_to="e1")])
+        self.assertEqual(self._tid("e0"), self.tid)
+        self._set("e0", "런타임에서 출력 텐서 캐시 미스매치가 간헐 재현됩니다.\n감사합니다.")
+        _s, blob, total = self._blob()
+        self.assertEqual(total, 3)
+        self.assertEqual(blob.count(self._KANG_SAID), 1)        # 메일 행 한 번만
+        self.assertNotIn("강미래 선임 · 앞선 대화", blob)
+        self.assertIn("아래 1턴은", blob)
+        self.assertIn(self._OH_SAID, blob)                      # 겹치지 않는 발언은 그대로
+        # 받은 메일에 있는 문장은 '앞선 대화'라고 표기하지 않는다
+        msgs = self.store.thread_messages(self.tid)
+        self.assertEqual(review.quote_origin(msgs, self._KANG_SAID), "")
+        self.assertEqual(review.quote_origin(msgs, self._OH_SAID),
+                         "앞선 대화 · 07-21 오태양 책임")
+
+    def test_short_reply_is_not_mistaken_for_a_duplicate(self):
+        # "감사합니다." 같은 짧은 글은 남의 긴 글에 우연히 들어 있다 — 포함으로 같다고 보지 않는다
+        long = "검토 감사합니다. 재현 케이스 3종으로 검증 준비해 두겠습니다."
+        self.assertFalse(review._same_as_a_mail(
+            review._squash("감사합니다."), [review._squash(long)]))
+        self.assertTrue(review._same_as_a_mail(
+            review._squash("감사합니다."), [review._squash("감사합니다.")]))
+        self.assertTrue(review._same_as_a_mail(
+            review._squash("재현 케이스 3종으로 검증 준비해 두겠습니다."),
+            [review._squash(long)]))
+
+    def _many_turns(self, n, size):
+        """오래된 것부터 n 개의 발언 — 본문은 '발언k번' + 채움."""
+        parts = []
+        for k in range(n, 0, -1):                      # 인용은 최신이 위다
+            parts.append("________________________________\n"
+                         f"보낸 사람: 발신{k} <p{k}@corp.example>\n"
+                         f"보낸 날짜: 2026년 07월 {k:02d}일 AM 09:00\n"
+                         "제목: RE: 긴 건\n\n"
+                         f"발언{k}번 " + "가" * size + "\n")
+        return "\n".join(parts)
+
+    def test_over_budget_drops_the_oldest_turns_and_says_so(self):
+        self._set("e1", self._OWN + "\n\n" + PRESERVED_MARK + "\n"
+                  + self._many_turns(9, 990))
+        _s, blob, _n = self._blob()
+        kept = review._DIAG_PRE_TOTAL // 996            # '발언k번 ' + 990자
+        self.assertGreater(9, kept)                     # 이 픽스처는 정말 넘친다
+        for k in range(9, 9 - kept, -1):
+            self.assertIn(f"발언{k}번", blob)           # 내가 들어온 시점에 가까운 쪽
+        for k in range(9 - kept, 0, -1):
+            self.assertNotIn(f"발언{k}번", blob)
+        self.assertIn(f"아래 {kept}턴은", blob)
+        self.assertIn(f"그보다 앞선 {9 - kept}턴은 생략했다", blob)
+        # 앞선 대화가 아무리 길어도 받은 메일의 몫은 그대로다 — 예산이 따로다
+        self.assertIn(self._OWN, blob)
+        self.assertIn(self._MINE, blob)
+        # 근거 검사는 안 실린 발언까지 본다(모델은 본 것만 인용하므로 넓어도 무해하다)
+        self.assertTrue(distill._QuoteChecker(self.store, preserved=True)
+                        .ok(self.tid, "발언1번 " + "가" * 20))
+
+    def test_turn_does_not_carry_the_next_turns_rule(self):
+        # 발언 사이의 구분선은 다음 발언의 머리다 — 서명이 없는 발언의 끝에 붙어 와
+        # 재료를 먹고(발언당 34자) 화면에는 빈 가로줄로 그려졌다
+        from mailkb.clean import parse_preserved
+        turns = parse_preserved(PRESERVED_MARK + "\n" + self._many_turns(3, 10))
+        self.assertEqual(len(turns), 3)
+        for t in turns:
+            self.assertNotIn("____", t["body"])
+            self.assertTrue(t["body"].endswith("가"))
+        en = (PRESERVED_MARK + "\nFrom: A <a@corp.example>\nSent: 2026-08-02 2:00 PM\n"
+              "Subject: x\n\nsecond\n\n-----Original Message-----\n"
+              "From: B <b@corp.example>\nSent: 2026-08-01 2:00 PM\nSubject: x\n\nfirst\n")
+        self.assertEqual([t["body"] for t in parse_preserved(en)], ["first", "second"])
+        # 본문 **안**의 선은 글쓴이가 그은 것이다 — 꼬리만 뗀다
+        mid = (PRESERVED_MARK + "\nFrom: A <a@corp.example>\nSent: 2026-08-02 2:00 PM\n\n"
+               "위 문단입니다.\n-----\n아래 문단입니다.\n")
+        self.assertEqual(parse_preserved(mid)[0]["body"],
+                         "위 문단입니다.\n-----\n아래 문단입니다.")
+
+    def test_one_long_turn_is_cut_in_the_middle_with_a_mark(self):
+        self._set("e1", self._OWN + "\n\n" + PRESERVED_MARK + "\n"
+                  + self._many_turns(1, 5000))
+        _s, blob, _n = self._blob()
+        self.assertIn("발언1번", blob)
+        self.assertIn("…(중략", blob)                   # 조각을 전문으로 믿지 않게
+        seg = blob[blob.index("· 앞선 대화]"):blob.index("[2026-07-22T09:00 kang]")]
+        self.assertLessEqual(len(seg), review._DIAG_PRE_TURN + 40)
+
+    def test_chain_that_cannot_be_split_is_context_only(self):
+        said = "일정은 8월 말로 정했습니다"
+        self._set("e1", self._OWN + "\n\n" + PRESERVED_MARK + "\n"
+                  + f"> 앞사람이 쓴 글입니다. {said}.\n> 그렇게 하시죠.")
+        _s, blob, _n = self._blob()
+        self.assertIn("[앞선 대화 · 인용 원문]", blob)
+        self.assertIn(said, blob)
+        self.assertIn("누가 쓴 문장인지 확실하지 않다", blob)
+        # 화자를 댈 수 없는 문장은 근거가 못 된다 — 줄이 탈락한다
+        got, _ = self._run(f'정리: 상황.\n배경: 일정이 정해졌다 | 근거: "{said}"')
+        self.assertNotIn("배경:", got)
+        self.assertEqual(review.diagnose_thread.last_dropped, 1)
+        self.assertEqual(review.quote_origin(
+            self.store.thread_messages(self.tid), said), "")
+
+    # ------------------------------------------------------------- 근거
+    def test_earlier_turn_is_evidence_for_the_thread_briefing(self):
+        raw = ("정리: 캐시 미스매치의 원인이 UMD 쪽으로 좁혀졌다.\n"
+               f'문제: 간헐 재현이 계속된다 | 근거: "{self._KANG_SAID}"\n'
+               f'배경: 훅 호출은 UMD 책임이다 | 근거: "{self._OH_SAID}"\n'
+               '배경: 지어낸 배경 | 근거: "원문 어디에도 없는 문장입니다"')
+        got, _ = self._run(raw)
+        self.assertIn("문제: 간헐 재현이 계속된다", got)
+        self.assertIn("배경: 훅 호출은 UMD 책임이다", got)
+        self.assertNotIn("지어낸 배경", got)            # 검증 자체는 그대로 돈다
+        self.assertEqual(review.diagnose_thread.last_dropped, 1)
+
+    def test_the_exception_is_this_output_only(self):
+        # 화자를 기록하는 산출은 그대로 뺀다 — 2026-08-06 의 규칙
+        self.assertFalse(distill._QuoteChecker(self.store).ok(self.tid, self._OH_SAID))
+        self.assertFalse(distill._PersonQuoteChecker(self.store, self.KANG)
+                         .ok(self.tid, self._OH_SAID))
+        self.assertTrue(distill._QuoteChecker(self.store, preserved=True)
+                        .ok(self.tid, self._OH_SAID))
+        # 발언의 주인은 실어 온 사람이 아니다 — 검사기 행에도 그렇게 남는다
+        rows = distill._QuoteChecker(self.store, preserved=True)._bodies(self.tid)
+        owner = [r for r in rows if distill._norm_ws(self._OH_SAID) in r[0]]
+        self.assertEqual([(r[1], r[2]) for r in owner], [("오태양 책임", self.OH)])
+        # 인물 브리핑은 같은 문장을 근거로 받지 않는다
+        with mock.patch.object(review, "ai_run", return_value=(
+                f'정리: 상황.\n배경: 훅 호출은 UMD 책임이다 | 근거: "{self._OH_SAID}"')):
+            got = review.diagnose_person(self.store, self.cfg, self.KANG, "kang")
+        self.assertNotIn("배경:", got)
+        self.assertEqual(review.diagnose_person.last_dropped, 1)
+
+    # ------------------------------------------------------------- 표시
+    def test_origin_names_the_speaker_not_the_carrier(self):
+        msgs = self.store.thread_messages(self.tid)
+        self.assertEqual(review.quote_origin(msgs, self._OH_SAID),
+                         "앞선 대화 · 07-21 오태양 책임")
+        self.assertEqual(review.quote_origin(msgs, self._KANG_SAID),
+                         "앞선 대화 · 07-20 강미래 선임")
+        self.assertEqual(review.quote_origin(msgs, "참조 추가드립니다"), "")   # 받은 메일
+        self.assertEqual(review.quote_origin(msgs, "어디에도 없는 문장"), "")
+        self.assertEqual(review.quote_origin(msgs, ""), "")
+
+    def test_screen_and_cli_say_where_the_evidence_came_from(self):
+        mine = "런타임 쪽 확인이 필요해서 참조 추가드립니다"
+        self._run(f'정리: 상황.\n문제: 회신이 필요하다 | 근거: "{mine}"\n'
+                  f'배경: 훅 호출은 UMD 책임이다 | 근거: "{self._OH_SAID}"')
+        html = web.render_thread(self.store, self.cfg, self.tid)
+        self.assertIn("근거(앞선 대화 · 07-21 오태양 책임): " + self._OH_SAID, html)
+        self.assertIn("근거: " + mine, html)                 # 받은 메일의 근거는 종전대로
+        # 저장 형식은 그대로다 — 출처는 그릴 때 계산한다
+        saved = self.store.thread(self.tid)["rolling_summary"]
+        self.assertNotIn("앞선 대화", saved)
+        from mailkb import cli
+        (self.home / "config.toml").write_text(
+            'my_addresses = ["%s"]\n[ai]\ndiagnose = "internal"\n'
+            '[ai.backends.internal]\ncmd = ["echo"]\n' % ME, encoding="utf-8")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cli.cmd_thread(argparse.Namespace(home=str(self.home), thread_id=self.tid))
+        self.assertIn(f'근거: "{self._OH_SAID}"  ← 앞선 대화 · 07-21 오태양 책임',
+                      buf.getvalue())
+        self.assertIn(f'근거: "{mine}"\n', buf.getvalue())
+        buf = io.StringIO()
+        with mock.patch.object(review, "ai_run", return_value=(
+                f'정리: 상황.\n배경: 훅 호출은 UMD 책임이다 | 근거: "{self._OH_SAID}"')):
+            with contextlib.redirect_stdout(buf):
+                cli.cmd_thread_diag(argparse.Namespace(
+                    home=str(self.home), threads=[self.tid], pick=1, backend=None))
+        self.assertIn("← 앞선 대화 · 07-21 오태양 책임", buf.getvalue())
+
+    def test_measuring_tool_prints_numbers_only(self):
+        # 회사 PC 에서 돌려 숫자만 가져오는 도구 — 메일 내용이 새면 안 된다
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "bench_diagnose", Path(__file__).resolve().parent.parent
+            / "tools" / "bench_diagnose.py")
+        bench = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bench)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(bench._earlier(self.store), 0)
+        out = buf.getvalue()
+        self.assertIn("인용이 실려 온 스레드 1", out)
+        self.assertIn("발언을 가른 스레드 1 · 못 가른 스레드 0", out)
+        self.assertIn("| 발언 수(턴) | 2 | 2 | 2 |", out)
+        self.assertIn(f"전체 {review._DIAG_PRE_TOTAL:,}자", out)
+        for leak in ("오태양", "강미래", "kang", "DMA", "UMD", "corp.example"):
+            self.assertNotIn(leak, out)
+        # 재료 조립과 같은 함수로 센다 — 실리는 양이 실제 재료의 발언 본문 합과 같다
+        turns, _raw = review.earlier_turns(self.store.thread_messages(self.tid),
+                                           self.store.thread_messages(self.tid)[0])
+        put = sum(len(t["body"]) for t in turns)
+        self.assertIn(f"| 재료에 실리는 양(자) | {put:,} | {put:,} | {put:,} |", out)
+
+
 class TestViewModel(unittest.TestCase):
     """웹 뷰모델 순수 로직 (HTML 미생성 — 구 model.py 병합분)."""
 

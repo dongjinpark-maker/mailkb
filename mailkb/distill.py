@@ -21,7 +21,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from . import review
-from .clean import smart_truncate, strip_preserved
+from .clean import parse_preserved, smart_truncate, strip_preserved
 from .config import Config
 from .store import DOSSIER_VALIDATOR_VERSION, Store
 
@@ -133,10 +133,18 @@ class _QuoteChecker:
     올릴 수 있다 — 실측 예: 오태양 책임의 「sync_for_cpu 훅 호출은 UMD 책임입니다」가
     강미래 선임 메일 안에 있어, 결정자를 강미래로 붙여도 통과했다. 인물 요약 쪽
     (_PersonQuoteChecker)은 처음부터 이렇게 하고 있었고 여기만 빠져 있었다.
+
+    **예외는 `preserved=True` 하나**(2026-11-19, 스레드 현안 브리핑 전용). 그 산출은
+    `배경: 서술 | 근거: "문장"` 꼴이라 **화자를 기록하지 않는다** — 위 사고가 날
+    자리가 없다. 그래서 내가 받기 전에 오간 발언도 근거로 받는데, **발언별로 가른
+    것만**이다(`clean.parse_preserved`). 못 가른 덩어리는 누가 쓴 문장인지 댈 수
+    없어 여전히 뺀다. 화자를 기록하는 산출(수확·인물 프로필·위키)은 켜지 않는다.
     """
 
-    def __init__(self, store: Store, addr: str | None = None):
+    def __init__(self, store: Store, addr: str | None = None,
+                 preserved: bool = False):
         self.store = store
+        self.preserved = preserved
         # None = 발신자 제한 없음. 빈 문자열은 '아무도 아님'이라 그대로 둔다
         # (인물 요약이 빈 주소로 오면 근거 0줄이 되는 종전 동작 유지).
         self.addr = None if addr is None else (addr or "").strip().lower()
@@ -153,6 +161,12 @@ class _QuoteChecker:
                                  (m["sender_name"] or "").strip(),
                                  (m["sender_addr"] or "").strip().lower(),
                                  bool(m["is_sent"])))
+                if self.preserved:
+                    # 발언의 주인은 실어 온 사람(m)이 아니라 인용 머리의 사람이다
+                    for t in parse_preserved(m["new_content"] or ""):
+                        if t["body"].strip():
+                            rows.append((_norm_ws(t["body"]), t["who"],
+                                         t["addr"], False))
             self.cache[tid] = rows
         return self.cache[tid]
 

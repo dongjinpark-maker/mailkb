@@ -1148,6 +1148,12 @@ def _pres_when(raw: str) -> str:
     return f"{out} {hh:02d}:{mm:02d}" if 0 <= hh < 24 else out
 
 
+def _pres_rule(line: str) -> bool:
+    """발언 사이의 구분선인가 — 선뿐인 줄(3자 이상)이거나 인용 라벨 줄."""
+    s = line.strip()
+    return bool((len(s) >= 3 and _DASH_ONLY_RX.match(s)) or _HTML_CUT_RX.match(s))
+
+
 def parse_preserved(text: str) -> list[dict]:
     """보존 인용 블록을 대화 턴 목록으로 — 오래된 것부터.
 
@@ -1198,7 +1204,11 @@ def parse_preserved(text: str) -> list[dict]:
         body = _strip_signature([ln for ln in seg[body_at:]])
         while body and not body[0].strip():
             body.pop(0)
-        while body and not body[-1].strip():
+        # 꼬리의 구분선은 **다음 발언의 머리**다 — `____…` 나 `-----Original
+        # Message-----` 가 다음 `보낸 사람:` 앞에 오는데, 발언을 그 줄에서 가르므로
+        # 앞 발언의 끝에 붙어 온다. 서명이 있으면 서명과 함께 떨어져서 안 보였고,
+        # 서명 없는 발언에서만 남았다(2026-11-19 — 브리핑 재료에 실으며 발견).
+        while body and (not body[-1].strip() or _pres_rule(body[-1])):
             body.pop()
         turns.append({**got, "body": "\n".join(body).strip()})
     # 인용은 보통 최신이 위다. 시각을 읽었으면 그걸로, 아니면 역순으로 뒤집는다.

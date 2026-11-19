@@ -21,7 +21,8 @@ from pathlib import Path
 from . import actions, features
 from . import search as search_mod
 from . import promises as promises_mod
-from .clean import smart_truncate, strip_preserved
+from .clean import (PRESERVED_MARK, parse_preserved, smart_truncate,
+                    strip_preserved, take_preserved)
 from .config import Config
 from .features import DECISION_RX, DEADLINE_RX
 from .store import Store
@@ -1607,6 +1608,10 @@ THREAD_DIAGNOSE = """당신은 업무 메일 스레드를 읽고 **지금 무엇
   버려진다). 관련 스레드에만 있는 사실은 `모르는 것`으로 적어라.
 - **[내 노트]·[지식]·[내 메모]·[사용자 지침]이 붙어 있으면** 사안을 이해하고 용어를
   해석하는 데 써라. 근거 인용·일정·수치는 메일에서만 따고, 메일과 어긋나면 메일을 따른다.
+- **머리에 `앞선 대화` 가 붙은 발언은** 내가 이 스레드를 받기 전에 오간 것이다
+  (받은 메일에 인용으로 실려 왔다). 사안의 발단과 이미 정해진 것을 거기서 읽어라.
+  **머리의 이름이 그 말을 한 사람이다** — 인용을 실어 온 사람의 말로 쓰지 마라.
+  근거로 인용해도 된다. 단 `인용 원문` 이라 적힌 덩어리는 인용하지 마라.
 
 [스레드: {subject}]
 {messages}
@@ -1786,6 +1791,153 @@ _DIAG_TOTAL = 60_000       # 스레드 전체 본문 예산 (자)
 _DIAG_BODY_MIN = 800
 _DIAG_BODY_MAX = 3_000
 
+# ── 앞선 대화 — 내가 받기 전의 발언을 재료에 (2026-11-19) ─────────────────
+# 왜: 중간에 참조로 들어온 스레드(mid-join)는 발단과 이미 정해진 것이 **메시지 행
+# 없이 인용 안에만** 있다(clean.parse_preserved 의 실측: 스레드 3통, 대화 5턴).
+# 재료는 신규 작성분만 실어서 그 앞부분을 못 봤다 — 데모의 DMA 캐시 스레드는
+# "아래 히스토리 참고 부탁드립니다" 만 읽고 히스토리 없이 정리를 쓰고 있었다.
+#
+# **덩어리째 붙이지 않는다.** 실어 온 메일의 머리 아래에 남의 글이 섞이면 모델이
+# 화자를 그 사람으로 읽는다 — 2026-08-06 에 수확에서 실제로 난 사고다(오태양
+# 책임의 문장이 강미래 선임의 결정으로 올라갔다). 발언별로 갈라 **쓴 사람을 머리에**
+# 달고, 원문 덩어리의 서명·면책 문구는 parse_preserved 가 뗀다(데모: 716자 → 207자).
+#
+# 두 값은 **추측이다** — 데모에 mid-join 스레드가 1건뿐이라 잴 재료가 없었다.
+# `tools/bench_diagnose.py --earlier` 가 실환경의 분포를 숫자로만 찍는다(AI 0콜).
+# 메일 예산(_DIAG_TOTAL)과 따로 잡는다: 같이 쓰면 앞선 대화가 길수록 **최근 메일이
+# 잘린다** — 브리핑이 답할 것은 '지금'이라 그 방향의 손해는 지지 않는다.
+_DIAG_PRE_TOTAL = 6_000    # 앞선 대화 전체 예산 (자)
+_DIAG_PRE_TURN = 1_200     # 발언 하나
+_PRE_ROOM_MIN = 200        # 이보다 덜 남았으면 조각을 싣느니 생략을 알린다
+_PRE_DUP_MIN = 20          # 이보다 짧은 글은 '포함'으로 같은 글이라 보지 않는다
+EARLIER_TAG = "앞선 대화"  # 재료 머리 · 근거 출처 표기 — 스레드 화면의 접힘 머리줄과 같은 말
+
+
+def _squash(s: str) -> str:
+    """공백을 전부 뗀다 — 인용 대조(distill._norm_ws)와 같은 정규화."""
+    return re.sub(r"\s+", "", s or "")
+
+
+def _same_as_a_mail(turn: str, own: list[str]) -> bool:
+    """복원한 발언이 스레드의 실제 메일과 같은 글인가(공백 무시, 한쪽이 포함해도 같다).
+
+    서명·인사 한 줄의 차이로 완전 일치는 잘 안 나온다. 짧은 글("감사합니다.")은
+    남의 긴 글에 우연히 들어갈 수 있어 포함으로는 보지 않는다."""
+    for o in own:
+        if not o:
+            continue
+        a, b = (turn, o) if len(turn) <= len(o) else (o, turn)
+        if a == b or (len(a) >= _PRE_DUP_MIN and a in b):
+            return True
+    return False
+
+
+def earlier_turns(msgs: list, m) -> tuple[list[dict], str]:
+    """메일 m 이 인용으로 실어 온 앞선 대화 — (발언 목록, 가르지 못한 원문).
+
+    **스레드에 실제 메일로도 있는 발언은 뺀다.** 옛 메일이 뒤늦게 수집되면(백필)
+    같은 글이 메일 행과 인용 양쪽에 있다 — 둘 다 실으면 재료가 중복되고, 받은
+    메일의 문장에 '앞선 대화'라는 출처가 붙는다.
+    발언을 가르지 못하면 `([], 원문)` 이다 — 누가 쓴 문장인지 댈 수 없으므로
+    호출측은 이해용으로만 싣고 근거로는 받지 않는다. 인용이 없으면 `([], "")`.
+    """
+    text = m["new_content"] or ""
+    raw = take_preserved(text)
+    if not raw:
+        return [], ""
+    turns = parse_preserved(text)
+    if not turns:
+        return [], raw
+    own = [_squash(strip_preserved(x["new_content"] or "")) for x in msgs]
+    return ([t for t in turns
+             if _squash(t["body"]) and not _same_as_a_mail(_squash(t["body"]), own)],
+            "")
+
+
+def _earlier_blocks(msgs: list, m, room: int) -> tuple[list[str], int]:
+    """(재료 블록, 쓴 자수) — m 이 실어 온 앞선 대화를 room 자 안에서.
+
+    넘치면 **오래된 발언부터** 뺀다: 내가 들어온 시점에 가까운 발언일수록 지금
+    걸린 것과 이어진다. 뺀 수는 머리줄에 적는다 — 모델이 조각을 전부로 믿지 않게
+    (smart_truncate 가 중략을 표시하는 것과 같은 이유).
+    """
+    turns, raw = earlier_turns(msgs, m)
+    if not turns and not raw:
+        return [], 0
+    carrier = (m["sent_on"] or "")[5:10] + " " + (
+        "내" if m["is_sent"] else (m["sender_name"] or m["sender_addr"] or "발신자 미상"))
+    if room < _PRE_ROOM_MIN:
+        n = f"{len(turns)}턴" if turns else "인용 원문"
+        return [f"({carrier} 메일에 인용으로 실려 온 {EARLIER_TAG} {n}은 "
+                f"분량 때문에 싣지 못했다)"], 0
+    if not turns:
+        body = smart_truncate(raw, min(room, _DIAG_PRE_TOTAL))
+        return [f"(아래는 {carrier} 메일에 인용으로 실려 온 **{EARLIER_TAG}**다 — 내가 "
+                f"이 스레드를 받기 전에 오간 것이다. 발언을 가르지 못해 원문 그대로 "
+                f"실었고 누가 쓴 문장인지 확실하지 않다. 이해에만 쓰고 근거로 "
+                f"인용하지 마라)",
+                f"[{EARLIER_TAG} · 인용 원문]\n{body}"], len(body)
+    kept: list[tuple[dict, str]] = []
+    used = 0
+    for t in reversed(turns):               # 최근 발언부터 채운다
+        # 첫 발언은 남은 자리에 맞춰서라도 싣는다(둘째 인용이 예산 끝에 걸렸을 때)
+        body = smart_truncate(t["body"], _DIAG_PRE_TURN if kept
+                              else min(_DIAG_PRE_TURN, room))
+        if kept and used + len(body) > room:
+            break
+        kept.append((t, body))
+        used += len(body)
+    kept.reverse()
+    skipped = len(turns) - len(kept)
+    out = [f"(아래 {len(kept)}턴은 **내가 이 스레드를 받기 전**에 오간 {EARLIER_TAG}다 — "
+           f"{carrier} 메일에 인용으로 실려 온 것을 발언별로 갈랐다. 머리의 이름이 "
+           f"그 발언을 쓴 사람이다"
+           + (f". 그보다 앞선 {skipped}턴은 생략했다" if skipped else "") + ")"]
+    for t, body in kept:
+        when = (t["when"] or "시각 미상").replace(" ", "T")
+        out.append(f"[{when} {t['who'] or t['addr'] or '발신자 미상'} · "
+                   f"{EARLIER_TAG}]\n{body}")
+    return out, used
+
+
+def quote_origin(msgs: list, quote: str) -> str:
+    """근거 인용의 출처 표기 — 앞선 대화에서 나왔으면 `앞선 대화 · 07-21 오태양 책임`.
+
+    받은 메일 본문에 있으면 ''(표기 없음 — 그쪽이 기본이다). **화자를 모델이 아니라
+    코드가 댄다**: 인용은 실어 온 사람의 메일 안에 있지만 쓴 사람은 따로 있고,
+    그 이름은 인용 머리(`보낸 사람:`)에서 읽는다.
+
+    저장 형식에 넣지 않고 **그릴 때 계산한다** — 읽기뿐이고(불변식 9), 옛 메일이
+    뒤늦게 수집되어 그 발언이 실제 메일이 되면 표기도 저절로 떨어진다.
+    """
+    q = _squash(quote)
+    if not q or not any(PRESERVED_MARK in (m["new_content"] or "") for m in msgs):
+        return ""
+    if any(q in _squash(strip_preserved(m["new_content"] or "")) for m in msgs):
+        return ""
+    for m in msgs:
+        for t in parse_preserved(m["new_content"] or ""):
+            if q in _squash(t["body"]):
+                who = f"{(t['when'] or '')[5:10]} {t['who'] or t['addr']}".strip()
+                return EARLIER_TAG + (f" · {who}" if who else "")
+    return ""
+
+
+def diagnosis_origins(msgs: list, diag: list) -> dict[str, str]:
+    """{근거 인용: 출처 표기} — 앞선 대화에서 나온 근거만 든다(대부분의 스레드는 빈 dict).
+
+    인용이 없는 스레드는 본문을 훑지 않고 바로 끝낸다 — 스레드 화면을 그릴 때마다
+    불리는 자리다."""
+    if not any(PRESERVED_MARK in (m["new_content"] or "") for m in msgs):
+        return {}
+    out = {}
+    for _kind, _body, quote in diag:
+        if quote and quote not in out:
+            o = quote_origin(msgs, quote)
+            if o:
+                out[quote] = o
+    return out
+
 
 def _diag_kind(raw: str) -> str:
     """표기 흔들림 흡수 — '먼저 할일'·'모르는것' 도 같은 슬롯으로."""
@@ -1840,6 +1992,8 @@ def _diagnosis_material(store: Store, tid: int) -> tuple[str, str, int]:
     버튼을 누른 순간 전체를 보는 것이 가장 정확하고, 콜 하나의 고정비(실측
     5.3k 토큰)를 생각하면 증분 여러 콜보다 싸다. 긴 스레드는 최근 N통으로
     자르되 통당 본문은 smart_truncate 로 앞뒤를 나눠 담는다(결론이 뒤에 있다).
+    내가 받기 전의 대화(보존 인용)는 발언별로 갈라 그 메일 앞에 싣는다
+    (`_earlier_blocks`) — 통수(반환값)는 메일 행만 센다.
     """
     msgs = store.thread_messages(tid)
     if not msgs:
@@ -1864,7 +2018,16 @@ def _diagnosis_material(store: Store, tid: int) -> tuple[str, str, int]:
     per = max(_DIAG_BODY_MIN,
               min(_DIAG_BODY_MAX, _DIAG_TOTAL // max(1, len(window))))
     got_body = False
+    room = _DIAG_PRE_TOTAL
     for m in window:
+        # 앞선 대화는 **실어 온 메일 바로 앞**에 둔다 — 시간순이 그렇다. 보통은 첫
+        # 메일이지만, 옛 메일이 뒤늦게 수집되면 실어 온 메일이 첫 줄이 아니다.
+        if PRESERVED_MARK in (m["new_content"] or ""):
+            pre, used = _earlier_blocks(msgs, m, room)
+            blocks.extend(pre)
+            room -= used
+            # 본문 없이 전달만 한 메일("FYI")도 실어 온 대화가 있으면 재료다
+            got_body = got_body or used > 0
         who = "나" if m["is_sent"] else (m["sender_name"] or m["sender_addr"])
         body = smart_truncate(strip_preserved(m["new_content"] or ""), per)
         got_body = got_body or bool(body.strip())
@@ -1979,7 +2142,12 @@ def diagnose_thread(store: Store, cfg: Config, tid: int,
         memory=memory),
         system_prompt=MAIL_TASK_SYSTEM, on_event=on_event, cancel=cancel)
     from . import distill        # 지연 임포트 — distill 이 review 를 임포트
-    checker = distill._QuoteChecker(store)
+    # **앞선 대화의 발언도 근거로 받는다**(preserved=True, 이 자리만). 수확·인물
+    # 프로필이 보존 인용을 근거에서 빼는 이유는 '누가 말했나'를 기록하기 때문인데
+    # (2026-08-06), 이 산출의 줄에는 화자 칸이 없다 — `배경: 서술 | 근거: "문장"`.
+    # 내가 받기 전에 정해진 것이 바로 `배경`이라, 여기서 빼면 그 줄이 통째로 탈락한다.
+    # 누가 쓴 문장인지는 화면이 코드로 댄다(quote_origin).
+    checker = distill._QuoteChecker(store, preserved=True)
     kept, dropped = [], 0
     for kind, body, quote in parse_diagnosis(strip_summary_header(raw)):
         if kind in _DIAG_VERIFIED and not checker.ok(tid, quote):
