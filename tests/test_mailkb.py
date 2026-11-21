@@ -21475,6 +21475,288 @@ class TestWiki(unittest.TestCase):
             self.assertNotIn(banned, src)
 
 
+class TestWikiView(unittest.TestCase):
+    """기억 › 위키 — 주제 페이지를 **읽어 그리기만** 하는 화면(2026-11-21).
+
+    페이지를 쓰는 것은 /mail-wiki 세션이다. 화면이 지키는 것: 파일·DB 에 쓰지 않는다 ·
+    AI 를 부르지 않는다 · 파일의 줄을 버리지 않는다 · 근거 번호를 따라갈 수 있게 한다.
+    코퍼스와 페이지는 TestWiki 의 것을 그대로 쓴다(가상 값 — 프로젝트 알파)."""
+
+    setUp = TestWiki.setUp
+    tearDown = TestWiki.tearDown
+    mid = TestWiki.mid
+    tid = TestWiki.tid
+    top = TestWiki.top
+    page = TestWiki.page
+    seq_of = TestWiki.seq_of
+    TODAY = "2026-01-13"
+
+    def view(self, **qs):
+        q = {"tab": ["wiki"]}
+        q.update({k: [v] for k, v in qs.items()})
+        return web.render_records(self.store, self.cfg, q, self.TODAY)
+
+    def topic(self, **qs):
+        return self.view(page="알파.md", **qs)
+
+    def known(self):
+        """scan 이 후보로 올릴 스레드 전부 — 머리말에 적어 두면 '새 후보'가 0 이 된다."""
+        return [self.tid("e1"), self.tid("g1"), self.tid("c1")]
+
+    # ── 탭과 목록 ──
+    def test_wiki_is_the_fifth_tab_of_records(self):
+        out = self.view()
+        self.assertIn("<b>위키</b>", out)
+        self.assertIn("href='/records?tab=wiki'",
+                      web.render_records(self.store, self.cfg, {"tab": ["memo"]}, self.TODAY))
+        # 탭 순서 = 가공된 정도(메모 → 지식 → 위키)
+        self.assertLess(out.index("지식"), out.index("위키"))
+
+    def test_empty_state_says_where_pages_come_from(self):
+        out = self.view()
+        self.assertIn("아직 주제 페이지가 없습니다", out)
+        self.assertIn("/mail-wiki new", out)
+
+    def test_list_shows_basis_summary_and_what_piled_up(self):
+        self.page()
+        w = self.wiki.wiki_dir(self.cfg)
+        (w / "index.md").write_text(
+            "- [[알파]] — 출시일 2월 둘째 주로 결정 · 기준 2026-01-12 · 스레드 2\n",
+            encoding="utf-8")
+        (w / "log.md").write_text("- 2026-01-12 new 알파: 읽은 메일 5 · 경위 +5\n",
+                                  encoding="utf-8")
+        out = self.view()
+        self.assertIn("href='/records?tab=wiki&page=" + web._q("알파.md") + "'", out)
+        self.assertIn("기준 01-12 · 1일 전 · 스레드 2", out)
+        self.assertIn("출시일 2월 둘째 주로 결정", out)          # index.md 의 한 줄
+        self.assertNotIn("· 기준 2026-01-12 · 스레드 2", out)     # 꼬리는 떼고 싣는다
+        self.assertIn("열린 것 1", out)
+        self.assertIn("최근 작업", out)                           # log.md 는 접어서
+        self.assertNotIn("index.md", out)                         # 목록의 주제가 아니다
+
+    def test_list_puts_topics_to_update_first_and_frozen_last(self):
+        self.page(name="가동결", frozen="2026-01-12")
+        self.page(name="나최신", candidates=self.known())
+        self.page(name="다낡음", candidates=self.known(),
+                  seq=self.seq_of("b2") - 1)                      # b2 한 통이 새 메일
+        out = self.view()
+        self.assertLess(out.index("다낡음"), out.index("나최신"))
+        self.assertLess(out.index("나최신"), out.index("가동결"))
+        self.assertIn("갱신할 것 1", out)
+        self.assertEqual(out.count("● 새 메일 1"), 1)
+        self.assertIn("<span class='wdot ok'>최신</span> · 후보 3 대기", out)
+        self.assertIn("동결 01-12", out)
+
+    # ── 주제 페이지: 근거를 따라간다 ──
+    def test_evidence_numbers_become_links_to_that_mail(self):
+        self.page()
+        out = self.topic()
+        a3, A = self.mid("a3"), self.tid("a1")
+        self.assertIn(f"href='/thread/{A}?focus={a3}'", out)
+        self.assertNotIn("[메일 #", out)                # 11자리 번호는 화면에 내지 않는다
+        self.assertIn("01-12 ↗", out)                   # 칩 = 근거 메일의 발신일
+        self.assertIn("알파 출시 일정", out)             # 툴팁에 제목
+
+    def test_missing_mail_is_shown_as_missing_not_hidden(self):
+        self.page(state=["- 결정: 출시일은 2월 둘째 주다. [메일 #99999999]"])
+        out = self.topic()
+        self.assertIn("원문 없음", out)
+        self.assertIn("출시일은 2월 둘째 주다.", out)   # 줄은 그대로 남는다
+
+    def test_two_evidence_of_the_same_day_are_told_apart(self):
+        self.page(state=[f"- 사실: 부하 시험 수치. [메일 #{self.mid('b1')}] "
+                         f"[메일 #{self.mid('b2')}]"])
+        out = self.topic()
+        chips = re.findall(r"class='wref'[^>]*>([^<]+)</a>", out.split("열린 것")[0])
+        self.assertEqual(len(chips), 2)
+        self.assertNotEqual(chips[0], chips[1])
+        self.assertTrue(all(c.startswith("01-11 ") for c in chips))
+
+    # ── 주제 페이지: 경위를 두 가지로 묶는다 ──
+    def test_decision_view_hangs_settled_talk_under_its_decision(self):
+        self.page()
+        out = self.topic()
+        dec = out[out.index("class='wvb'"):out.index("class='wvt'")]
+        card = dec[dec.index("class='wdec'"):dec.index("아직 열린 논의")]
+        self.assertIn("출시일 2월 둘째 주", card)
+        self.assertIn("이 결정으로 매듭지어진 논의 1", card)
+        self.assertIn("2월 둘째 주로 미루자는 제안", card)        # → 결정 꼬리가 달린 줄
+        self.assertNotIn("1월 말 출시가 가능한지 물음", card)     # 꼬리 없는 논의는 따로
+        rest = dec[dec.index("아직 열린 논의"):]
+        self.assertIn("1월 말 출시가 가능한지 물음", rest)
+        self.assertIn("확인된 사실", rest)
+        # 다섯 줄이 한 번씩 — 빠지지도, 두 번 나오지도 않는다
+        self.assertEqual(dec.count("class='wq'"), 5)
+
+    def test_time_view_resorts_by_date_whatever_the_file_order(self):
+        p = self.page()
+        text = p.read_text(encoding="utf-8")
+        lines = [l for l in text.splitlines() if l.startswith("- 2026-")]
+        # 계약: 경위는 끝에 덧붙인다 — 날짜순이 아닐 수 있다. 일부러 뒤집어 쓴다.
+        p.write_text(text.replace("\n".join(lines), "\n".join(reversed(lines))),
+                     encoding="utf-8")
+        tv = self.topic()
+        tv = tv[tv.index("class='wvt'"):]
+        days = re.findall(r"class='wday'>(\d\d-\d\d) \((.)\)", tv)
+        self.assertEqual([d for d, _ in days], ["01-12", "01-11", "01-10", "01-09"])
+        self.assertEqual(days[0][1], "월")                        # 2026-01-12 는 월요일
+        self.assertIn("전체 5", tv)
+        self.assertIn("결정·변경 1", tv)
+        self.assertIn("안 매듭지어진 논의 2", tv)
+
+    def test_initial_switches_follow_the_address(self):
+        self.page()
+        on = lambda html, sid: bool(re.search(rf"id='{sid}' checked", html))
+        out = self.topic()
+        self.assertTrue(on(out, "wv-dec") and on(out, "wf-all"))
+        self.assertFalse(on(out, "wv-time") or on(out, "wq-on"))
+        out = self.topic(view="time", show="open", quote="1")
+        self.assertTrue(on(out, "wv-time") and on(out, "wf-open") and on(out, "wq-on"))
+        out = self.topic(view="<x>", show="'x")                   # 모르는 값은 기본으로
+        self.assertTrue(on(out, "wv-dec") and on(out, "wf-all"))
+        self.assertNotIn("<x>", out)
+
+    def test_switching_is_css_only_and_the_ids_match(self):
+        """전환·거르기·인용 보기는 스크립트 없이 :checked 로 한다 — 화면의 id 와 CSS 의
+        선택자가 어긋나면 눌러도 아무 일도 안 일어난다(조용한 실패)."""
+        self.page()
+        out = self.topic()
+        for sid in ("wv-dec", "wv-time", "wq-on", "wo-old",
+                    "wf-all", "wf-dec", "wf-fact", "wf-talk", "wf-open"):
+            self.assertEqual(out.count(f"id='{sid}'"), 1, sid)
+            self.assertIn(f"for='{sid}'", out)
+            if sid != "wf-all":
+                self.assertIn(f"#{sid}:checked", web._CSS, sid)
+        self.assertNotIn("<script", out)
+        self.assertNotIn("onclick", out)
+
+    def test_lines_outside_the_grammar_are_kept(self):
+        p = self.page()
+        text = p.read_text(encoding="utf-8").replace(
+            "\n\n## 기술", "\n- 형식을 벗어난 메모 줄\n\n## 기술")
+        p.write_text(text, encoding="utf-8")
+        out = self.topic()
+        self.assertEqual(out.count("형식을 벗어난 메모 줄"), 2)   # 두 묶음에 한 번씩
+        rows = self.wiki.history(self.wiki.parse_page(p))
+        self.assertEqual(rows[-1], {"raw": "- 형식을 벗어난 메모 줄"})
+        self.assertEqual(rows[1]["tails"], [("2026-01-12", "결정", self.mid("a3"))])
+
+    def test_unknown_sections_and_notes_are_kept(self):
+        p = self.page(open=["- 대기: 답 없음.", "(오래된 것은 접었다 — 경위에 남아 있다)"])
+        p.write_text(p.read_text(encoding="utf-8") + "\n## 새로 생긴 절\n- 모르는 줄\n",
+                     encoding="utf-8")
+        out = self.topic()
+        self.assertIn("(오래된 것은 접었다 — 경위에 남아 있다)", out)
+        self.assertIn("<h2>새로 생긴 절</h2>", out)
+        self.assertIn("모르는 줄", out)
+
+    # ── 낡음 표시 ──
+    def test_stale_banner_gives_the_command_to_paste(self):
+        self.page(seq=self.seq_of("b2") - 1)
+        out = self.topic()
+        self.assertIn("기준 뒤에 쌓인 것: 새 메일 <b>1</b> · 새 후보 <b>3</b>", out)
+        self.assertIn("data-copy='/mail-wiki update 알파'", out)
+        self.page(candidates=self.known())
+        self.assertIn("최신 — 기준 뒤에 온 관련 메일이 없습니다", self.topic())
+
+    def test_frozen_and_unreadable_pages_say_so(self):
+        self.page(frozen="2026-01-12")
+        out = self.topic()
+        self.assertIn("동결 2026-01-12", out)
+        self.assertNotIn("/mail-wiki update", out)
+        self.page(format="")
+        out = self.topic()
+        self.assertIn("읽을 수 없는 페이지", out)
+        self.assertIn("출시일은 2월 둘째 주다.", out)             # 그래도 읽을 수는 있게
+
+    def test_overdue_is_marked(self):
+        self.page(open=["- 기한: 2026-01-10 일정 회신.",
+                        "- 대기: 회신 — 2026-01-09 까지, 지남."])
+        out = self.topic()
+        self.assertIn("class='wdue over'>3일 지남", out)
+        self.assertIn("<span class='wover'>지남</span>", out)
+        self.assertIn("지남 2", self.view())
+
+    def test_candidates_are_folded_with_commands_to_copy(self):
+        C = self.tid("c1")
+        self.page(candidates=[C])
+        out = self.topic()
+        self.assertIn("<details class='wfold'><summary>확인할 스레드", out)
+        self.assertIn(f"data-copy='/mail-wiki add 알파 {C}'", out)
+        self.assertIn(f"data-copy='/mail-wiki drop 알파 {C}'", out)
+        self.assertIn(f"href='/thread/{C}'", out)
+
+    # ── 지키는 것 ──
+    def test_page_text_is_escaped(self):
+        """페이지 글은 세션이 메일에서 옮겨 쓴 것이다 — 발신자가 정하는 값이 섞인다."""
+        x = "<img src=x onerror=alert(1)>"
+        a1 = self.mid("a1")
+        p = self.page(
+            state=[f"- 결정: {x} [메일 #{a1}]"], open=[f"- 대기: {x}"],
+            lines=[f'- 2026-01-09 **논의** {x} — {x} [메일 #{a1}] "{x} 따옴표\'"'])
+        p.write_text(p.read_text(encoding="utf-8").replace("| 제목 |", f"| {x} |")
+                     .replace("> 기준", f"> {x}"), encoding="utf-8")
+        (self.wiki.wiki_dir(self.cfg) / "index.md").write_text(
+            f"- [[알파]] — {x} · 기준 2026-01-12 · 스레드 2\n", encoding="utf-8")
+        for out in (self.topic(), self.view()):
+            self.assertNotIn("<img", out)
+            self.assertIn("&lt;img", out)
+        self.assertNotIn("따옴표'", self.topic())                 # 속성을 못 닫는다
+
+    def test_only_listed_page_names_open(self):
+        self.page()
+        (self.cfg.home / "secret.md").write_text("# 비밀\n\n## 현재 상태\n- 결정: 새는 글\n",
+                                                 encoding="utf-8")
+        for bad in ("../../secret.md", str(self.cfg.home / "secret.md"),
+                    "index.md", "없는주제.md", ".history/알파.md"):
+            out = self.view(page=bad)
+            self.assertIn("그 주제 페이지가 없습니다", out, bad)
+            self.assertNotIn("새는 글", out)
+        with mock.patch.object(web, "_open_external", return_value=True) as op:
+            loc = web.perform_action(self.store, self.cfg, "/wiki/open", {"page": ["알파.md"]})
+            self.assertIn("외부 편집기로 열기", urllib_unquote(loc))
+            loc = web.perform_action(self.store, self.cfg, "/wiki/open",
+                                     {"page": ["../../secret.md"]})
+            self.assertIn("주제 페이지가 아닙니다", urllib_unquote(loc))
+            self.assertEqual(op.call_count, 1)
+
+    def test_viewing_writes_nothing_and_calls_no_ai(self):
+        self.page(candidates=[self.tid("c1")])
+        w = self.wiki.wiki_dir(self.cfg)
+        (w / "index.md").write_text("- [[알파]] — 한 줄 · 기준 2026-01-12 · 스레드 2\n",
+                                    encoding="utf-8")
+        snap = lambda: {str(p.relative_to(w)): (p.read_bytes(), p.stat().st_mtime_ns)
+                        for p in w.rglob("*") if p.is_file()}
+        before, changes = snap(), self.store.db.total_changes
+        with mock.patch("mailkb.review.ai_run") as ai:
+            self.view()
+            self.topic()
+            self.topic(view="time", quote="1")
+            ai.assert_not_called()
+        self.assertEqual(snap(), before)                          # .history 도 안 생긴다
+        self.assertEqual(self.store.db.total_changes, changes)    # 읽기 경로에서 쓰지 않는다
+
+    def test_status_is_computed_once_until_something_changes(self):
+        p = self.page()
+        with mock.patch.object(self.wiki, "status", wraps=self.wiki.status) as st:
+            self.view()
+            self.topic()
+            self.view()
+            self.assertEqual(st.call_count, 1)                    # 탭을 오가도 다시 훑지 않는다
+            self.store.hide_thread(self.tid("b1"), True)          # 숨김이 바뀌면
+            self.view()
+            self.assertEqual(st.call_count, 2)
+            p.write_text(p.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+            self.view()                                           # 페이지 파일이 바뀌면
+            self.assertEqual(st.call_count, 3)
+            self.store.ingest([_rec("z1", "park@corp.example", [ME], "알파 추가 건",
+                                    "2026-01-13T09:00:00", body="알파 추가 확인 부탁드립니다.")])
+            self.assertIn("새 스레드 1", self.view())              # 새 메일이 오면
+            self.assertEqual(st.call_count, 4)
+            web.render_records(self.store, self.cfg, {"tab": ["wiki"]}, "2026-01-14")
+            self.assertEqual(st.call_count, 5)                    # 날짜가 바뀌면(며칠 전·지남)
+
+
 class TestMemo(unittest.TestCase):
     """메모(2026-11-18) — 메일에 묶이지 않는 내 기록과 할 일.
 

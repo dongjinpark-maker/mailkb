@@ -221,6 +221,41 @@ def _tails(line: str) -> list[str]:
     return _TAIL_RX.findall(parts[6]) if parts else []
 
 
+_TAIL_KIND = re.compile(r" → (%s) (%s) \[메일 #(\d+)\]" % (_DAY, "|".join(TAILS)))
+REF_RX = re.compile(r"\[메일 #(\d+)\]")     # 페이지가 근거로 든 메일 번호
+
+
+def history(page: "Page") -> list[dict]:
+    """경위 줄을 **읽는 쪽**(웹 화면)이 쓸 모양으로 푼다 — 파일에 적힌 순서 그대로.
+
+    문법을 아는 곳을 여기 한 군데로 두려는 것이다: 화면이 줄을 스스로 쪼개면 형식 판을
+    올리는 날 화면만 옛 문법으로 남는다. 페이지가 적어 둔 판(`format:`)의 문법으로 읽고,
+    문법 밖의 줄은 버리지 않고 `raw` 만 실어 돌려준다(화면이 그대로 보인다).
+    `tails` 는 (날짜, 결정|변경|해소, 메일 번호), `dropped` 는 '제외됨(주제 밖)' 꼬리."""
+    out = []
+    for line in page.bullets("경위"):
+        parts = _line_parts(line, page.fmt)
+        if not parts:
+            out.append({"raw": line})
+            continue
+        day, mark, gist, who, mid, quote, tail = parts
+        out.append({"raw": line, "day": day, "mark": mark, "gist": gist, "who": who,
+                    "mid": int(mid), "quote": quote,
+                    "tails": [(d, k, int(m)) for d, k, m in _TAIL_KIND.findall(tail)],
+                    "dropped": DROP_TAIL in tail})
+    return out
+
+
+def deadline_days(line: str, today: date) -> int | None:
+    """`- 기한: YYYY-MM-DD …` 줄의 날짜가 며칠 지났나(음수면 남은 날). 기한 줄이 아니면 None."""
+    return _deadline_days(line, today)
+
+
+def overdue(line: str, today: date) -> bool:
+    """열린 것 한 줄이 지난 것인가 — 세션이 '지남' 이라 적었거나, 날짜가 지났는데 표시가 없거나."""
+    return "지남" in line or _deadline_passed(line, today)
+
+
 # ── 메일 읽기 ──────────────────────────────────────────────────────────────
 
 class _Mail:

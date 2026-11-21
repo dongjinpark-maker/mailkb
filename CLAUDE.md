@@ -11,7 +11,7 @@ AI 코딩 에이전트가 먼저 읽는 문서. 무엇을 만들고 있는지는
 메일에 묶이지 않는 기록·할 일은 메모(`vault/memo/`, 한 건에 파일 하나)에 적고,
 더 깊은 분석은 Claude Code 스킬(`/mail-research`)이 세션에서 직접 한다.
 등록한 주제의 페이지(위키)를 편찬·갱신하는 것은 `/mail-wiki` 다 — 찾기·대조는
-`mailkb wiki`(코드), 읽고 쓰는 것은 세션.
+`mailkb wiki`(코드), 읽고 쓰는 것은 세션. 웹(기억 › 위키)은 그 페이지를 읽어 그리기만 한다.
 수·발신·보관은 Outlook 에 그대로 둔다.
 
 ## 깨면 안 되는 것
@@ -260,5 +260,5 @@ Windows 실기기 확인이 필요한 변경은 그렇다고 말하고 넘긴다
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 목적·모듈 지도·데이터 모델·파이프라인·기능 상세·설계 결정 |
 | [docs/OPENCODE-WINDOWS.md](docs/OPENCODE-WINDOWS.md) | `internal`(opencode) 백엔드를 Windows에서 쓰기 — WSL 호출 형태의 함정과 진행 표시 · WSL 에서 opencode 로 저장소 바로 쓰기(`.opencode/`) |
 | [agent-guides/](agent-guides/) | 조사 에이전트용 CLI 계약 — 어떤 명령이 읽기 전용이고 어떤 것이 AI를 부르는지 |
-| [.claude/skills/mail-wiki/](.claude/skills/mail-wiki/) | 주제 위키 스킬(`/mail-wiki`) — 계약은 `agent-guides/minerva-wiki.md`, 손발은 `mailkb/wiki.py`. 페이지 형식·표시·꼬리를 바꾸면 **계약과 `wiki.LINE_RX`·`check` 를 함께** 고치고, 이미 쓰인 페이지가 있으면 `wiki.FORMAT` 을 올리되 옛 판의 문법을 `GRAMMAR` 에 남긴다(어긋나면 세션이 쓴 줄이 전부 형식 오류가 된다). '새 메일'은 머리말 `seq`(도착 순서)로 가른다 — 발신 시각으로 가르지 않는다(불변식 8). `.opencode/command/mail-wiki.md` 는 스킬의 복사본 |
+| [.claude/skills/mail-wiki/](.claude/skills/mail-wiki/) | 주제 위키 스킬(`/mail-wiki`) — 계약은 `agent-guides/minerva-wiki.md`, 손발은 `mailkb/wiki.py`. 페이지 형식·표시·꼬리를 바꾸면 **계약과 `wiki.LINE_RX`·`check` 를 함께** 고치고, 이미 쓰인 페이지가 있으면 `wiki.FORMAT` 을 올리되 옛 판의 문법을 `GRAMMAR` 에 남긴다(어긋나면 세션이 쓴 줄이 전부 형식 오류가 된다). '새 메일'은 머리말 `seq`(도착 순서)로 가른다 — 발신 시각으로 가르지 않는다(불변식 8). `.opencode/command/mail-wiki.md` 는 스킬의 복사본. 웹 화면(기억 › 위키)은 경위 줄을 `wiki.history` 로만 읽는다 — 화면에서 줄을 따로 쪼개지 않는다 |
 | [.claude/skills/mail-research/](.claude/skills/mail-research/) | 사용자용 조사 스킬(`/mail-research`) — **계약의 원본이 아니다**. agent-guides 를 가리키기만 하므로, 그쪽 파일 이름이 바뀌면 여기도 고친다(테스트가 막는다) |

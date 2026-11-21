@@ -1328,6 +1328,106 @@ details.doneundo li { font-size: 12.5px; margin: 3px 0; }
 @media (prefers-reduced-motion: reduce) {
   .rvfill.indet, .waitcard .spin { animation: none; }
 }
+/* ── 기억 › 위키 (2026-11-21) — 주제 페이지를 읽어 그린다 ── */
+.wsum { margin: 8px 0 10px; font-size: 13.5px; color: var(--ink-2); }
+.wsum code, .wstale code { font-family: var(--mono); font-size: 12.5px; padding: 1px 5px;
+    background: var(--surface); border: 1px solid var(--border-2); border-radius: 4px; }
+.witem { padding: 9px 12px; }
+.witem .wtitle { font-weight: 700; font-size: 15px; }
+.witem .wmeta { display: block; margin-top: 4px; font-size: 12.5px; color: var(--ink-2); }
+.wdot { color: var(--warn); font-weight: 600; }
+.wdot.ok { color: var(--ok); } .wdot.bad { color: var(--danger); }
+.wfz { font-size: 11.5px; font-weight: 600; padding: 1px 7px; border-radius: 999px;
+    color: var(--ink-2); background: var(--surface-3); border: 1px solid var(--border-2);
+    vertical-align: 2px; }
+.wover { color: var(--danger); font-weight: 600; }
+.wiki h1 { margin-bottom: 6px; }
+.wiki h1 .wage { font-size: 12.5px; font-weight: 400; color: var(--ink-3); margin-left: 6px; }
+.wiki h2 { margin: 20px 0 6px; }
+.wn { font-size: 12px; font-weight: 600; color: var(--ink-3); margin-left: 2px; }
+.wstale { margin: 8px 0; padding: 8px 12px; font-size: 13px; line-height: 1.7;
+    color: var(--warn); background: var(--warn-bg); border: 1px solid var(--warn-border);
+    border-radius: var(--r-md); }
+.wstale.ok { color: var(--ok); background: var(--ok-bg); border-color: var(--ok-border); }
+.wstale.frozen { color: var(--ink-2); background: var(--surface-2); border-color: var(--border); }
+.wstale.bad { color: var(--danger); background: var(--danger-bg); border-color: var(--danger); }
+.wiki .copybtn { font-size: 12px; padding: 1px 7px; margin-left: 2px; cursor: pointer;
+    background: var(--surface); color: var(--ink-2); border: 1px solid var(--border-2);
+    border-radius: 4px; }
+.whead { font-size: 12.5px; color: var(--ink-3); line-height: 1.6; margin: 6px 0 2px; }
+.wl { list-style: none; margin: 0; padding: 0; }
+.wl > li { display: flex; gap: 8px; align-items: baseline; padding: 5px 2px;
+    border-bottom: 1px solid var(--border); font-size: 14px; line-height: 1.55; }
+.wl > li.wnote { display: block; color: var(--ink-3); font-size: 12.5px; border-bottom: 0; }
+.wl .wt { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.wl .wd { flex: none; width: 3.1em; color: var(--ink-3); font-size: 12.5px;
+    font-variant-numeric: tabular-nums; }
+.wm { flex: none; min-width: 2.6em; text-align: center; font-size: 11.5px; font-weight: 700;
+    padding: 0 6px; border-radius: 4px; line-height: 1.7;
+    color: var(--ink-2); background: var(--surface-3); border: 1px solid var(--border-2); }
+.wm.dec { color: var(--accent-fg); background: var(--accent); border-color: var(--accent); }
+.wm.chg, .wm.due { color: var(--warn); background: var(--warn-bg); border-color: var(--warn-border); }
+.wm.fact { color: var(--ok); background: var(--ok-bg); border-color: var(--ok-border); }
+.wref { white-space: nowrap; font-size: 11.5px; margin-left: 4px; padding: 0 5px;
+    border: 1px solid var(--border-2); border-radius: 999px; color: var(--accent);
+    background: var(--surface); }
+.wref:hover { border-color: var(--accent); text-decoration: none; }
+.wref.gone { color: var(--ink-3); }
+.wdue { margin-left: 6px; font-size: 11.5px; font-weight: 600; color: var(--ink-2); }
+.wdue.over { color: var(--danger); }
+.ww { color: var(--ink-3); font-size: 13px; }
+.wtail { white-space: nowrap; font-size: 12px; color: var(--ink-3); }
+.wtail .wref { margin-left: 0; }
+.wq { display: none; margin-top: 2px; font-size: 12.5px; color: var(--ink-2);
+    border-left: 2px solid var(--border-strong); padding-left: 8px; }
+/* 경위의 스위치 — 라디오·체크 상자는 숨기고 라벨을 칩으로. 전환은 :checked 만으로 한다
+   (스크립트 없음). 상자를 display:none 으로 숨기면 키보드로 못 가므로 투명하게만 둔다. */
+.wlog { position: relative; }
+.wsw { position: absolute; opacity: 0; pointer-events: none; }
+.wsw + label { display: inline-block; margin: 0 4px 8px 0; padding: 1px 9px; font-size: 12.5px;
+    cursor: pointer; color: var(--ink-2); background: var(--surface);
+    border: 1px solid var(--border-2); border-radius: 999px; }
+.wsw + label:hover { border-color: var(--accent); }
+.wsw:checked + label { color: var(--accent-strong); background: var(--sel-bg);
+    border-color: var(--accent); font-weight: 600; }
+.wsw:focus-visible + label { outline: 2px solid var(--accent); outline-offset: 1px; }
+.wgap { display: inline-block; width: 10px; }
+.wlog li.tied .wt { color: var(--ink-3); }
+.wlog li.tied .wm { opacity: .55; }
+#wv-dec:checked ~ .wvt, #wv-time:checked ~ .wvb { display: none; }
+#wq-on:checked ~ div .wq { display: block; }
+.wgh { margin: 14px 0 4px; font-size: 13.5px; color: var(--ink-2); }
+.wdec { margin: 6px 0 10px; padding: 4px 10px 6px; background: var(--surface);
+    border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    border-radius: var(--r-md); }
+.wdec > .wl > li { border-bottom: 0; font-weight: 600; }
+.wdec > .wl > li .ww, .wdec > .wl > li .wq { font-weight: 400; }
+.wkids { margin: 2px 0 2px 3.6em; padding-left: 10px; border-left: 2px solid var(--border-strong); }
+.wkids .wkh { font-size: 12px; color: var(--ink-3); }
+.wkids .wl > li { font-size: 13px; padding: 3px 0; border-bottom: 0; }
+.wvb li.tied .wt { color: var(--ink-2); }
+.wgrp { margin-top: 12px; }
+.wgrp > summary { cursor: pointer; font-size: 13.5px; font-weight: 700; color: var(--ink-2); }
+.wlg { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.wdl { display: flex; flex-direction: column; margin-left: 10px; padding-left: 12px;
+    border-left: 2px solid var(--border-strong); }
+.wdl > li { border-bottom: 0; } .wdl .wd { display: none; }
+.wday { margin-top: 10px; padding: 2px 0; font-size: 12.5px; font-weight: 700;
+    color: var(--ink-2); border-bottom: 1px solid var(--border-strong); }
+#wo-old:checked ~ .wlg, #wo-old:checked ~ .wlg .wdl { flex-direction: column-reverse; }
+/* 거르기 — 줄을 숨기고, 남은 줄이 없는 날짜 묶음도 같이 숨긴다(:has) */
+#wf-dec:checked ~ .wlg .wdl > li:not(.k-dec),
+#wf-fact:checked ~ .wlg .wdl > li:not(.k-fact),
+#wf-talk:checked ~ .wlg .wdl > li:not(.k-talk),
+#wf-open:checked ~ .wlg .wdl > li:not(.k-open),
+#wf-dec:checked ~ .wlg .wdayg:not(:has(.k-dec)),
+#wf-fact:checked ~ .wlg .wdayg:not(:has(.k-fact)),
+#wf-talk:checked ~ .wlg .wdayg:not(:has(.k-talk)),
+#wf-open:checked ~ .wlg .wdayg:not(:has(.k-open)) { display: none; }
+.wfold { margin: 14px 0 0; border-top: 1px solid var(--border); padding-top: 8px; }
+.wfold > summary { cursor: pointer; font-weight: 700; font-size: 15px; }
+.wfold > summary .dim { font-weight: 400; font-size: 12.5px; }
+.wcand { display: block; margin-top: 4px; }
 """
 
 _REF_RX = re.compile(r"#(\d+)")
@@ -3165,6 +3265,19 @@ _APP_JS = r"""
     try {
       if (navigator.clipboard) navigator.clipboard.writeText(txt).then(done, function () {});
     } catch (e) { /* 안 되면 그대로 둔다 */ }
+  });
+
+  /* ---- 위키 경위의 스위치(.wsw) — 전환 자체는 CSS(:checked)가 한다. 여기서 하는 일은
+     하나: **마우스로 누른 뒤 포커스를 풀어 준다.** 라벨을 누르면 숨은 라디오·체크 상자가
+     포커스를 갖는데, 단축키 처리는 INPUT 에 포커스가 있으면 '입력 중'으로 보고 쉰다 —
+     그대로 두면 [시간순]을 한 번 누른 뒤로 j/k·m 이 먹지 않는다. 키보드(Tab·Space·
+     화살표)로 바꿀 때는 이벤트 대상이 라벨이 아니라 상자라 여기 걸리지 않는다. ---- */
+  document.addEventListener("click", function (ev) {
+    var l = ev.target.closest && ev.target.closest("label[for]");
+    if (!l) return;
+    var box = document.getElementById(l.getAttribute("for"));
+    if (box && box.classList.contains("wsw"))
+      setTimeout(function () { box.blur(); }, 0);
   });
 
   function hookAitestPolling(root) {
@@ -9076,22 +9189,482 @@ def _render_knowledge_doc(store, cfg, path_str: str) -> str:
     return "\n".join(out)
 
 
+# ─────────────────────────────────────────────────── 위키 (2026-11-21)
+# 주제 페이지(vault/wiki/*.md)를 **읽어 그리기만** 한다. 페이지를 만들고 고치는 것은
+# `/mail-wiki` 세션이고(계약: agent-guides/minerva-wiki.md), 여기는 AI 호출 0 · DB 쓰기 0
+# · 파일 쓰기 0 이다. 편집기로 열면 안 되는 세 가지를 해 주려는 화면이다:
+#   · 근거를 따라간다 — `[메일 #26110743001]` 같은 11자리 번호를 날짜 칩으로 바꾸고,
+#     누르면 오른쪽에 그 스레드가 그 메일 위치로 열린다(페이지는 왼쪽에 그대로 남는다)
+#   · 낡았는지 안다 — 기준 뒤에 쌓인 메일·후보 수와, 세션에 붙여 넣을 갱신 명령
+#   · 길어도 훑는다 — 경위를 결정 중심(기본)·시간순 두 가지로 묶는다
+# **파일의 줄은 하나도 버리지 않는다** — 순서를 다시 세우고 접을 뿐이다. 문법 밖의
+# 줄도 그대로 보인다. 페이지 글은 세션이 메일에서 옮겨 쓴 것이라(발신자가 정하는 값이
+# 섞인다) 전부 esc 를 거친다.
+_WIKI_HEAD_RX = re.compile(r"- (결정|사실|미정|대기|기한):\s*(.*)")
+_WIKI_CLS = {"결정": "dec", "변경": "chg", "사실": "fact", "논의": "talk",
+             "미정": "open", "대기": "wait", "기한": "due"}
+_WIKI_VIEWS = ("dec", "time")            # 경위 묶는 법 — 결정 중심(기본) · 시간순
+_WIKI_SHOWS = ("dec", "fact", "talk", "open")
+
+# status 는 주제마다 별칭·낱말로 본문 전체를 훑는다(LIKE). 데모 5ms, 9천 통으로 부풀린
+# 사본에서 주제당 약 0.4초 — 탭을 누를 때마다 치르기엔 길다. 결과가 달라질 수 있는 것
+# (새 메일 · 숨김 · 페이지 파일 · 자동 알림 규칙 · 날짜)을 키로 묶어 메모리에 둔다.
+# DB 에 캐시하지 않는다 — 읽기 경로에서 쓰지 않는다(불변식 9).
+_wiki_cache: dict = {"key": None, "rows": None}
+_wiki_lock = threading.Lock()
+
+
+def _wiki_status(store, cfg, today: str) -> list[dict]:
+    from . import wiki
+    pages = tuple((p.name, p.stat().st_mtime_ns, p.stat().st_size)
+                  for p in wiki.page_paths(cfg))
+    seq = store.db.execute(
+        "SELECT COALESCE(MAX(ingest_seq), 0), COUNT(*) FROM messages "
+        "WHERE gone_at IS NULL").fetchone()
+    key = (str(cfg.db_path), today, tuple(seq), pages,
+           tuple(sorted(store.hidden_thread_ids())),
+           tuple(cfg.ignore_senders), tuple(cfg.blocked_senders),
+           tuple(cfg.internal_domains or ()))
+    with _wiki_lock:
+        if _wiki_cache["key"] == key:
+            return [dict(r) for r in _wiki_cache["rows"]]
+    rows = wiki.status(store, cfg, date.fromisoformat(today))
+    with _wiki_lock:
+        _wiki_cache["key"], _wiki_cache["rows"] = key, rows
+    return [dict(r) for r in rows]
+
+
+def _wiki_page_ok(cfg, name: str) -> Path | None:
+    """주제 페이지 파일 이름 검증 — vault/wiki 의 페이지 목록에 **있는 이름**만 통과한다.
+    경로를 받지 않으므로 `../` 로 밖을 가리킬 수 없다(index·log·notes 도 페이지가 아니다)."""
+    from . import wiki
+    return next((p for p in wiki.page_paths(cfg) if p.name == name), None)
+
+
+def _wiki_mails(store, text: str) -> dict:
+    """페이지가 근거로 든 메일 번호 → 스레드·발신일·보낸 사람·제목. 한 번에 읽는다."""
+    from . import wiki
+    ids = sorted({int(x) for x in wiki.REF_RX.findall(text)})
+    out = {}
+    for i in range(0, len(ids), 400):    # SQLite 바인딩 상한(구판 999) 아래로
+        part = ids[i:i + 400]
+        for r in store.db.execute(
+                "SELECT id, thread_id, sent_on, sender_name, sender_addr, subject "
+                "FROM messages WHERE id IN (%s)" % ",".join("?" * len(part)), part):
+            out[r["id"]] = r
+    return out
+
+
+def _wiki_ref(mid, mails: dict, label: str = "") -> str:
+    """`[메일 #N]` → 칩. 누르면 오른쪽에 그 스레드가 그 메일 위치로 열린다.
+
+    번호를 그대로 보이지 않는 까닭: 11자리 수는 읽을 수 없고, 읽는 사람이 궁금한 것은
+    '언제 누가 한 말인가'다 — 칩에 발신일을, 툴팁에 보낸 사람·제목을 싣는다.
+    DB 에 없는 번호(PC 교체로 DB 를 새로 만든 경우 등)는 링크 없이 그 사실을 보인다."""
+    r = mails.get(int(mid))
+    if r is None:
+        return ("<span class='wref gone' title='이 번호의 메일이 지금 DB 에 없습니다'>"
+                "원문 없음</span>")
+    sent = r["sent_on"] or ""
+    tip = (f"{r['sender_name'] or r['sender_addr'] or ''} · "
+           f"{sent[:16].replace('T', ' ')} · {r['subject'] or ''}")
+    return (f"<a class='wref' href='/thread/{r['thread_id']}?focus={r['id']}' "
+            f"title='{esc(tip)}'>{esc(label or sent[5:10])} ↗</a>")
+
+
+def _wiki_plain(s: str) -> str:
+    t = _BOLD_RX.sub(r"<strong>\1</strong>", esc(s))
+    return t.replace("지남", "<span class='wover'>지남</span>")
+
+
+def _wiki_text(text: str, mails: dict) -> str:
+    """본문 한 줄 → HTML. 근거 번호는 그 자리에서 칩으로 바꾼다.
+
+    한 줄에 같은 날 근거가 둘이면 칩이 똑같아 보인다 — 그때만 보낸 사람을 붙인다."""
+    from . import wiki
+    found = list(wiki.REF_RX.finditer(text))
+    days = [((mails.get(int(m.group(1))) or {"sent_on": ""})["sent_on"] or "")[5:10]
+            for m in found]
+    out, pos = [], 0
+    for m, day in zip(found, days):
+        out.append(_wiki_plain(text[pos:m.start()]))
+        r = mails.get(int(m.group(1)))
+        label = ""
+        if r is not None and days.count(day) > 1:
+            who = (r["sender_name"] or r["sender_addr"] or "").split("@")[0]
+            label = f"{day} {who}".strip()
+        out.append(_wiki_ref(m.group(1), mails, label))
+        pos = m.end()
+    out.append(_wiki_plain(text[pos:]))
+    return "".join(out)
+
+
+def _wiki_bullets(lines: list, mails: dict, today: date) -> str:
+    """현재 상태 · 열린 것 · 기술 · 사람(과 모르는 절) — 줄 머리의 종류를 칩으로."""
+    from . import wiki
+    out = []
+    for raw in lines:
+        s = raw.strip()
+        if not s:
+            continue
+        m = _WIKI_HEAD_RX.match(s)
+        if m:
+            kind, rest = m.groups()
+            due = ""
+            days = wiki.deadline_days(s, today) if kind == "기한" else None
+            if days is not None and "지남" not in s:
+                due = (f"<span class='wdue over'>{days}일 지남</span>" if days > 0
+                       else f"<span class='wdue'>D-{-days}</span>" if days < 0
+                       else "<span class='wdue'>오늘</span>")
+            out.append(f"<li><span class='wm {_WIKI_CLS[kind]}'>{kind}</span>"
+                       f"<span class='wt'>{_wiki_text(rest, mails)}{due}</span></li>")
+        elif s.startswith("- "):
+            name, sep, rest = s[2:].partition(" — ")
+            body = (f"<b>{_wiki_plain(name)}</b> — {_wiki_text(rest, mails)}" if sep
+                    else _wiki_text(s[2:], mails))
+            out.append(f"<li><span class='wt'>{body}</span></li>")
+        else:                            # 불릿이 아닌 줄(세션이 남긴 안내) — 버리지 않는다
+            out.append(f"<li class='wnote'>{_wiki_text(s, mails)}</li>")
+    return "<ul class='wl'>" + "".join(out) + "</ul>" if out else ""
+
+
+def _wiki_log(page, mails: dict, view: str = "", show: str = "",
+              quote: bool = False) -> tuple[str, int]:
+    """경위 — 같은 줄을 두 가지로 묶어 보인다. (HTML, 줄 수)
+
+    결정 중심(기본): 결정마다 그 결정으로 매듭지어진 논의를 딸려 보이고, 이어서 아직
+    열린 논의. 위키를 만드는 목적이 '중간 논의와 최종 결정을 갈라 보는 것'이라 이쪽이
+    기본이다. 시간순: 날짜를 머리로 한 번만 쓰고 그날의 줄을 아래에 — '그 주에 무슨 일이
+    있었나'는 이쪽이 맞다. 파일은 덧붙인 순서라 날짜가 섞여 있어(계약: 경위는 끝에
+    덧붙인다) 어느 쪽이든 날짜로 다시 세운다.
+
+    **전환·거르기·인용 보기는 CSS 만으로 한다** — 두 묶음을 다 그려 두고 라디오·체크
+    상자의 :checked 로 하나만 보인다. 링크로 다시 그리면 긴 페이지 한가운데서 맨 위로
+    튀고, 스크립트를 쓰면 자산(JS)이 늘어난다. view·show·quote 는 처음에 켜 둘 상태다
+    (주소로 그 상태를 가리킬 수 있게)."""
+    from . import wiki
+    rows = [(r.get("day", ""), i, r) for i, r in enumerate(wiki.history(page))]
+    rows.sort(key=lambda x: (x[0], x[1]), reverse=True)      # 최신이 위, 같은 날은 뒤에 쓴 것이 위
+    total = len(rows)
+    if not total:
+        return "", 0
+    years = {d[:4] for d, _i, _r in rows if d}
+    n = {"dec": 0, "fact": 0, "talk": 0, "open": 0}
+    items, info = [], []                 # info[i] = (날짜, 종류, 열림?, 이 줄을 매듭지은 결정 메일, 근거 메일)
+    for day, _i, r in rows:
+        if "mark" not in r:              # 문법 밖의 줄 — 그대로 보인다
+            items.append("<li><span class='wd'></span><span class='wm'>?</span>"
+                         f"<span class='wt'>{_wiki_text(r['raw'][2:], mails)}</span></li>")
+            info.append(("", "", False, [], 0))
+            continue
+        mark = r["mark"]
+        key = "dec" if mark in ("결정", "변경") else "fact" if mark == "사실" else "talk"
+        tied = bool(r["tails"]) or r["dropped"]
+        is_open = key == "talk" and not tied
+        n[key] += 1
+        n["open"] += is_open
+        cls = f"k-{key}" + (" k-open" if is_open else "") + (" tied" if tied else "")
+        tail = "".join(" <span class='wtail'>→ "
+                       + _wiki_ref(tm, mails, f"{td[5:]} {tk}") + "</span>"
+                       for td, tk, tm in r["tails"])
+        if r["dropped"]:
+            tail += " <span class='wtail'>→ 제외됨(주제 밖)</span>"
+        shown = day if len(years) > 1 else day[5:]
+        items.append(
+            f"<li class='{cls}'><span class='wd' title='{esc(day)}'>{esc(shown)}</span>"
+            f"<span class='wm {_WIKI_CLS[mark]}'>{mark}</span>"
+            f"<span class='wt' title='{esc(r['quote'])}'>{_wiki_plain(r['gist'])} "
+            f"<span class='ww'>— {esc(r['who'])}</span> {_wiki_ref(r['mid'], mails, '원문')}"
+            f"{tail}<span class='wq'>“{esc(r['quote'])}”</span></span></li>")
+        info.append((day, key, is_open,
+                     [tm for _td, tk, tm in r["tails"] if tk in ("결정", "변경")], r["mid"]))
+
+    def sw(kind, sid, label, on=False, name="wf"):
+        return (f"<input class='wsw' type='{kind}' name='{name}' id='{sid}'"
+                f"{' checked' if on else ''}><label for='{sid}'>{label}</label>")
+
+    # ── 결정 중심
+    by_mid: dict = {}
+    for i, x in enumerate(info):
+        for t in x[3]:
+            by_mid.setdefault(t, []).append(i)
+    used, cards = set(), []
+    for i, x in enumerate(info):
+        if x[1] != "dec":
+            continue
+        # 한 메일에 결정 줄이 둘이면 딸린 논의는 먼저 나온 카드에만 붙인다(두 번 보이지 않게)
+        kids = [k for k in by_mid.get(x[4], []) if k != i and k not in used]
+        used.update(kids)
+        used.add(i)
+        cards.append(
+            "<div class='wdec'><ol class='wl'>" + items[i] + "</ol>"
+            + (f"<div class='wkids'><span class='wkh'>이 결정으로 매듭지어진 논의 {len(kids)}"
+               f"</span><ol class='wl'>{''.join(items[k] for k in kids)}</ol></div>"
+               if kids else "")
+            + "</div>")
+    opens = [i for i, x in enumerate(info) if x[2]]
+    facts = [i for i, x in enumerate(info) if x[1] == "fact"]
+    used.update(opens)
+    used.update(facts)
+    rest = [i for i in range(total) if i not in used]
+
+    def grp(title, idx, fold=False):
+        if not idx:
+            return ""
+        body = f"<ol class='wl'>{''.join(items[i] for i in idx)}</ol>"
+        head = f"{title} <span class='wn'>{len(idx)}</span>"
+        return (f"<details class='wgrp'><summary>{head}</summary>{body}</details>" if fold
+                else f"<h3 class='wgh'>{head}</h3>{body}")
+
+    by_dec = ((f"<h3 class='wgh'>결정 <span class='wn'>{len(cards)}</span></h3>" + "".join(cards)
+               if cards else "<p class='dim'>아직 결정 줄이 없습니다.</p>")
+              + grp("아직 열린 논의", opens) + grp("확인된 사실", facts, fold=True)
+              + grp("그 밖 — 해소된 질문·요청 등", rest, fold=True))
+
+    # ── 시간순: 날짜 묶음
+    days: dict = {}
+    for i, x in enumerate(info):
+        days.setdefault(x[0], []).append(i)
+    groups = []
+    for day, idx in days.items():
+        try:
+            wk = " (" + "월화수목금토일"[date.fromisoformat(day).weekday()] + ")"
+        except ValueError:
+            wk = ""
+        label = (day if len(years) > 1 else day[5:]) or "날짜 없는 줄"
+        groups.append(f"<li class='wdayg'><div class='wday'>{esc(label)}{wk}</div>"
+                      f"<ol class='wl wdl'>{''.join(items[i] for i in idx)}</ol></li>")
+    bar = (sw("radio", "wf-all", f"전체 {total}", show not in _WIKI_SHOWS)
+           + sw("radio", "wf-dec", f"결정·변경 {n['dec']}", show == "dec")
+           + sw("radio", "wf-fact", f"사실 {n['fact']}", show == "fact")
+           + sw("radio", "wf-talk", f"논의 {n['talk']}", show == "talk")
+           + sw("radio", "wf-open", f"안 매듭지어진 논의 {n['open']}", show == "open")
+           + "<span class='wgap'></span>" + sw("checkbox", "wo-old", "오래된 순", name="wo"))
+    by_time = f"{bar}<ol class='wlg'>{''.join(groups)}</ol>"
+
+    head = (sw("radio", "wv-dec", "결정 중심", view != "time", name="wv")
+            + sw("radio", "wv-time", "시간순", view == "time", name="wv")
+            + "<span class='wgap'></span>" + sw("checkbox", "wq-on", "인용 보기", quote, name="wq"))
+    return (f"<div class='wlog'>{head}<div class='wvb'>{by_dec}</div>"
+            f"<div class='wvt'>{by_time}</div></div>", total)
+
+
+def _wiki_table(lines: list) -> list[list[str]]:
+    """마크다운 표 → 칸의 목록(머리·구분 줄 제외)."""
+    rows = []
+    for raw in lines:
+        s = raw.strip()
+        if not s.startswith("|"):
+            continue
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        if all(re.fullmatch(r":?-+:?", c) for c in cells):
+            continue
+        rows.append(cells)
+    return rows[1:]
+
+
+def _wiki_cmd(verb: str, topic: str, *args) -> str:
+    """세션에 붙여 넣을 명령 + [복사] — 웹은 페이지를 쓰지 않으므로 여기까지만 돕는다."""
+    c = " ".join(["/mail-wiki", verb, topic, *map(str, args)])
+    return (f"<code>{esc(c)}</code> <button type='button' class='copybtn' "
+            f"data-copy='{esc(c)}'>복사</button>")
+
+
+def _wiki_stale(row: dict, topic: str) -> str:
+    """머리의 낡음 표시 — 기준 뒤에 무엇이 얼마나 쌓였나, 무엇을 돌리면 되나."""
+    if row.get("problem"):
+        return f"<div class='wstale bad'>읽을 수 없는 페이지 — {esc(row['problem'])}</div>"
+    if row["frozen"]:
+        n = row["new_messages"]
+        return (f"<div class='wstale frozen'><b>동결 {esc(row['frozen'])}</b> — 이 뒤 메일은 "
+                "반영하지 않습니다. "
+                + (f"그 뒤에 온 관련 메일 <b>{n}통</b> · 다시 열려면 "
+                   f"{_wiki_cmd('unfreeze', topic)}" if n
+                   else "그 뒤에 온 관련 메일은 없습니다.") + "</div>")
+    parts = [f"{label} <b>{row[k]}</b>" for k, label in (
+        ("new_messages", "새 메일"), ("new_confirmed_threads", "새 스레드"),
+        ("new_candidates", "새 후보"), ("deadlines_passed_unmarked", "표시 안 된 지난 기한"))
+        if row[k]]
+    if not parts:
+        return "<div class='wstale ok'>최신 — 기준 뒤에 온 관련 메일이 없습니다.</div>"
+    return ("<div class='wstale'>기준 뒤에 쌓인 것: " + " · ".join(parts)
+            + f"<br>세션에서 {_wiki_cmd('update', topic)}</div>")
+
+
+def _wiki_age(row: dict) -> str:
+    thr = (row.get("through") or "")[:10]
+    age = row.get("days_since")
+    return (f"기준 {esc(thr[5:] or '?')}"
+            + (f" · {age}일 전" if age else " · 오늘" if age == 0 else "")
+            + f" · 스레드 {row['threads']}")
+
+
+def _render_wiki_topic(store, cfg, path, row: dict, qs, today: str) -> str:
+    """주제 페이지 한 장. 절은 **파일에 적힌 순서대로** — 모르는 절도 그대로 보인다."""
+    from . import wiki
+    page = wiki.parse_page(path)
+    text = path.read_text(encoding="utf-8")
+    mails = _wiki_mails(store, text)
+    day = date.fromisoformat(today)
+    topic = page.topic
+    here = f"/records?tab=wiki&page={_q(path.name)}"
+    # 머리 줄(`>`) — 첫 절 앞의 인용 줄. 세션이 쓴 그대로 보인다(기준·읽지 못한 첨부).
+    head = [_wiki_plain(l[1:].strip()) for l in text.split("\n## ")[0].splitlines()
+            if l.startswith(">")]
+    out = ["<p class='dim'><a href='/records?tab=wiki'>← 위키 목록</a></p>",
+           "<div class='wiki'>",
+           f"<h1>{esc(topic)}"
+           + (" <span class='wfz'>동결</span>" if page.frozen else "")
+           + f" <span class='wage'>{_wiki_age(row)}</span></h1>",
+           _wiki_stale(row, topic),
+           "<div class='whead'>" + "<br>".join(head) + "</div>" if head else ""]
+    for name, lines in page.secs.items():
+        n = sum(1 for l in lines if l.startswith("- "))
+        if name == "경위":
+            html, n = _wiki_log(page, mails, (qs.get("view") or [""])[0],
+                                (qs.get("show") or [""])[0],
+                                (qs.get("quote") or [""])[0] == "1")
+            out.append(f"<h2>경위 <span class='wn'>{n}</span></h2>"
+                       + (html or "<p class='dim'>아직 경위 줄이 없습니다.</p>"))
+        elif name in ("스레드", "확인할 스레드"):
+            rows = _wiki_table(lines)
+            items = []
+            for c in rows:
+                c = c + [""] * 5
+                link = (f"<a href='/thread/{int(c[0])}'>{esc(c[1] or c[0])}</a>"
+                        if c[0].isdigit() else esc(c[1] or c[0]))
+                if name == "스레드":
+                    items.append(
+                        f"<div class='item'>{link} <span class='day'>{esc(c[2])}통 · "
+                        f"{esc(c[3][5:])}</span><span class='snip'>{esc(c[4])}</span></div>")
+                else:
+                    btn = "".join(
+                        "<button type='button' class='copybtn' data-copy='"
+                        f"{esc(' '.join(['/mail-wiki', verb, topic, c[0]]))}'>{label}</button>"
+                        for verb, label in (("add", "넣기 명령 복사"), ("drop", "빼기 명령 복사")))
+                    items.append(f"<div class='item'>{link}<span class='snip'>{esc(c[2])}"
+                                 f"</span><span class='wcand'>{btn}</span></div>")
+            if name == "스레드":
+                out.append(f"<h2>스레드 <span class='wn'>{len(rows)}</span></h2>"
+                           + "".join(items))
+            else:
+                # 접어 둔다 — 실사용 페이지는 후보가 주제마다 수백 건이다(2026-11-14 자가 평가)
+                out.append(
+                    "<details class='wfold'><summary>확인할 스레드 "
+                    f"<span class='wn'>{len(rows)}</span> <span class='dim'>— 이 주제의 "
+                    "것인지 아직 정하지 않은 후보</span></summary>"
+                    "<p class='dim'>제목을 눌러 읽어 보고, 맞으면 [넣기] 아니면 [빼기] "
+                    "명령을 복사해 세션에 붙여 넣습니다.</p>"
+                    + "".join(items) + "</details>")
+        elif name in ("기술", "사람"):
+            out.append(f"<details class='wfold'><summary>{esc(name)} "
+                       f"<span class='wn'>{n}</span></summary>"
+                       + _wiki_bullets(lines, mails, day) + "</details>")
+        else:
+            cnt = f" <span class='wn'>{n}</span>" if name == "열린 것" else ""
+            out.append(f"<h2>{esc(name)}{cnt}</h2>" + _wiki_bullets(lines, mails, day))
+    out.append("<div class='actions'><form method='post' action='/wiki/open'>"
+               f"<input type='hidden' name='page' value='{esc(path.name)}'>"
+               f"<input type='hidden' name='back' value='{esc(here)}'>"
+               "<button>외부 편집기로 열기</button></form></div>"
+               f"<p class='dim'>{esc(str(path))}</p></div>")
+    return "\n".join(x for x in out if x)
+
+
+def render_wiki_page(store, cfg, qs, today: str) -> str:
+    """기억 › 위키 — 주제 목록, `page=` 가 있으면 그 주제 페이지.
+
+    목록은 '무엇을 갱신해야 하나'가 먼저 보이게 세운다: 쌓인 것이 있는 주제 → 최신 →
+    동결. 주제마다 기준 시각 · index.md 의 한 줄 요약 · 쌓인 수 · 열린 것(지남)."""
+    from . import wiki
+    rows = _wiki_status(store, cfg, today)
+    by_file = {r["file"]: r for r in rows}
+    name = (qs.get("page") or [""])[0]
+    if name:
+        path = _wiki_page_ok(cfg, name)
+        if path is None or name not in by_file:
+            return ("<p class='dim'><a href='/records?tab=wiki'>← 위키 목록</a></p>"
+                    "<p class='empty'>그 주제 페이지가 없습니다 — 이름이 바뀌었거나 "
+                    "지워졌으면 목록에서 다시 여세요.</p>")
+        return _render_wiki_topic(store, cfg, path, by_file[name], qs, today)
+    if not rows:
+        return ("<p class='empty'>아직 주제 페이지가 없습니다 — Claude Code 세션에서 "
+                "<code>/mail-wiki new &lt;주제&gt;</code> 로 만듭니다.</p>")
+    one = {}                             # index.md 의 한 줄 요약
+    idx = wiki.wiki_dir(cfg) / "index.md"
+    if idx.exists():
+        for line in idx.read_text(encoding="utf-8").splitlines():
+            m = re.match(r"- \[\[(.+?)\]\] — (.*?)(?: · 기준 .*)?$", line)
+            if m:
+                one[m.group(1) + ".md"] = m.group(2)
+
+    def need(r):
+        return bool(not r["frozen"] and not r.get("problem") and (
+            r["new_messages"] or r["new_confirmed_threads"]
+            or r["new_candidates"] or r["deadlines_passed_unmarked"]))
+
+    rows.sort(key=lambda r: (bool(r["frozen"]), not need(r), r["topic"]))
+    todo = sum(1 for r in rows if need(r))
+    out = [f"<p class='wsum'>주제 {len(rows)}"
+           + (f" · <b>갱신할 것 {todo}</b>" if todo else "")
+           + " <span class='dim'>— 만들기·갱신은 세션에서 <code>/mail-wiki</code></span></p>"]
+    day = date.fromisoformat(today)
+    for r in rows:
+        page = wiki.parse_page(wiki.wiki_dir(cfg) / r["file"])
+        opens = page.bullets("열린 것")
+        over = sum(1 for l in opens if wiki.overdue(l, day))
+        meta = []
+        if r.get("problem"):
+            meta.append("<span class='wdot bad'>읽을 수 없는 페이지</span>")
+        elif r["frozen"]:
+            meta.append(f"동결 뒤 관련 메일 {r['new_messages']}")
+        else:
+            bits = [f"{label} {r[k]}" for k, label in (
+                ("new_messages", "새 메일"), ("new_confirmed_threads", "새 스레드"),
+                ("new_candidates", "새 후보")) if r[k]]
+            meta.append("<span class='wdot'>● " + " · ".join(bits) + "</span>" if bits
+                        else "<span class='wdot ok'>최신</span>")
+            if r["candidates_waiting"]:
+                meta.append(f"후보 {r['candidates_waiting']} 대기")
+        if opens:
+            meta.append(f"열린 것 {len(opens)}"
+                        + (f" (<span class='wover'>지남 {over}</span>)" if over else ""))
+        out.append(
+            f"<div class='item witem{' dim' if r['frozen'] else ''}'>"
+            f"<a class='wtitle' href='/records?tab=wiki&page={_q(r['file'])}'>"
+            f"{esc(r['topic'])}</a>"
+            + (f" <span class='wfz'>동결 {esc(r['frozen'][5:])}</span>" if r["frozen"] else "")
+            + f" <span class='day'>{_wiki_age(r)}</span>"
+            + (f"<span class='snip'>{esc(one[r['file']])}</span>" if one.get(r["file"]) else "")
+            + f"<span class='wmeta'>{' · '.join(meta)}</span></div>")
+    log = wiki.wiki_dir(cfg) / "log.md"
+    if log.exists():
+        last = [l[2:] for l in log.read_text(encoding="utf-8").splitlines()
+                if l.startswith("- ")][-5:]
+        if last:
+            out.append("<details class='wfold'><summary>최근 작업 "
+                       f"<span class='wn'>{len(last)}</span></summary><ul class='wl'>"
+                       + "".join(f"<li class='wnote'>{esc(l)}</li>" for l in reversed(last))
+                       + "</ul></details>")
+    return "\n".join(out)
+
+
 def render_records(store, cfg, qs, today: str) -> str:
-    """기억 페이지 — 탭: 일간 회고 | 주간 보고 | 메모 | 지식. (장기기억 탭은
+    """기억 페이지 — 탭: 일간 회고 | 주간 보고 | 메모 | 지식 | 위키. (장기기억 탭은
     2026-08-14 폐지 — 활용도가 낮아 사용자가 제거를 확정했고, 영구 기억은
     vault/knowledge 의 암묵지 md 가 맡는다. 구 북마크 ?tab=decisions 는 일간으로 강등.)
 
     **기억 = vault 에 쌓인 것**이다. 메모를 상단 메뉴가 아니라 여기 둔 이유
-    (2026-11-18 사용자 확정): 메모(바로 적은 것) · 지식(승인한 것) · 앞으로 올 위키
-    (주제로 엮은 것)는 가공된 정도만 다른 같은 계열이라 나란히 둔다 — 탭 순서도 그
-    순서다. 할 일 전체 목록까지 한 번 더 누르게 된 대신, 기억을 누르면 먼저 열리는
+    (2026-11-18 사용자 확정): 메모(바로 적은 것) · 지식(승인한 것) · 위키(주제로 엮은
+    것 — 2026-11-21 에 탭이 왔다)는 가공된 정도만 다른 같은 계열이라 나란히 둔다 — 탭
+    순서도 그 순서다. 할 일 전체 목록까지 한 번 더 누르게 된 대신, 기억을 누르면 먼저 열리는
     오늘 회고의 맨 위에 '내 할 일'이 있고 `m` 은 어느 화면에서든 듣는다."""
     tab = (qs.get("tab") or ["daily"])[0]
-    if tab not in ("daily", "weekly", "memo", "knowledge"):
+    if tab not in ("daily", "weekly", "memo", "knowledge", "wiki"):
         tab = "daily"
     tabs = []
     for key, label in (("daily", "일간 회고"), ("weekly", "주간 보고"),
-                       ("memo", "메모"), ("knowledge", "지식")):
+                       ("memo", "메모"), ("knowledge", "지식"), ("wiki", "위키")):
         if key == tab:
             tabs.append(f"<b>{esc(label)}</b>")
         else:
@@ -9100,6 +9673,8 @@ def render_records(store, cfg, qs, today: str) -> str:
            + " · ".join(tabs) + "</span></div>")
     if tab == "knowledge":
         return bar + render_knowledge_page(store, cfg, qs)
+    if tab == "wiki":
+        return bar + render_wiki_page(store, cfg, qs, today)
     if tab == "memo":
         return bar + render_memo_list(store, cfg, qs, today)
     if tab == "weekly":
@@ -9762,6 +10337,19 @@ def perform_action(store, cfg, path: str, form: dict) -> str:
         if target is None:
             return back + sep + "msg=" + _q("지식 파일이 아닙니다")
         if _open_external(target):                    # 노트와 같은 함수(콘솔 분리)
+            return back + sep + "msg=" + _q(f"외부 편집기로 열기: {target.name}")
+        return back + sep + "msg=" + _q(
+            f"편집기 자동 열기 실패, 직접 여세요: {target}")
+
+    if len(parts) == 2 and parts[0] == "wiki" and parts[1] == "open":
+        # 주제 페이지를 OS 기본 편집기로 — 지식과 같다. 웹은 페이지를 쓰지 않는다.
+        # 경로가 아니라 **파일 이름**을 받아 페이지 목록과 맞춰 본다(폼 변조 방어).
+        back = (form.get("back") or ["/records?tab=wiki"])[0]
+        sep = "&" if "?" in back else "?"
+        target = _wiki_page_ok(cfg, (form.get("page") or [""])[0])
+        if target is None:
+            return back + sep + "msg=" + _q("주제 페이지가 아닙니다")
+        if _open_external(target):
             return back + sep + "msg=" + _q(f"외부 편집기로 열기: {target.name}")
         return back + sep + "msg=" + _q(
             f"편집기 자동 열기 실패, 직접 여세요: {target}")
