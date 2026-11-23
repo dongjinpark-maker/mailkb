@@ -2943,8 +2943,8 @@ DB 유무는 스스로 답이 돼 있고, 그 줄들이 화면을 채우면 정�
   CLI 는 모델마다 권한이 다를 수 있어(현안 브리핑의 기본이 opus 다) 불러 봐야
   안다. 실패 줄은 **무엇이 안 되는지를 역할 이름으로** 말하고(`opus (현안 브리핑)`),
   원문 오류를 그대로 싣고, 위 표에서 바꾸라는 처방을 붙인다.
-- **래퍼 명령은 있음/없음을 단정하지 않는다**(2026-08-30). Windows 에서 opencode 는
-  WSL 안에만 있어 설정이 `wsl.exe -e bash -lc 'exec opencode … "$@"' oc` 형태가 된다
+- **래퍼 명령은 있음/없음을 단정하지 않는다**(2026-08-30). Windows 에서 opencode 가
+  WSL 안에만 있으면(옛 방식 — 2026-11-23 부터 기본은 Windows 직접 설치) 설정이 `wsl.exe -e bash -lc 'exec opencode … "$@"' oc` 형태가 된다
   (§ [OPENCODE-WINDOWS](OPENCODE-WINDOWS.md)). 그러면 `cmd[0]` 이 `wsl.exe` 라
   종전 판정은 **WSL 이 깔렸다는 사실을 opencode 가 있다는 뜻으로 말했다** —
   opencode 를 지워도 `● 있음` 이었다. `review.backend_program` 이 명령 전체에서

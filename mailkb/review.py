@@ -8,11 +8,13 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import re
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 import threading
 import time
 from datetime import date, timedelta
@@ -877,6 +879,159 @@ def _ai_resolve(cmd: list[str]) -> list[str]:
     return [exe] + cmd[1:]
 
 
+# ── opencode 를 부를 때 코드가 붙이는 것 (2026-11-23, Windows 네이티브로 옮기며) ──
+# 종전(WSL 다리)에는 사람이 네 가지를 손으로 맞췄다 — 지시문이 안 걸리는 폴더
+# (`--dir /var/tmp/minerva-oc`), 그 안에 복사한 에이전트 파일, `--agent minerva`, 로그인
+# 셸. 하나라도 어긋나면 **조용히** 기본 에이전트(도구가 열린 채)로 돌았다. 이제 앞의
+# 셋은 코드가 호출마다 붙인다 — 사람이 맞출 것은 `cmd` 한 줄로 줄었다(로그인 셸은 옛
+# WSL 방식에만 남는다).
+#
+# 실측(2026-11-23, Windows 11 · opencode 1.19.6 과 2.3.2 · 가짜 홈에 표식 지시문):
+#   · `~/.claude/CLAUDE.md` 는 **실린다** — 전역 `~/.config/opencode/AGENTS.md` 가 없으면
+#     opencode 가 Claude Code 의 것을 대신 읽는다. WSL 홈엔 대개 없었지만 Windows 홈엔
+#     Claude Code 를 같이 쓰면 있다 → OPENCODE_DISABLE_CLAUDE_CODE=1 로 꺼짐 확인(두 판)
+#   · 작업 폴더의 **부모**에 둔 `AGENTS.md` 도 실린다(1.19.6 — `C:\Users\Public\AGENTS.md`
+#     가 `C:\Users\Public\minerva-oc` 에서 실림). 홈 밖이어도 드라이브 루트까지 올라갔다
+#     → OPENCODE_DISABLE_PROJECT_CONFIG=1 로 꺼짐 확인. 이 변수는 폴더의 `.opencode/`
+#     (에이전트 파일)까지 끈다 — 그래서 에이전트를 파일이 아니라 아래 환경변수로 준다.
+#   · OPENCODE_CONFIG_CONTENT 의 `agent` 키로 준 에이전트는 두 판 다 먹는다(표식 지시를
+#     넣어 답에 붙는 것으로 확인. 2.3.2 의 문서는 `agents` 라 적지만 그 키는 먹지 않았다).
+#     WSL 의 1.18.30 도 찾는다.
+# 끄지 못하는 것 하나: 전역 `~/.config/opencode/AGENTS.md`. `diagnose` 가 있으면 알린다.
+#
+# WSLENV 에 이름을 더하는 것은 옛 방식(wsl.exe 다리)에도 같은 값이 건너가게 하려는
+# 것이다 — WSL 은 WSLENV 에 적힌 변수만 넘긴다. 그래서 옛 방식도 폴더의 에이전트
+# 파일 없이 돈다.
+MINERVA_AGENT = "minerva"
+# 에이전트 정의 — `prompt` 는 **콜마다 모델로 가는 글**이라 짧게 둔다(종전 파일의 본문과
+# 같은 문장). 도구는 이름을 하나씩 적지 않고 `"*"` 로 전부 끈다 — 열거는 반드시 낡는다
+# (종전 목록엔 websearch 가 빠져 켜져 있었고, 적어 둔 6개는 없는 이름이었다).
+MINERVA_AGENT_DEF = {
+    "description": "Minerva 메일 분석 전용 — 도구 없이 주어진 텍스트만 읽는다",
+    "mode": "primary",
+    "prompt": "주어진 텍스트만 읽고 답한다. 도구를 쓰지 않는다. 파일·셸·네트워크에 접근하지 않는다.",
+    "tools": {"*": False},
+}
+OPENCODE_ENV = {
+    "OPENCODE_DISABLE_CLAUDE_CODE": "1",
+    "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+}
+
+
+def _opencode_config_content(existing: str | None) -> str:
+    """OPENCODE_CONFIG_CONTENT 값 — 사용자가 이미 준 것이 있으면 거기에 에이전트만 더한다.
+    ensure_ascii: 한글을 \\u 로 적어 둔다(환경 블록·WSL 다리의 인코딩을 타지 않게)."""
+    try:
+        conf = json.loads(existing) if existing else {}
+    except ValueError:
+        conf = {}
+    if not isinstance(conf, dict):
+        conf = {}
+    agents = conf.get("agent") if isinstance(conf.get("agent"), dict) else {}
+    conf["agent"] = {**agents, MINERVA_AGENT: MINERVA_AGENT_DEF}
+    return json.dumps(conf, ensure_ascii=True)
+
+
+def _child_env(cmd: list[str]) -> dict | None:
+    """AI 프로세스의 환경 — opencode 일 때만 위의 것을 더한다. 그 밖엔 None(상속 그대로)."""
+    if not _is_opencode_cmd(cmd):
+        return None
+    env = dict(os.environ)
+    env.update(OPENCODE_ENV)
+    env["OPENCODE_CONFIG_CONTENT"] = _opencode_config_content(env.get("OPENCODE_CONFIG_CONTENT"))
+    names = [n for n in (env.get("WSLENV") or "").split(":") if n]
+    for k in (*OPENCODE_ENV, "OPENCODE_CONFIG_CONTENT"):
+        if k not in names:
+            names.append(k)
+    env["WSLENV"] = ":".join(names)
+    return env
+
+
+def _child_cwd(cmd: list[str]) -> str | None:
+    """opencode 의 작업 폴더 — 빈 전용 폴더(`<임시>/minerva-oc`). 그 밖엔 None(상속).
+
+    지시문은 위 환경변수가 막으니 자리 때문이 아니다. opencode 는 작업 폴더를 '프로젝트'로
+    잡고 되돌리기용 스냅숏을 뜬다 — 웹 서버를 띄운 저장소 폴더(메일 DB 가 그 아래 있을
+    수 있다)를 프로젝트로 잡게 두지 않는다. 종전 `--dir` 이 하던 일이고, 2.x 에는 `--dir`
+    이 없다(2.3.2 `run --help`). 만들지 못하면 None — 상속으로 돌고 실패시키지 않는다."""
+    if not _is_opencode_cmd(cmd):
+        return None
+    d = Path(tempfile.gettempdir()) / "minerva-oc"
+    try:
+        d.mkdir(exist_ok=True)
+    except OSError:
+        return None
+    return str(d)
+
+
+def opencode_version(cmd: list[str], run=subprocess.run) -> tuple[int, ...] | None:
+    """`<opencode> --version` 의 판 번호 — 래퍼(wsl.exe 등) 뒤에 있으면 None.
+    AI 호출이 아니다(로컬 프로세스 하나, 네트워크 0) — `diagnose` 가 쓴다. doctor 는
+    프로세스를 띄우지 않는 계약이라 쓰지 않는다."""
+    if not cmd or not _OPENCODE_RX.search(" " + Path(str(cmd[0])).name + " "):
+        return None
+    try:
+        r = run(_ai_resolve([cmd[0], "--version"]), capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", (r.stdout or "") + " " + (r.stderr or ""))
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+# 판마다 `opencode run` 이 아는 옵션이 다르고, **모르는 옵션이면 도움말을 찍고 실패한다**
+# (2026-11-23 실측, 두 판 다). 1.x: --pure·--dir·--variant 있음, --standalone 없음.
+# 2.x: --standalone 있음, 나머지 셋 없음(추론 강도는 --model 'p/m#variant' 로 옮겨 갔다).
+# 2.x 는 기본이 '배경 서비스'에 붙는 것이라 **우리 환경변수가 안 먹는다**(서비스는 자기
+# 환경으로 떴다 — 문서 'Rules') → --standalone 이 있어야 에이전트를 찾는다.
+_OC_FLAGS = {1: {"has": ("--pure", "--dir", "--variant"), "need": ()},
+             2: {"has": ("--standalone",), "need": ("--standalone",)}}
+
+
+def opencode_notes(cmd: list[str], effort_flag: str | None, version, home: Path | None = None) -> list[str]:
+    """이 판·이 설정으로 돌 때 문제가 될 것 — 한 줄씩. 없으면 빈 목록."""
+    notes = []
+    if version:
+        major = 1 if version[0] < 2 else 2
+        other = _OC_FLAGS[2 if major == 1 else 1]["has"]
+        bad = [f for f in other if f in cmd and f not in _OC_FLAGS[major]["has"]]
+        if effort_flag and effort_flag in other and effort_flag not in _OC_FLAGS[major]["has"]:
+            bad.append(f"effort_flag {effort_flag}")
+        ver = ".".join(map(str, version))
+        if bad:
+            notes.append(f"opencode {ver} 에는 없는 옵션: {', '.join(bad)} — 모든 호출이 실패합니다")
+        miss = [f for f in _OC_FLAGS[major]["need"] if f not in cmd]
+        if miss:
+            notes.append(f"opencode {ver} 는 {', '.join(miss)} 가 있어야 Minerva 에이전트를 찾습니다")
+    home = home or Path.home()
+    glob = home / ".config" / "opencode" / "AGENTS.md"
+    if glob.is_file():
+        notes.append(f"전역 지시문 {glob} 이 모든 메일 분석 콜에 실립니다 (끄는 스위치가 없습니다)")
+    return notes
+
+
+def _kill_tree(proc, windows: bool | None = None) -> None:
+    """AI 프로세스를 **아래 프로세스까지** 끈다 — 중지·시간 초과에서 쓴다.
+
+    Windows 의 npm 설치 CLI(claude·opencode)는 `.cmd` 셔틀이라 cmd.exe → node → 실제
+    CLI 순으로 뜬다. `proc.kill()` 은 맨 위 cmd.exe 만 끄므로 [중지]를 눌러도 아래의
+    CLI 는 끝날 때까지 돌며 토큰을 쓴다. 그 CLI 가 출력 파이프를 쥐고 있어 읽기도 안
+    끝난다 — 블로킹 경로의 `subprocess.run(timeout=…)` 이 시간 초과 뒤 그 파이프를
+    기다리며 **상한 없이** 멈춘 것이 이것이다(2026-11-23 Windows 실측). taskkill /T 는
+    부모가 살아 있어야 아래를 찾으므로 proc.kill() 보다 먼저 부른다."""
+    if os.name == "nt" if windows is None else windows:
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=15,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except (OSError, subprocess.SubprocessError):
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
 # AI 실패 로그 목적지(<home>/logs) — ai_run 은 cfg 를 모르는 함수라 cli.main 이
 # 시작 시 한 번 주입한다. None 이면 기록하지 않는다(테스트·라이브러리 사용 기본).
 AI_ERROR_LOG_DIR: Path | None = None
@@ -905,25 +1060,34 @@ def _ai_run_once(cmd: list[str], prompt: str, timeout: int,
     on_event 는 **성공 경로의 setup 경고**만 흘린다(`notice`). 이 경로는 원래
     stderr 를 성공 시 버리는데, opencode 의 에이전트 폴백처럼 '돌긴 도는데 설정이
     안 먹은' 상태가 거기에만 남는다. 진행 이벤트는 여기서 안 낸다 — 블로킹이라
-    낼 것이 없다."""
+    낼 것이 없다.
+
+    subprocess.run(timeout=) 을 쓰지 않는다 — Windows 에서 시간 초과가 나면 run 은
+    맨 위 프로세스만 끄고 **파이프가 닫히기를 상한 없이** 기다린다. npm 셔틀 아래의
+    CLI 가 파이프를 쥐고 있으면 그게 끝날 때까지다(_kill_tree)."""
     t0 = time.time()
+    # FileNotFoundError(명령 자체가 없음)는 그대로 전파 — 재시도해도 소용없다
+    popen = subprocess.Popen(
+        _ai_resolve(cmd), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        # Windows 기본 인코딩(cp949)은 메일 본문의 이모지 등에서 죽는다
+        encoding="utf-8", errors="replace", env=_child_env(cmd), cwd=_child_cwd(cmd))
     try:
-        proc = subprocess.run(
-            _ai_resolve(cmd),
-            input=prompt,
-            capture_output=True,
-            # Windows 기본 인코딩(cp949)은 메일 본문의 이모지 등에서 죽는다
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-        )
-    except FileNotFoundError:
-        # 명령 자체가 없음 — 재시도해도 소용없으므로 그대로 전파(루프 밖에서 처리)
-        raise
+        out_s, err_s = popen.communicate(prompt, timeout=timeout)
     except subprocess.TimeoutExpired:
+        _kill_tree(popen)
+        try:
+            popen.communicate(timeout=5)
+        except (subprocess.TimeoutExpired, ValueError, OSError):
+            pass
         _log_ai_error({"reason": "timeout", "cmd": cmd, "timeout_s": timeout,
                        "prompt_bytes": len(prompt.encode("utf-8"))})
         raise AITimeout(f"AI 호출 시간 초과 ({timeout}s): {' '.join(cmd)}")
+    except BaseException:
+        _kill_tree(popen)            # 그 밖의 중단(Ctrl+C 등) — run 이 하던 정리를 그대로
+        raise
+    proc = subprocess.CompletedProcess(popen.args, popen.returncode,
+                                       out_s or "", err_s or "")
     elapsed = round(time.time() - t0, 1)
     if proc.returncode != 0:
         err, out = proc.stderr.strip(), proc.stdout.strip()
@@ -1022,7 +1186,8 @@ def _ai_run_stream(cmd: list[str], prompt: str, timeout: int,
 
     proc = subprocess.Popen(
         _ai_resolve(full), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, encoding="utf-8", errors="replace")
+        stderr=subprocess.PIPE, encoding="utf-8", errors="replace",
+        env=_child_env(full), cwd=_child_cwd(full))
     lines: queue.Queue = queue.Queue()
     stderr_acc: list[str] = []
 
@@ -1120,16 +1285,13 @@ def _ai_run_stream(cmd: list[str], prompt: str, timeout: int,
                         emit({"ev": "delta", "phase": "writing",
                               "bytes": len(tx.encode("utf-8")), "text": tx})
     except (AIError, AICancelled):
-        try:
-            proc.kill()
-        except OSError:
-            pass
+        _kill_tree(proc)             # 셔틀 아래의 CLI 까지 — 안 그러면 계속 돈다
         raise
 
     try:
         rc = proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        _kill_tree(proc)
         rc = proc.wait()
     # **stderr 리더가 끝나기를 기다린다.** 안 기다리면 프로세스가 죽자마자
     # stderr_acc 를 읽어 버려 오류 본문이 간헐적으로 통째로 비고(실측: 전체
@@ -1228,7 +1390,8 @@ def _ai_run_stream_oc(cmd: list[str], prompt: str, timeout: int,
 
     proc = subprocess.Popen(
         _ai_resolve(full), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, encoding="utf-8", errors="replace")
+        stderr=subprocess.PIPE, encoding="utf-8", errors="replace",
+        env=_child_env(full), cwd=_child_cwd(full))
     lines: queue.Queue = queue.Queue()
     stderr_acc: list[str] = []
 
@@ -1316,16 +1479,13 @@ def _ai_run_stream_oc(cmd: list[str], prompt: str, timeout: int,
                 err_result = str((err or {}).get("message")
                                  if isinstance(err, dict) else err or "")[:1000]
     except (AIError, AICancelled):
-        try:
-            proc.kill()
-        except OSError:
-            pass
+        _kill_tree(proc)             # 셔틀 아래의 CLI 까지 — 안 그러면 계속 돈다
         raise
 
     try:
         rc = proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        _kill_tree(proc)
         rc = proc.wait()
     err_reader.join(timeout=5)       # 오류 본문이 통째로 비는 것 방지(claude 와 같음)
     tail = "\n".join(raw_tail)
@@ -1433,6 +1593,10 @@ def _ai_request(cmd: list[str], prompt: str, system_prompt: str | None,
             and _EFFORT_TOKEN_RX.fullmatch(effort)):
         out += [effort_flag, effort]
     if not _is_claude_cmd(out):
+        # opencode 는 Minerva 에이전트로 — 정의는 호출 환경이 싣는다(_child_env). 설정이
+        # 이미 `--agent` 를 적었으면(옛 WSL 래퍼는 bash 문자열 안에) 그대로 둔다.
+        if _is_opencode_cmd(out) and not any("--agent" in str(t) for t in out):
+            out += ["--agent", MINERVA_AGENT]
         if system_prompt:
             prompt = f"[SYSTEM]\n{system_prompt.strip()}\n[/SYSTEM]\n\n{prompt}"
         return out, prompt

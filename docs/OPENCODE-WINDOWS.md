@@ -1,217 +1,151 @@
-# Windows 에서 WSL 의 opencode 쓰기
+# Windows 에서 opencode 쓰기
 
-opencode 가 **WSL 안에만 설치돼 있는** Windows PC 에서 opencode 를 쓰는 두 방식과, 그걸
-가능하게 하려고 코드에 넣은 것(부록). 회사 PC의 실제 모양이고, Windows 네이티브 설치라면
-A1의 `cmd`만 `["opencode", "run", "--pure"]`로 줄이면 나머지는 같다.
+**Minerva 의 AI 는 기본이 claude 다**(`[ai]` 의 sonnet·opus). opencode 는 사용자가 어떤 역할을
+`internal` 로 돌렸을 때만 쓰는 **부가 백엔드**이고, 이 문서는 그 경우의 이야기다 — 이 문서의
+어떤 설정도 claude 로 도는 역할을 바꾸지 않는다.
 
-```mermaid
-flowchart LR
-  subgraph W[Windows]
-    MK[mailkb<br/>Windows 파이썬]
-    DB[(db.sqlite)]
-    PS[powershell.exe]
-  end
-  subgraph L[WSL]
-    OCA[opencode run<br/>에이전트 minerva]
-    OCB[opencode TUI<br/>에이전트 mailkb]
-  end
-  MK -- "A. wsl.exe 로 AI 호출" --> OCA
-  OCB -- "B. mailkb 실행" --> PS --> MK
-  MK --- DB
-```
+opencode 를 **Windows 에 직접 깔아** 쓰는 두 방식이다. A 는 mailkb 가 opencode 를 AI 백엔드로
+부르는 것이고, B 는 사람이 opencode 를 띄워 저장소를 쓰는 것이다. 2026-11-23 부터 opencode 를
+쓸 때는 이쪽이 기본이다. 그 전까지 쓰던 WSL 안의 opencode 는
+[부록 C — 옛 방식](#부록-c--옛-방식-wsl-안의-opencode)으로 내렸다. 옛 설정도 그대로 돈다.
 
 | | A. AI 백엔드 | B. opencode TUI |
 |---|---|---|
 | 흐름 | mailkb → opencode | 사람 → opencode → mailkb |
-| 쓰는 곳 | 웹의 분석·회고 | 터미널에서 조사·코딩 |
-| 설정 | `config.toml` 의 `internal` + `/var/tmp/minerva-oc` | 저장소 `.opencode/` (따로 할 것 없음) |
-| 에이전트 | `minerva` — 도구 없음 | `mailkb` — 도구 있음 |
+| 쓰는 곳 | 웹의 분석·회고·브리핑 | 터미널에서 조사·코딩 |
+| 설정 | `config.toml` 의 `internal` 한 줄 | 저장소 `.opencode/` (따로 할 것 없음) |
+| 에이전트 | `minerva` — 도구 없음, **코드가 호출마다 정의를 싣는다** | `mailkb` — 도구 있음 |
 
-두 방식 모두 DB 는 **Windows 파이썬만** 연다 — 경계를 넘어 열면 잠금이 깨진다(B2).
-
-측정값은 전부 2026-08-30 Windows 11 + WSL2(Ubuntu) + opencode 1.18.25 실기기다.
+측정값은 2026-11-23 Windows 11 · opencode 1.19.6 과 2.3.2(npm 설치) 실기기다.
 
 ---
 
 ## A. mailkb 가 opencode 를 부른다 — AI 백엔드(`internal`)
 
-### A1. 설정 — 이것만 하면 돈다
+### A1. 설정 — 판을 먼저 본다
 
-#### `<home>/config.toml`
+```
+opencode --version
+```
+
+**1.x 와 2.x 는 `opencode run` 이 아는 옵션이 다르다.** 모르는 옵션이 하나라도 있으면 도움말만
+찍고 실패하므로, 판에 맞는 한 줄을 고른다.
+
+`<home>/config.toml` (보통 `data\config.toml`):
 
 ```toml
+# opencode 1.x  (1.19.6 에서 확인)
 [ai.backends.internal]
-cmd = ["wsl.exe", "-e", "bash", "-lc",
-       'exec opencode run --pure --dir /var/tmp/minerva-oc --agent minerva "$@"', "oc"]
-effort_flag = "--variant"      # opencode의 추론 강도: high / max / minimal
+cmd = ["opencode", "run", "--pure"]
+effort_flag = "--variant"      # 추론 강도 high / max / minimal
 ```
 
-네 조각이 각각 하나씩 막는다.
+```toml
+# opencode 2.x  (2.3.2 에서 확인)
+[ai.backends.internal]
+cmd = ["opencode", "run", "--standalone"]
+# effort_flag 는 적지 않는다 — 2.x 에는 --variant 가 없다(추론 강도는 --model 'p/m#variant')
+```
 
-| 조각 | 없으면 |
+| 조각 | 1.x | 2.x | 없으면 |
+|---|---|---|---|
+| `--pure` | 있음 | **없음** | 외부 플러그인이 콜마다 뜬다 (2.x 에 넣으면 모든 호출 실패) |
+| `--standalone` | **없음** | 있음 | 2.x 는 배경 서비스에 붙는데, 서비스는 자기 환경으로 떠 있어 아래 A2 의 정의가 **전달되지 않는다** → `Agent not found: "minerva"` |
+| `--variant`(effort_flag) | 있음 | **없음** | 어려운 콜에 추론 강도가 안 붙을 뿐이다 |
+
+**`opencode` 가 PATH 에 없으면** 그 자리에 전체 경로를 쓴다(`where opencode` 가 알려 준다 —
+`…\npm\opencode.cmd` 처럼 `.cmd` 로 끝나도 된다).
+
+`--format json` 은 적지 않는다. 코드(`_ai_run_stream_oc`)가 진행 표시가 필요한 호출에만
+붙인다 — 직접 넣으면 진행 이벤트가 없는 경로에서 JSON 줄이 그대로 답이 되어 하류가 깨진다.
+
+### A2. 코드가 호출마다 붙이는 것 — 사람이 맞출 것이 아니다
+
+종전(WSL)에는 사람이 지시문이 안 걸리는 폴더(`--dir`), 그 안에 복사한 에이전트 파일,
+`--agent minerva` 를 손으로 맞췄다. 하나라도 어긋나면 **조용히** 도구가 열린 기본 에이전트로
+돌았다(입력 토큰 7배, 메일 본문이 든 프롬프트에 도구가 열림). 이제 코드가 붙인다
+(`review._child_env` · `_child_cwd` · `_ai_request`).
+
+| 붙이는 것 | 막는 것 |
 |---|---|
-| `bash -lc` | `wsl -e opencode` 는 `execvpe(opencode) failed` — 로그인 셸이 없으면 `~/.opencode/bin`이 PATH에 없다 |
-| `"$@"` 와 끝의 `"oc"` | 코드가 argv 뒤에 붙이는 플래그(`--format json`·`effort_flag`)가 `$0`·`$1`이 되어 **조용히 사라진다** |
-| `--dir` | opencode가 `AGENTS.md`/`CLAUDE.md`를 읽는다 — **cwd 뿐 아니라 위로 올라가며** 찾는다(A4). 저장소에서 띄우면 **코딩 규칙이 메일 분석 프롬프트에 실린다** |
-| `--agent minerva` | 기본 `build` 에이전트가 콜마다 툴 스키마로 **~7,000 토큰**을 태우고, 메일 본문이 들어가는 프롬프트에 툴이 열려 있다 |
+| `--agent minerva` (설정이 `--agent` 를 적었으면 그대로 둔다) | 기본 에이전트의 도구·긴 시스템 프롬프트 |
+| 환경변수 `OPENCODE_CONFIG_CONTENT` 에 minerva 정의(도구 `"*": false`, 프롬프트 한 줄) | 에이전트 파일 복사 · 저장소가 바뀌어도 복사본이 낡는 것 |
+| `OPENCODE_DISABLE_CLAUDE_CODE=1` | 내 **Claude Code 지시문**(`~/.claude/CLAUDE.md`)이 메일 분석 콜에 실리는 것 |
+| `OPENCODE_DISABLE_PROJECT_CONFIG=1` | 작업 폴더와 **그 부모들**의 `AGENTS.md`·`.opencode/` 가 실리는 것 |
+| 작업 폴더 `%TEMP%\minerva-oc` (비어 있는 전용 폴더) | opencode 가 웹 서버를 띄운 저장소 폴더를 '프로젝트'로 잡아 되돌리기용 스냅숏을 뜨는 것 |
 
-`--format json`은 config에 쓰지 않는다. 코드(`_ai_run_stream_oc`)가 필요할 때만
-붙인다 — 직접 넣으면 진행 이벤트가 없는 블로킹 경로에서 NDJSON이 답으로 나가
-하류 파서가 전부 깨진다.
+**왜 환경변수인가 — 실측**(가짜 홈에 "답 끝에 표식을 붙여라"라는 지시문을 심고 답을 봤다):
 
-#### `/var/tmp/minerva-oc/.opencode/agent/minerva.md` (WSL 안)
+| 심은 자리 | 아무것도 안 하면 | 위 변수를 주면 |
+|---|---|---|
+| `~/.claude/CLAUDE.md` (1.19.6 · 2.3.2) | **답에 표식이 붙었다** | 안 붙었다 |
+| 작업 폴더의 부모 `C:\Users\Public\AGENTS.md` (1.19.6) | **붙었다** — 홈 밖이어도 드라이브 루트까지 올라갔다 | 안 붙었다 |
+| 같은 자리 (2.3.2) | 안 붙었다 | 안 붙었다 |
 
-**손으로 쓰지 않는다** — 저장소가 나르는 것을 이름만 바꿔 복사한다. 내용이 저장소와
-어긋나면 도구 목록이 조용히 낡는다. 저장소 파일이 바뀌어도 **복사본은 따라오지
-않는다** — 그때마다 아래 `cp` 를 다시 돌린다.
+WSL 에서 부를 때는 WSL 홈이라 `~/.claude/CLAUDE.md` 가 대개 없었다. **Windows 에서 직접 부르면
+Windows 홈이다** — Claude Code 를 같이 쓰는 PC 면 그 파일이 있다. 끄는 스위치가 환경변수뿐이라
+(설정 파일 키가 없다) 코드가 붙인다. `PROJECT_CONFIG` 는 폴더의 에이전트 파일까지 끄므로
+에이전트도 파일이 아니라 환경변수로 준다 — 두 판 다 `agent` 키로 먹었다(2.3.2 문서는
+`agents` 라 적지만 그 키는 먹지 않았다).
 
-```bash
-mkdir -p /var/tmp/minerva-oc/.opencode/agent
-cp /mnt/c/<저장소>/tools/opencode/minerva-agent.md \
-   /var/tmp/minerva-oc/.opencode/agent/minerva.md
+**끄지 못하는 것 하나** — 전역 `%USERPROFILE%\.config\opencode\AGENTS.md`. 스위치가 없다.
+`mailkb diagnose --backend internal` 이 있으면 `▲` 로 알린다.
+
+### A3. 확인
+
+```
+python -m mailkb diagnose --backend internal
 ```
 
-내용은 이렇다.
-
-```markdown
----
-description: Minerva 메일 분석 전용 — 도구 없이 주어진 텍스트만 읽는다
-mode: primary
-tools:
-  "*": false          # 이름을 하나씩 적지 않는다 — 목록은 낡는다
----
-주어진 텍스트만 읽고 답한다. 도구를 쓰지 않는다. 파일·셸·네트워크에 접근하지 않는다.
+```
+[AI 백엔드]
+  internal — opencode run --pure
+    opencode 1.19.6 · 에이전트 minerva(코드가 정의를 싣는다)
+    ● 응답: 'OK'
 ```
 
-안내·주의 문구는 **frontmatter 의 `#` 주석**에 둔다. `---` 아래 본문은 에이전트
-프롬프트라 **콜마다 모델로 간다** — 2026-09-05 까지 배포 안내가 본문의 `<!-- -->`
-안에 있어 프롬프트가 460자였다(지금은 49자).
+- 둘째 줄에 `▲` 가 있으면 판과 설정이 안 맞는 것이다 — 그 줄이 무엇을 고칠지 말한다.
+- `● 응답` 이면 끝이다. 웹은 설정 › **이 PC에서 쓸 수 있는 AI** 의 `[응답 시험]` 이 같은 호출이다.
+- 상한은 `review.AITEST_TIMEOUT_OPENCODE`(150초)다. opencode 는 콜드 스타트가 길다.
 
-**도구를 하나씩 적지 않는다.** 2026-09-05 까지는 17개를 열거했는데, 그 목록에
-`websearch` 가 없어 계속 켜져 있었고(이름이 `webfetch` 가 아니다) 적어 둔 것 중
-6개는 존재하지도 않는 이름이었다. MCP 를 쓰면 그 도구들은 애초에 이름을 모른다.
-`"*": false` 한 줄이 셋을 함께 닫는다 — 열거는 반드시 낡는다.
-
-claude 백엔드의 `--tools ""`에 해당한다(`review._ai_request`). opencode는 그 채널이
-없어 에이전트 파일로 같은 일을 한다. 분석(`ask`)은 한 질문에 최대 12콜이라 이 차이가
-그대로 곱해진다 — 토큰만이 아니라 **콜 시간도 같이 는다**.
-
-한 단어 답 1콜의 입력 토큰(2026-08-30 실측, 같은 질문):
-
-| 설정 | 입력 합 |
-|---|---|
-| 아무것도 안 함(기본 `build`) | 7,765 |
-| 설정 `tools` 키로 도구만 끄기 | 2,909 |
-| **전용 에이전트**(이 절, 열거식으로 잰 값) | **1,059** |
-
-가운데 줄은 **검토했으나 안 쓴 길**이다. opencode 설정 스키마에 최상위 `tools`
-(`{도구이름: false}`)가 있어 `--agent` 없이 JSON 한 장으로 끌 수 있다 — 그런데 절반만
-줄고(2,909), 목록을 더 늘려도 안 줄었다(전부 끄나 절반만 끄나 2,910 대 2,909). 남는
-몫은 도구가 아니라 `build` 에이전트 정의 자체가 싣는 것이라 에이전트를 갈아야 사라진다.
-설정을 **전역**(`~/.config/opencode/opencode.jsonc`)에 두는 길도 있지만, 그러면
-사용자가 opencode 로 코딩할 때도 도구가 꺼진다 — mailkb 만 조용해야 한다.
-
-표는 2026-08-30 회사 PC(wsl.exe 다리) 값이다. 2026-09-05 에 이 WSL 에서 다시 재니
-열거식 1,049 → `"*": false` 154 였다. 모델도 환경도 달라 위 표와 직접 비교할 수는
-없지만, 열거가 남기던 몫이 실재한다는 것은 같다.
-
-**MCP 를 쓴다면 한 줄 더 있다.** 전역 설정에 MCP 서버가 있으면 `opencode run` 이 콜마다
-그 서버를 띄운다 — `--pure` 는 플러그인만 끄지 MCP 는 안 끈다(실측). 도구가 프롬프트에
-실리는 것은 `"*": false` 가 막지만 **프로세스가 뜨는 것은 못 막는다.** 그것까지 끄려면
-에이전트 폴더 옆에 설정을 둔다.
-
-`/var/tmp/minerva-oc/.opencode/opencode.json`
-
-```json
-{ "mcp": { "<서버이름>": { "enabled": false } } }
-```
-
-이름은 `opencode mcp list` 로 확인한다 — 거기 아무것도 안 뜨면 **이 파일도 만들지
-않는다.** 없는 이름을 적는 것은 무해하지만, JSON 이 깨지면 콜이 exit 1 로 죽는다.
-
-### A2. 확인
-
-```bash
-python -m mailkb --home <home> diagnose --backend internal
-```
-
-`● 응답`이면 끝이다. `▲ 무응답`이면 늦는 것이지 고장이 아닐 수 있다 — 상한은
-`review.AITEST_TIMEOUT_OPENCODE`(150초)이고, 그걸 넘으면 WSL에서 `opencode run`을
-직접 돌려 로그인·모델 설정을 본다.
-
-웹은 설정 › **이 PC에서 쓸 수 있는 AI**의 `[응답 시험]`이 같은 일을 한다.
-
-### A3. 안 될 때 — 증상이 셋뿐이다
+### A4. 안 될 때
 
 | 보이는 것 | 뜻 | 할 일 |
 |---|---|---|
-| `Failed to change directory to …` (exit 1) | `--dir` 폴더가 없다 | A1 의 `mkdir -p` |
-| `▲ 설정 안 먹음` · `에이전트 '…' 를 못 찾아 기본값으로 돌았습니다` | 에이전트 파일이 없거나 이름이 다르다 | A1 의 `cp`, 이름은 `minerva.md` |
-| `■ 실패` · `execvpe(opencode) failed` | 로그인 셸을 안 거쳐 PATH 에 없다 | `cmd` 에 `bash -lc` 가 있는지 |
+| `▲ opencode … 에는 없는 옵션: …` · 실패에 opencode 도움말 | 판과 `cmd` 가 안 맞는다 | A1 에서 판에 맞는 줄로 |
+| `Agent not found: "minerva"` | 2.x 가 배경 서비스에 붙었다 | `cmd` 에 `"--standalone"` |
+| `▲ 설정 안 먹음` · `에이전트 'minerva' 를 못 찾아…` | 1.x 가 정의를 못 받았다 | `diagnose` 결과를 그대로 알려 주세요(새 경우다) |
+| `■ 실패` · `AI 사용량 한도` · `Free usage limit reached` | opencode 무료 모델 한도 | 회사 모델(공급자)을 연결했는지 `opencode` 로 확인 |
+| `▲ 무응답` | 150초 안에 답이 없다 | 다시 돌려 본다. 계속이면 `opencode run` 을 직접 돌려 로그인·모델을 본다 |
+| `▲ 전역 지시문 … 이 모든 메일 분석 콜에 실립니다` | 위 A2 의 끄지 못하는 파일 | 그 파일이 opencode 코딩용이면 그대로 두고 감수하거나, 내용을 옮긴다 |
 
-셋 다 **조용하지 않다.** 특히 가운데는 종전에 조용했다 — opencode 가 에이전트를
-못 찾아도 실패하지 않고 기본 `build` 로 떨어져 `● 응답` 으로 보였다(A4).
-`[응답 시험]`과 `diagnose` 가 성공 경로의 stderr 를 보고 `▲ 설정 안 먹음` 으로
-가른다(2026-08-31). 대답이 왔다고 다 된 것이 아니다.
+**무료 모델에서 본 것** — 이 PC 의 무료 모델(`opencode/big-pickle`)은 도구를 끈 에이전트의 요청을
+`Free usage limit reached` 로 거절하고 기본 에이전트는 받다가, 시험을 거듭하자 기본 에이전트도
+거절했다. 정책인지 한도인지 가르지 못했다. 회사 모델을 연결해 쓰면 상관없다.
 
-### A4. 함정 둘 — 둘 다 조용하다
+**MCP 를 쓴다면** — 전역 설정에 MCP 서버가 있으면 `opencode run` 이 콜마다 그 서버를 띄운다.
+도구가 프롬프트에 실리는 것은 `"*": false` 가 막지만 **프로세스가 뜨는 것은 못 막는다**
+(시간만 든다). 종전엔 폴더 설정(`.opencode/opencode.json`)으로 껐는데, 이제 폴더 설정을
+읽지 않으므로 그 길은 없다. 필요해지면 알려 주세요 — 정의에 MCP 끄기를 함께 싣는 길이 있다.
 
-**`--dir` 은 `$HOME` 아래에 두면 안 된다.** opencode 는 지시문 파일을 `--dir` 에서만
-찾지 않고 **위로 올라가며** 찾는다. 세 번 재서 확인했다(2026-08-30, 1.18.25 —
-부모에 canary 지시문을 심고 답 끝에 그 표시가 붙는지 봤다).
+### A5. WSL 에서 옮겨 올 때
 
-| 실험 | 결과 |
-|---|---|
-| 두 칸 위 `CLAUDE.md` | 붙는다 — **깊이로는 못 막는다** |
-| 가까운 `AGENTS.md` · 먼 `CLAUDE.md` | 가까운 것만 — 거리가 아니라 **종류** 우선순위였다 |
-| 가까운 `AGENTS.md` · 먼 `AGENTS.md` | **둘 다 붙는다** — 위아래가 합쳐진다 |
+1. `config.toml` 의 `[ai.backends.internal] cmd` 를 A1 의 한 줄로 바꾼다(옛 `wsl.exe …` 줄은 지운다).
+2. `python -m mailkb diagnose --backend internal` 로 확인한다.
+3. WSL 쪽 `/var/tmp/minerva-oc` 는 이제 안 쓴다 — 지워도 된다(`rm -rf /var/tmp/minerva-oc`).
 
-세 번째가 결론이다. 같은 종류는 합쳐지므로 가까운 자리에 빈 `AGENTS.md` 를 방패로
-두는 것도 소용없다. 위로 올라가도 나올 것이 없는 자리를 써야 하고, `/var/tmp` 가
-그렇다(`/var/tmp` → `/var` → `/`). `$HOME/.minerva-oc` 는 부모가 `$HOME` 이라
-사용자가 홈에 `AGENTS.md`·`CLAUDE.md` 를 두는 순간 **모든 메일 분석 콜에 실린다** —
-개발자 홈에는 흔한 파일이다.
-
-설정으로는 막을 수 없다. 스키마의 `instructions` 키는 *"Additional instruction files"*
-라 **더하기만 하고 끄지 못한다.**
-
-**에이전트 파일이 없으면 실패하지 않는다.** 이름이 틀리거나 자리가 어긋나면 이렇게
-된다(실측).
-
-```
-! agent "minerva" not found. Falling back to default agent   ← stderr, 그리고 계속 간다
-{"type":"step_start", …}
-{"type":"step_finish", … "tokens":{"input":5411, … "cache":{"read":2353}}}
-종료코드 0
-```
-
-**exit 0 에 정상 NDJSON 이라 mailkb 는 아무 이상을 못 본다.** 대가는 입력 1,059 →
-7,764 토큰(약 7배)이고, 그보다 **도구가 열린 채로 메일 본문이 들어간다**. 이 저장소가
-`--tools ""` 와 전용 에이전트로 막아 온 바로 그 축이 조용히 열린다.
-
-`[응답 시험]` 과 `mailkb diagnose --backend internal` 이 이 경고를 `▲ 설정 안 먹음` 으로
-보여 준다(A3).
-
-### A5. 자리를 옮긴 뒤
-
-옛 자리(`~/.minerva-oc`)는 지워도 된다.
-
-```bash
-rm -rf ~/.minerva-oc
-ls -la ~/AGENTS.md ~/CLAUDE.md    # 있었다면 지금까지 메일 프롬프트에 실려 왔다
-```
+되돌리려면 1 의 줄을 옛 줄로 돌려놓는다. 코드는 두 꼴을 다 알아본다(부록 C).
 
 ---
 
 ## B. 사람이 opencode 를 쓰고, opencode 가 mailkb 를 부른다 — TUI
 
-A 와 반대 방향이다 — mailkb 가 opencode 를 부르는 게 아니라, 사람이 WSL 셸에서
-opencode 를 띄워 저장소를 쓴다. 필요한 설정은 저장소 `.opencode/` 에 들어 있다.
-
 ### B1. 실행
 
-```bash
-cd /mnt/c/<저장소>
+저장소 폴더에서(Windows 터미널):
+
+```
+cd <저장소>
 opencode --agent mailkb
 ```
 
@@ -221,16 +155,18 @@ opencode --agent mailkb
 
 | 파일 | 하는 일 |
 |---|---|
-| `.opencode/agent/mailkb.md` | mailkb 는 Windows 파이썬(PowerShell)으로만 실행 · DB 파일 직접 접근 차단 · 임시 파일은 `temp/` |
+| `.opencode/agent/mailkb.md` | mailkb 는 `python -X utf8 -m mailkb …` 로 실행 · DB 파일 직접 접근 차단 · 임시 파일은 `temp/` |
 | `.opencode/command/mail-research.md` | `/mail-research` — Claude Code 스킬과 같은 조사 절차 |
 | `.opencode/command/mail-wiki.md` | `/mail-wiki` — 등록한 주제의 위키 페이지를 만들고 갱신(계약: `agent-guides/minerva-wiki.md`) |
 
+1.19.6 과 2.3.2 둘 다 `mailkb` 에이전트를 읽는 것을 확인했다(`opencode agent list` ·
+`opencode debug agents`). 명령(`/mail-research`)이 2.x 에서 보이는지는 확인하지 못했다.
+
 ### B2. 지킬 것
 
-**저장소는 Windows 디스크(`/mnt/c/…`)에서 연다.** DB 는 Windows 쪽에 있고 웹 서버가
-늘 열어 두므로 mailkb 는 Windows 파이썬으로만 돌아야 한다. WSL 파이썬이 같이 열면
-`disk I/O error`, 저장소를 WSL 디스크(`/home/…`)에 두면 Windows 파이썬이 `database is locked` 다.
-
+- **`-X utf8` 을 뺀 `python -m mailkb` 는 한글이 깨진다.** 파이프로 받은 Windows 파이썬의
+  출력은 cp949 인데 opencode 는 UTF-8 로 읽는다. 에이전트 파일이 모델에게 이 형식을 쓰게 한다.
+- DB 파일(`*.sqlite`)은 직접 열지 않는다 — 웹 서버가 늘 열어 두므로 mailkb 명령으로만 읽는다.
 - 데모로 시험하려면 "`--home demo` 로" 라고 말한다. 말하지 않으면 실제 데이터(`data/`)다.
 - `.opencode/` 파일을 고치면 opencode 를 다시 띄워야 반영된다.
 
@@ -238,75 +174,89 @@ opencode --agent mailkb
 
 | 보이는 것 | 할 일 |
 |---|---|
-| `disk I/O error` · `database is locked` | 저장소가 `/mnt/c/…` 아래인지 본다 |
-| 한글이 `?ㅼ젙` 처럼 깨짐 | PowerShell 결과를 `chcp 65001` + 파일로 받았는지 본다 |
+| 한글이 `?ㅼ젙` 처럼 깨짐 | 명령에 `-X utf8` 이 있는지 본다 |
 | `/mail-research` 가 안 보임 | opencode 를 저장소 안에서 띄웠는지 본다 |
+| `python3` 이 막혔다는 거절 | 정상이다 — `python` 을 쓴다(옛 WSL 울타리) |
 
 ---
 
-## 부록 — 개발자용
+## 부록 C — 옛 방식: WSL 안의 opencode
+
+2026-11-22 까지의 회사 PC 모양이다. **지금도 돈다** — 다만 손으로 맞출 것이 많아 기본에서 내렸다.
+
+```toml
+[ai.backends.internal]
+cmd = ["wsl.exe", "-e", "bash", "-lc",
+       'exec opencode run --pure --dir /var/tmp/minerva-oc --agent minerva "$@"', "oc"]
+effort_flag = "--variant"
+```
+
+| 조각 | 없으면 |
+|---|---|
+| `bash -lc` | `wsl -e opencode` 는 `execvpe(opencode) failed` — 로그인 셸이 없으면 `~/.opencode/bin` 이 PATH 에 없다 |
+| `"$@"` 와 끝의 `"oc"` | 코드가 argv 뒤에 붙이는 플래그(`--format json`·`effort_flag`)가 `$0`·`$1` 이 되어 **조용히 사라진다** |
+| `--dir` | 저장소 폴더가 작업 폴더가 된다(A2 의 스냅숏) |
+
+**에이전트 파일은 이제 복사하지 않아도 된다.** A2 의 환경변수는 `WSLENV` 를 타고 WSL 로 건너간다
+(Windows 파이썬 → `wsl.exe` 에서 값이 그대로 도착하는 것을 확인했다). 그래서 옛 줄 그대로도
+코드가 실은 정의로 돈다 — 폴더(`/var/tmp/minerva-oc/.opencode/agent/minerva.md`)는 읽지 않는다.
+`--dir` 폴더 자체는 있어야 한다(없으면 `Failed to change directory`).
+
+옛 방식의 TUI 는 WSL 셸에서 `/mnt/c/<저장소>` 로 들어가 `opencode --agent mailkb` 였다. 지금
+에이전트 파일은 Windows 를 기준으로 쓰여 있어 WSL 에서 띄우면 `python` 이 없다고 실패한다 —
+그때는 `powershell.exe -NoProfile -Command "chcp 65001 | Out-Null; python -m mailkb … | Out-File
+-Encoding utf8 temp\x.txt"` 로 돌리고 파일을 `utf-8-sig` 로 읽는다. **WSL 의 python3 로 mailkb 를
+돌리지 않는다** — Windows 디스크의 DB 를 Windows 프로세스가 쥐고 있으면 `disk I/O error` 다(실측
+12/12).
+
+---
+
+## 부록 D — 개발자용
 
 ### 코드에 들어간 것
 
 | 곳 | 무엇 | 왜 |
 |---|---|---|
-| `review._is_opencode_cmd` | **명령 전체**를 보는 백엔드 판별자 | `_is_claude_cmd`처럼 `cmd[:2]`만 보면 실행 파일이 `wsl.exe`라 영영 못 찾는다 |
-| `review._ai_run_stream_oc` | `--format json` NDJSON 파서 | 진행 이벤트를 claude와 **같은 중립 어휘**로 흘린다 |
-| `review._usage_of_oc` | `step_finish` → 토큰 계측 | 입력 합산식을 claude와 같게(신규+캐시생성+캐시읽기) — 한 화면의 숫자가 백엔드마다 다른 것을 세면 비교가 안 된다 |
-| `review.aitest_timeout` | 응답 시험 상한을 백엔드별로 | 30초는 claude 기준이다. opencode는 콜드 스타트만 ~20초라 멀쩡한 백엔드가 늘 '무응답'으로 떴다 |
-| `web._job_live_line` | 무수신 워치독에 `stream` 게이트 | `last_ev`는 콜 시작(`ev:call`)으로도 찍히고 그건 백엔드와 무관하다 — 게이트가 없으면 이벤트 0건인 백엔드가 정상 진행 중에 경고를 받는다 |
-| `web._STALL_SECS_OPENCODE` | 무수신 기준 30→90초 | opencode는 첫 이벤트가 20~46초 뒤에 온다. 같은 기준을 쓰면 정상 구간마다 경고가 떠 배경음이 된다 |
-| `web._job_stream_event` | `ev:call`에서 `phase`·`recv` 리셋 | 콜 단위 리셋을 원래 `model` 이벤트가 했는데 **opencode는 모델 이름을 안 흘린다** |
-| `web._job_live_line` | `phase: tool` → `도구 사용 중` | 메일 분석에 툴이 돌면 그건 메일 본문이 유발했다는 뜻이다. 조용히 넘기지 않는다 |
+| `review._child_env` | opencode 호출에만 A2 의 환경변수, `WSLENV` 에 이름 추가 | 지시문 차단·에이전트 정의. 사용자가 이미 준 `OPENCODE_CONFIG_CONTENT` 는 남기고 에이전트만 더한다 |
+| `review._child_cwd` | `%TEMP%\minerva-oc` | 스냅숏 대상. 만들지 못하면 상속으로 돈다(실패시키지 않는다) |
+| `review._ai_request` | `--agent minerva` | 설정의 어느 토큰에든 `--agent` 가 있으면 안 붙인다(옛 래퍼는 bash 문자열 안) |
+| `review._kill_tree` | Windows 에서 `taskkill /F /T` | npm 설치 CLI 는 `.cmd` 셔틀이라 cmd.exe → node → CLI 다. `proc.kill()` 은 cmd.exe 만 끈다 |
+| `review._ai_run_once` | `subprocess.run(timeout=)` 대신 `Popen` + `communicate` | run 은 시간 초과 뒤 파이프가 닫히기를 상한 없이 기다린다 |
+| `review.opencode_version` · `opencode_notes` | 판과 `cmd` 의 옵션 대조 | `diagnose` 가 호출 전에 말한다(doctor 는 프로세스를 띄우지 않는 계약이라 넣지 않았다) |
+| `review._is_opencode_cmd` | **명령 전체**를 보는 판별자 | 옛 래퍼에선 실행 파일이 `wsl.exe` 다 |
+| `review._ai_run_stream_oc` | `--format json` 파서 | 1.x 와 2.x 의 이벤트 모양이 같았다(아래) |
+
+**셔틀 실측**(가짜 셔틀 `opencode.cmd` → node → 20초 자는 자식, Windows 파이썬):
+
+| | 고치기 전 | 고친 뒤 |
+|---|---|---|
+| 블로킹 호출 3초 상한 | **20.2초** 뒤에야 돌아옴 | 3.5초 |
+| 스트림 [중지] 뒤 남은 자식 | **1개 — 계속 돎** | 0개 |
+
+`claude` 도 npm 설치면 같은 셔틀이라 함께 고쳐진다.
 
 #### 이벤트 대응표
 
-opencode 1.18.25 `run` 핸들러 기준.
-
-| opencode | 조건 | 중립 어휘 |
+| opencode (`--format json`) | 조건 | 중립 어휘 |
 |---|---|---|
 | `step_start` | 단계마다 | `phase: thinking` |
 | `reasoning` | `--thinking` 필요 | `phase: thinking` + `delta` |
 | `text` | `time.end` 있을 때 = **완결분 1건** | `phase: writing` + `delta`(text 포함) |
 | `tool_use` | 툴 완료/오류 | `phase: tool` |
 | `step_finish` | `tokens`·`cost` | `usage` |
-| `error` | `session.error`, exit 1 동반 | `AIError` |
+| `error` | 2.x 는 에이전트 없음·한도도 이걸로 내고 exit 1 | `AIError` |
 
-**바이트 단위 델타가 없다.** text는 다 쓴 뒤 한 번에 온다 — 그래서 수신량은 답
-직전에 0에서 한 번에 뛰고, 진행바는 끝까지 인디터미닛이며, 모델 배지는 빈다
-(이 포맷에 모델 이름이 없다). 관측되지 않는 것은 지어내지 않고 `.waitslot:empty`가
-그 슬롯을 접는다.
+2.3.2 의 `text`·`step_finish` 모양은 1.x 와 같았다(`time.end`, `tokens{input,output,reasoning,
+cache{read,write}}`). **바이트 단위 델타가 없다** — text 는 다 쓴 뒤 한 번에 온다. 그래서 수신량은
+답 직전에 0에서 한 번에 뛰고, 진행바는 끝까지 인디터미닛이며, 모델 배지는 빈다.
 
-#### 평문 폴백
-
-`--format json`이 셸 래퍼에 삼켜지면(A1의 `"$@"` 누락) opencode는 평문을 뱉는다.
-그때 `_ai_run_stream_oc`는 **실패시키지 않고 그대로 답으로 쓴다** — 진행 표시만
-잃는다. 설정 한 줄의 실수가 AI 기능 전체를 죽이면 안 된다. claude 경로가
-2026-07-28에 이 폴백이 없어 분석이 전부 죽었던 그 자리와 같은 판단이다.
-
-### 실측 숫자
-
-| | |
-|---|---|
-| WSL interop 오버헤드 | 0.1초 — 무시해도 된다 |
-| opencode 프로세스 콜드 스타트 | ~20초 (웜 ~6초) |
-| 첫 진행 이벤트까지 | 20~46초 |
-| 한 단어 답 1콜 총시간 | **3초 ~ 60초** — 무료 모델 티어라 편차가 크다 |
-| 입력 토큰 (`build` / 툴 없는 에이전트) | 8,129 / 1,204 |
-
-콜 하나가 60초를 넘는 일이 흔하다는 것이 이 백엔드의 성격이고, 그래서 진행 표시가
-claude보다 **더** 중요하다. 그냥 두면 화면이 몇 분간 죽은 것처럼 보인다.
+`--format json` 이 셸 래퍼에 삼켜지면(부록 C 의 `"$@"` 누락) opencode 는 평문을 뱉는다. 그때도
+**실패시키지 않고 그대로 답으로 쓴다** — 진행 표시만 잃는다.
 
 ### 아직 안 한 것
 
-- **점검 콜이 실사용과 다른 길을 탄다** — `[응답 시험]`은 opencode 에만 `on_event`
-  를 넘긴다(setup 경고를 받으려고). claude 는 종전 블로킹 그대로다 — 넘기면 점검이
-  `stream-json` 으로 바뀌어 **잘 쓰던 사람에게 없던 위험**을 만든다. 점검이 실사용과
-  같은 길을 타는 쪽이 원래는 옳지만, 그건 claude 경로를 따로 확인한 뒤의 일이다.
-- **`[응답 시험]` 결과가 재시작을 못 넘긴다** — 인메모리라 서버를 다시 띄우면
-  래퍼 백엔드가 다시 `○ 확인 안 됨` 으로 돌아간다. 잘 쓰는 사람이 매번 그 표시를
-  본다.
-- **`ask_max_input_tokens`** — 기본 120,000은 Claude 창 기준이다. opencode가 부르는
-  모델에 맞춰 낮춰야 할 수 있다.
-- **`opencode serve` + `--attach`** — 콜당 기동 비용(~6초)을 없앨 수 있지만 프로세스
-  수명 관리가 늘고 "아웃바운드는 AI 뿐"(CLAUDE.md §2) 근거를 다시 따져야 한다.
+- **웹 `[응답 시험]` 은 판 대조(`opencode_notes`)를 보이지 않는다** — `diagnose` 만 한다.
+- **`ask_max_input_tokens`** — 기본 120,000 은 Claude 창 기준이다. 회사 모델의 창에 맞춰 낮춰야 할 수 있다.
+- **2.x 배경 서비스에 붙기(`--standalone` 없이)** — 콜당 기동 비용이 줄지만 환경변수가 서비스에
+  안 닿는다. 정의를 서비스 설정(`opencode service set env`)에 두는 길은 사용자의 다른 opencode 사용까지
+  바꾸므로 넣지 않았다.

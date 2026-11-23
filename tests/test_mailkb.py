@@ -12354,11 +12354,13 @@ class TestWeb(unittest.TestCase):
         # 읽는 자리 때문이다.
         import subprocess as sp
         self.assertTrue(issubclass(review.AITimeout, review.AIError))
-        with mock.patch("subprocess.run",
-                        side_effect=sp.TimeoutExpired(cmd="x", timeout=30)), \
+        proc = mock.MagicMock()
+        proc.communicate.side_effect = [sp.TimeoutExpired(cmd="x", timeout=30), ("", "")]
+        with mock.patch("subprocess.Popen", return_value=proc), \
              mock.patch("shutil.which", lambda b: "/x/" + b):
             with self.assertRaises(review.AITimeout):
                 review.ai_run(["x"], "프롬프트", timeout=30, retries=0)
+        proc.kill.assert_called()            # 시간 초과면 끄고 나온다(기다리지 않는다)
 
     def test_cli_diagnose_separates_no_answer_from_failure(self):
         # 터미널과 웹이 같은 어휘를 쓴다 — 한쪽만 고치면 같은 증상을 다르게 부른다
@@ -14304,6 +14306,195 @@ class TestBackendRoles(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 cli.cmd_diagnose(args)
         self.assertEqual(len(m2.call_args_list), 1)
+
+
+class TestOpencodeWindowsNative(unittest.TestCase):
+    """opencode 를 Windows 에서 직접 부른다(2026-11-23) — 사람이 손으로 맞추던 것을 코드가
+    호출마다 붙인다: Minerva 에이전트 정의 · 지시문 차단 스위치 · 빈 작업 폴더.
+
+    근거는 Windows 11 실측(opencode 1.19.6 · 2.3.2): `~/.claude/CLAUDE.md` 와 작업 폴더
+    부모의 `AGENTS.md` 가 메일 분석 콜에 실렸고, 아래 환경변수로 둘 다 꺼졌다. 에이전트를
+    환경변수로 주는 것도 두 판에서 먹었다(표식 지시가 답에 붙는 것으로 확인)."""
+
+    def test_env_carries_agent_and_switches_only_for_opencode(self):
+        env = review._child_env(["opencode", "run"])
+        self.assertEqual(env["OPENCODE_DISABLE_CLAUDE_CODE"], "1")
+        self.assertEqual(env["OPENCODE_DISABLE_PROJECT_CONFIG"], "1")
+        conf = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+        agent = conf["agent"][review.MINERVA_AGENT]
+        self.assertEqual(agent["tools"], {"*": False})        # 이름 열거가 아니라 전부
+        self.assertEqual(agent["mode"], "primary")
+        self.assertIn("도구를 쓰지 않는다", agent["prompt"])
+        self.assertLess(len(agent["prompt"]), 80)               # 콜마다 가는 글 — 짧게
+        self.assertTrue(env["OPENCODE_CONFIG_CONTENT"].isascii())   # 환경 블록·WSL 다리 안전
+        # 그 밖의 백엔드는 손대지 않는다(상속 그대로)
+        for cmd in (["claude", "-p", "--model", "opus"], ["sonode"]):
+            self.assertIsNone(review._child_env(cmd))
+            self.assertIsNone(review._child_cwd(cmd))
+
+    def test_env_keeps_what_the_user_already_set(self):
+        old = {"WSLENV": "WT_SESSION:OPENCODE_DISABLE_CLAUDE_CODE",
+               "OPENCODE_CONFIG_CONTENT": json.dumps(
+                   {"model": "corp/m1", "agent": {"other": {"mode": "primary"}}})}
+        with mock.patch.dict(os.environ, old):
+            env = review._child_env(["opencode", "run"])
+        conf = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+        self.assertEqual(conf["model"], "corp/m1")             # 사용자 설정은 남는다
+        self.assertIn("other", conf["agent"])
+        self.assertIn(review.MINERVA_AGENT, conf["agent"])
+        names = env["WSLENV"].split(":")
+        self.assertEqual(names[0], "WT_SESSION")
+        self.assertEqual(names.count("OPENCODE_DISABLE_CLAUDE_CODE"), 1)   # 겹치지 않게
+        self.assertIn("OPENCODE_CONFIG_CONTENT", names)        # 옛 WSL 다리도 받는다
+        with mock.patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": "{깨진"}):
+            conf = json.loads(review._child_env(["opencode", "run"])["OPENCODE_CONFIG_CONTENT"])
+        self.assertEqual(list(conf), ["agent"])
+
+    def test_agent_flag_is_added_unless_the_config_names_one(self):
+        add = lambda cmd: review._ai_request(cmd, "p", None, None, None)[0]
+        self.assertEqual(add(["opencode", "run"]), ["opencode", "run", "--agent", "minerva"])
+        self.assertEqual(add(["C:\\tools\\opencode.cmd", "run", "--standalone"])[-2:],
+                         ["--agent", "minerva"])
+        self.assertEqual(add(["opencode", "run", "--agent", "corp"]).count("--agent"), 1)
+        # 옛 WSL 래퍼는 bash 문자열 안에 적혀 있다 — 덧붙이면 같은 옵션이 두 번이 된다
+        wsl = ["wsl.exe", "-e", "bash", "-lc",
+               'exec opencode run --pure --dir /var/tmp/minerva-oc --agent minerva "$@"', "oc"]
+        self.assertEqual(add(wsl), wsl)
+        self.assertNotIn("--agent", add(["claude", "-p"]))
+
+    def test_neutral_working_folder(self):
+        with tempfile.TemporaryDirectory() as t:
+            with mock.patch.object(review.tempfile, "gettempdir", return_value=t):
+                d = review._child_cwd(["opencode", "run"])
+            self.assertEqual(Path(d), Path(t) / "minerva-oc")
+            self.assertTrue(Path(d).is_dir())
+            with mock.patch.object(review.tempfile, "gettempdir",
+                                   return_value=str(Path(t) / "없음" / "더없음")):
+                self.assertIsNone(review._child_cwd(["opencode", "run"]))   # 실패시키지 않는다
+
+    def test_every_launch_passes_env_and_folder(self):
+        seen = []
+
+        class P:
+            pid, returncode, args = 1, 0, ["x"]
+            stdin = io.StringIO()
+            stdout = io.StringIO('{"type":"text","part":{"type":"text","text":"OK","time":{"end":1}}}\n')
+            stderr = io.StringIO("")
+
+            def __init__(self, argv, **kw):
+                seen.append((argv, kw))
+
+            def communicate(self, *a, **k):
+                return "OK", ""
+
+            def wait(self, timeout=None):
+                return 0
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(review.tempfile, "gettempdir", return_value=tmp), \
+             mock.patch("subprocess.Popen", P), \
+             mock.patch("shutil.which", lambda b: "/x/" + b):
+            review.ai_run(["opencode", "run"], "질문", timeout=30, retries=0)
+            review.ai_run(["opencode", "run"], "질문", timeout=30, retries=0,
+                          on_event=lambda e: None)
+        self.assertEqual(len(seen), 2)
+        for argv, kw in seen:
+            self.assertIn("--agent", argv)
+            self.assertEqual(kw["env"]["OPENCODE_DISABLE_PROJECT_CONFIG"], "1")
+            self.assertTrue(kw["cwd"].endswith("minerva-oc"))
+        self.assertIn("--format", seen[1][0])                   # 스트림은 코드가 붙인다
+
+    def test_stop_kills_the_whole_tree_on_windows(self):
+        # npm 셔틀은 cmd.exe → node → 실제 CLI 다. 맨 위만 끄면 [중지] 뒤에도 CLI 가 돈다
+        # (2026-11-23 Windows 실측: 고치기 전 1개 남음, 고친 뒤 0개).
+        proc = mock.MagicMock(pid=4321)
+        with mock.patch("subprocess.run") as run:
+            review._kill_tree(proc, windows=True)
+        self.assertEqual(run.call_args[0][0], ["taskkill", "/F", "/T", "/PID", "4321"])
+        proc.kill.assert_called_once()
+        with mock.patch("subprocess.run") as run:
+            review._kill_tree(mock.MagicMock(pid=1), windows=False)
+        run.assert_not_called()
+
+    def test_blocking_timeout_does_not_wait_for_the_pipe(self):
+        # subprocess.run(timeout=) 은 Windows 에서 시간 초과 뒤 파이프가 닫히기를 상한 없이
+        # 기다렸다(셔틀 아래 CLI 가 쥐고 있다 — 실측 3초 상한이 20초). 이제 끄고 5초만 본다.
+        import subprocess as sp
+        proc = mock.MagicMock(pid=7)
+        proc.communicate.side_effect = [sp.TimeoutExpired("x", 3), sp.TimeoutExpired("x", 5)]
+        with mock.patch("subprocess.Popen", return_value=proc), \
+             mock.patch("shutil.which", lambda b: "/x/" + b), \
+             mock.patch.object(review, "_kill_tree") as kill:
+            with self.assertRaises(review.AITimeout):
+                review.ai_run(["opencode", "run"], "x", timeout=3, retries=0)
+        kill.assert_called_once_with(proc)
+        self.assertEqual(proc.communicate.call_args_list[-1][1], {"timeout": 5})
+
+    def test_version_and_flag_notes(self):
+        import subprocess as sp
+        run = lambda *a, **k: sp.CompletedProcess(a, 0, "opencode v2.3.2\n", "")
+        with mock.patch("shutil.which", lambda b: "/x/" + b):
+            self.assertEqual(review.opencode_version(["opencode", "run"], run=run), (2, 3, 2))
+            self.assertIsNone(review.opencode_version(
+                ["wsl.exe", "-e", "bash", "-lc", "exec opencode run"], run=run))  # 래퍼 뒤
+        with tempfile.TemporaryDirectory() as h:
+            notes = lambda cmd, eff, ver: review.opencode_notes(cmd, eff, ver, home=Path(h))
+            self.assertEqual(notes(["opencode", "run", "--pure"], "--variant", (1, 19, 6)), [])
+            self.assertEqual(notes(["opencode", "run", "--standalone"], None, (2, 3, 2)), [])
+            v2 = notes(["opencode", "run", "--pure"], "--variant", (2, 3, 2))
+            self.assertIn("--pure", v2[0])
+            self.assertIn("effort_flag --variant", v2[0])
+            self.assertIn("--standalone", v2[1])
+            self.assertIn("--standalone", notes(["opencode", "run", "--standalone"], None, (1, 19, 6))[0])
+            self.assertEqual(notes(["opencode", "run"], None, None), [])     # 판을 모르면 말하지 않는다
+            g = Path(h) / ".config" / "opencode"
+            g.mkdir(parents=True)
+            (g / "AGENTS.md").write_text("x", encoding="utf-8")
+            self.assertIn("전역 지시문", notes(["opencode", "run"], None, None)[0])
+
+    def test_diagnose_tells_version_mismatch_and_what_to_fix(self):
+        from mailkb import cli
+        with tempfile.TemporaryDirectory() as t:
+            home = Path(t)
+            (home / "config.toml").write_text(
+                'my_addresses = ["%s"]\nsource = "fake"\n[ai]\nsummary = "internal"\n'
+                '[ai.backends.internal]\ncmd = ["opencode", "run", "--pure"]\n'
+                'effort_flag = "--variant"\n' % ME, encoding="utf-8")
+            args = argparse.Namespace(home=str(home), backend="internal")
+            buf = io.StringIO()
+            with mock.patch.object(review, "opencode_version", return_value=(2, 3, 2)), \
+                 mock.patch.object(review, "ai_run",
+                                   side_effect=review.AIError('Agent not found: "minerva"')), \
+                 contextlib.redirect_stdout(buf):
+                cli.cmd_diagnose(args)
+        out = buf.getvalue()
+        self.assertIn("opencode 2.3.2", out)
+        self.assertIn("▲ opencode 2.3.2 에는 없는 옵션: --pure", out)
+        self.assertIn("위 ▲ 줄대로 config.toml 의 cmd 를", out)   # 실패에 붙는 처방
+        # 판은 맞는데 2.x 가 배경 서비스에 붙은 경우 — 에이전트를 못 찾는다
+        with tempfile.TemporaryDirectory() as t:
+            home = Path(t)
+            (home / "config.toml").write_text(
+                'my_addresses = ["%s"]\nsource = "fake"\n[ai]\nsummary = "internal"\n'
+                '[ai.backends.internal]\ncmd = ["opencode", "run"]\n' % ME, encoding="utf-8")
+            buf = io.StringIO()
+            with mock.patch.object(review, "opencode_version", return_value=None), \
+                 mock.patch.object(review, "ai_run",
+                                   side_effect=review.AIError('Agent not found: "minerva"')), \
+                 contextlib.redirect_stdout(buf):
+                cli.cmd_diagnose(argparse.Namespace(home=str(home), backend="internal"))
+        self.assertIn('"--standalone"', buf.getvalue())
+
+    def test_tui_agent_runs_windows_python_directly(self):
+        root = Path(__file__).resolve().parents[1]
+        text = (root / ".opencode" / "agent" / "mailkb.md").read_text(encoding="utf-8")
+        front, body = text.split("\n---\n", 1)
+        # 네이티브에선 `python` 이 바로 맞는 파이썬이다 — 막으면 TUI 가 mailkb 를 못 부른다
+        self.assertNotIn('"python -m mailkb*": deny', front)
+        self.assertIn('"python3 -m mailkb*": deny', front)     # 옛 WSL 울타리는 남긴다
+        self.assertIn("python -X utf8 -m mailkb", body)
+        self.assertNotIn("powershell", body.lower())
+        self.assertNotIn("chcp", body)
 
 
 class TestDoctorLinux(unittest.TestCase):

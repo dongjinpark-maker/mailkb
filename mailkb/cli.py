@@ -1025,6 +1025,17 @@ def cmd_diagnose(args) -> None:
         print(f"  {name}" + (f" ({roles_s})" if roles_s else "")
               + f" — {' '.join(cmd)}")
         limit = review.aitest_timeout(cmd)   # 백엔드별 — 웹 점검과 같은 값
+        oc_ver, oc_notes = None, []
+        if review._is_opencode_cmd(cmd):
+            # 판마다 아는 옵션이 달라 **모르는 옵션 하나에 모든 호출이 실패한다**
+            # (1.x ↔ 2.x). 호출 전에 판과 설정이 맞는지 먼저 말한다.
+            oc_ver = review.opencode_version(cmd)
+            print("    opencode " + (".".join(map(str, oc_ver)) if oc_ver
+                                    else "판 확인 못 함(래퍼 뒤)")
+                  + f" · 에이전트 {review.MINERVA_AGENT}(코드가 정의를 싣는다)")
+            oc_notes = review.opencode_notes(cmd, cfg.ai_effort_flag(name), oc_ver)
+            for n in oc_notes:
+                print(f"    ▲ {n}")
         notes: list = []
 
         def _note(info: dict, _n=notes) -> None:
@@ -1047,8 +1058,16 @@ def cmd_diagnose(args) -> None:
                   "그 CLI 를 직접 실행해 로그인·프록시를 확인하세요.")
         except (review.AIError, review.AIAuthError) as e:
             print(f"    ■ 실패: {str(e)[:180]}")
-            print("    → CLI 설치·PATH·인증, 그리고 그 CLI 가 이 모델을 "
-                  "지원하는지 확인. 이 역할이 이 때문에 빈다.")
+            low = str(e).lower()
+            if any("없는 옵션" in n or "--standalone" in n for n in oc_notes):
+                print("    → 위 ▲ 줄대로 config.toml 의 cmd 를 이 판에 맞추세요 "
+                      "(docs/OPENCODE-WINDOWS.md A1).")
+            elif review._is_opencode_cmd(cmd) and "agent not found" in low:
+                print("    → opencode 2.x 면 cmd 에 \"--standalone\" 을 넣으세요 — 없으면 "
+                      "배경 서비스에 붙어 Minerva 에이전트 정의가 전달되지 않습니다.")
+            else:
+                print("    → CLI 설치·PATH·인증, 그리고 그 CLI 가 이 모델을 "
+                      "지원하는지 확인. 이 역할이 이 때문에 빈다.")
 
     # 5) 개입 큐 과탐 분해 (false alarm)
     d = date.today().isoformat()

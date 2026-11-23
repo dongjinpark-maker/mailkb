@@ -98,10 +98,13 @@ diagnose = "opus"
 # chars_per_token = 1.0
 
 [ai.backends.internal]
-# opencode headless — 프롬프트는 stdin 으로 전달됨
-# **Windows 는 이 값으로 안 된다** — opencode 가 WSL 안에만 있어 wsl.exe 를 거쳐야
-# 하고, 그 호출 형태에 함정이 넷 있다(로그인 셸·"$@"·--dir·--agent).
-# docs/OPENCODE-WINDOWS.md A1 의 값을 그대로 쓴다.
+# opencode headless — 프롬프트는 stdin 으로 전달됨. **판마다 옵션이 다르다**
+# (`opencode --version`) — 모르는 옵션이 하나라도 있으면 모든 호출이 실패한다:
+#   1.x: cmd = ["opencode", "run", "--pure"]        effort_flag = "--variant"
+#   2.x: cmd = ["opencode", "run", "--standalone"]  (effort_flag 는 적지 않는다)
+# Minerva 에이전트(도구 없음)·지시문 차단·작업 폴더는 코드가 호출마다 붙인다 —
+# 손으로 맞출 것이 아니다. 근거·옛 WSL 방식은 docs/OPENCODE-WINDOWS.md.
+# 확인: mailkb diagnose --backend internal
 cmd = ["opencode", "run"]
 # 추론 강도 플래그 opt-in — 이 CLI 가 지원함을 **직접 확인한 뒤** 플래그 이름을
 # 선언하면, 분석·주간 보고의 어려운 콜에 "<플래그> high" 가 붙는다. 미선언(기본)
